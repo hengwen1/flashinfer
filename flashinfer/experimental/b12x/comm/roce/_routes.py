@@ -132,24 +132,36 @@ def _best_matching(candidates: list, rails: int) -> Optional[list[tuple[int, int
     return None if best is None else [(l, r) for _, l, r in best[1]]
 
 
+def neighbor_ranks(rank: int, world: int, *, ring_open: bool) -> set[int]:
+    """The ranks adjacent to ``rank`` in rank order: both around the cycle of a ring, or only the ones
+    that exist on a line (``ring_open``), whose end ranks have a single neighbor."""
+    if ring_open:
+        return {peer for peer in (rank - 1, rank + 1) if 0 <= peer < world}
+    return {(rank - 1) % world, (rank + 1) % world}
+
+
 def plan_routes(
     endpoints: Sequence[Sequence[Endpoint]],
     rank: int,
     rails: int,
     *,
     ring: bool = False,
+    ring_open: bool = False,
 ) -> list[list[tuple[int, int]]]:
-    """Per peer, the ``(local_device, remote_device)`` index pair carrying each rail; ``[]`` for ``rank``."""
+    """Per peer, the ``(local_device, remote_device)`` index pair carrying each rail; ``[]`` for ``rank``.
+
+    ``ring`` connects rank-order neighbors on a cycle; ``ring_open`` on a line, where rank 0 and
+    rank ``world - 1`` have one neighbor each and the proxy relays through the ranks between."""
     if not 1 <= rails <= MAX_RAILS:
         raise ValueError(f"rails must be 1..{MAX_RAILS}, got {rails}")
     world = len(endpoints)
-    if ring and not 2 <= world <= 16:
+    if (ring or ring_open) and not 2 <= world <= 16:
         raise ValueError("experimental ring requires 2..16 ranks")
     if not 0 <= rank < world:
         raise ValueError("rank outside the endpoint list")
-    if ring:
-        # Rank order defines the cycle; the proxy relays all non-neighbors.
-        neighbors = {rank, (rank + 1) % world, (rank - 1) % world}
+    if ring or ring_open:
+        # Rank order defines the cycle, or the line; the proxy relays all non-neighbors.
+        neighbors = neighbor_ranks(rank, world, ring_open=ring_open) | {rank}
         peers = [p for p in range(world) if p in neighbors]
         subset = [endpoints[p] for p in peers]
         planned = plan_routes(subset, peers.index(rank), rails)

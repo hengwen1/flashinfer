@@ -51,14 +51,15 @@ class Group:
                 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 listener.bind(("0.0.0.0", int(port)))
                 listener.listen(world - 1)
-                listener.settimeout(30)
+                # Peers import torch and build the proxy before connecting; allow slow hosts.
+                listener.settimeout(180)
                 self.peers = {}
                 for _ in range(world - 1):
                     peer, _ = listener.accept()
                     peer.settimeout(30)
                     self.peers[int(receive(peer))] = peer
         else:
-            until = time.monotonic() + 30
+            until = time.monotonic() + 180
             while True:
                 try:
                     self.peer = socket.create_connection((host, int(port)), 5)
@@ -94,6 +95,11 @@ def main():
         help="check the ordinary direct transport instead",
     )
     parser.add_argument("--skew-rank", type=int)
+    parser.add_argument(
+        "--ring-open",
+        action="store_true",
+        help="ranks form a line: no link between rank 0 and the last rank",
+    )
     parser.add_argument("--hca-names", default="roceP2p1s0f0,rocep1s0f0")
     parser.add_argument("--gid-index", type=int, default=3)
     parser.add_argument("--source", type=Path)
@@ -128,7 +134,8 @@ def main():
         slot_bytes=1 << 20,
         pipe_bytes=4 << 20,
         varlen_bytes=1 << 20,
-        ring=not args.mesh,
+        ring=not args.mesh and not args.ring_open,
+        ring_open=args.ring_open,
     )
     endpoints = routes_api.local_endpoints(names, args.gid_index)
     local = {
@@ -145,13 +152,23 @@ def main():
         ]
         for record in records
     ]
-    routes = routes_api.plan_routes(all_endpoints, args.rank, 2, ring=not args.mesh)
+    routes = routes_api.plan_routes(
+        all_endpoints,
+        args.rank,
+        2,
+        ring=not args.mesh and not args.ring_open,
+        ring_open=args.ring_open,
+    )
     if not args.mesh:
-        assert all(
-            not links
-            for peer, links in enumerate(routes)
-            if peer not in {args.rank, (args.rank + 1) % world, (args.rank - 1) % world}
+        # A ring links both rank-order neighbors around the cycle; a line links only the
+        # neighbors that exist, so its end ranks hold one link and never the far end.
+        neighbors = (
+            ({args.rank + 1, args.rank - 1} & set(range(world)))
+            if args.ring_open
+            else {(args.rank + 1) % world, (args.rank - 1) % world}
         )
+        linked = {peer for peer, links in enumerate(routes) if links}
+        assert linked == neighbors, (linked, neighbors)
     proxy.connect([bytes.fromhex(r["blob"]) for r in records], routes)
     group.exchange("connected")
     proxy.start()
@@ -301,10 +318,12 @@ def main():
         group.exchange("drained")
         proxy.stop()
         stats = proxy.stats()
+        end = args.ring_open and args.rank in (0, world - 1)
         assert stats["connected_peers"] == (
-            world - 1 if args.mesh else min(2, world - 1)
+            world - 1 if args.mesh else 1 if end else min(2, world - 1)
         )
-        if not args.mesh and world > 3:
+        # On a line the end ranks relay nothing; every other rank of a world above three does.
+        if not args.mesh and world > 3 and not end:
             assert stats["ring_forwarded"] > 0, stats
         print(
             json.dumps(

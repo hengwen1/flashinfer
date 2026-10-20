@@ -128,6 +128,8 @@ def load() -> ctypes.CDLL:
         ]
         lib.roce_enable_ring.restype = ctypes.c_int
         lib.roce_enable_ring.argtypes = [p]
+        lib.roce_enable_ring_open.restype = ctypes.c_int
+        lib.roce_enable_ring_open.argtypes = [p]
         lib.roce_local_blob.restype = ctypes.c_int
         lib.roce_local_blob.argtypes = [p, p, u64]
         lib.roce_connect.restype = ctypes.c_int
@@ -156,6 +158,24 @@ def load() -> ctypes.CDLL:
             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
         _LIB = lib
         return lib
+
+
+def _neighbor_ranks(rank: int, world: int, *, ring_open: bool) -> set[int]:
+    """``_routes.neighbor_ranks``, reached through the package or, when this module is loaded from its
+    file alone (the native validator does), from the sibling file."""
+    try:
+        from ._routes import neighbor_ranks
+    except ImportError:
+        import importlib.util
+        import sys
+
+        path = Path(__file__).with_name("_routes.py")
+        spec = importlib.util.spec_from_file_location("_roce_routes_standalone", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module  # dataclasses in the module resolve it by name
+        spec.loader.exec_module(module)
+        neighbor_ranks = module.neighbor_ranks
+    return neighbor_ranks(rank, world, ring_open=ring_open)
 
 
 class Layout:
@@ -243,6 +263,7 @@ class Proxy:
         pipe_bytes: int = 0,
         varlen_bytes: int = 0,
         ring: bool = False,
+        ring_open: bool = False,
     ) -> None:
         """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
         self.traffic_class = _traffic_class()
@@ -268,8 +289,12 @@ class Proxy:
             raise RuntimeError(
                 f"RoCE proxy setup failed: {err.value.decode(errors='replace')}"
             )
-        self.ring = ring
-        if ring and self._lib.roce_enable_ring(self._ctx) != 0:
+        self.ring = bool(ring)
+        self.ring_open = bool(ring_open)
+        enable = (
+            self._lib.roce_enable_ring_open if ring_open else self._lib.roce_enable_ring
+        )
+        if (ring or ring_open) and enable(self._ctx) != 0:
             message = self.error()
             self.close()
             raise RuntimeError(f"RoCE ring setup failed: {message}")
@@ -299,11 +324,13 @@ class Proxy:
         rails = max(len(r) for r in routes)
         flat = []
         for peer, rail_links in enumerate(routes):
-            relayed = getattr(self, "ring", False) and peer not in {
-                self.rank,
-                (self.rank + 1) % self.world_size,
-                (self.rank - 1) % self.world_size,
-            }
+            ring_open = getattr(self, "ring_open", False)
+            neighbors = _neighbor_ranks(
+                self.rank, self.world_size, ring_open=ring_open
+            ) | {self.rank}
+            relayed = (
+                getattr(self, "ring", False) or ring_open
+            ) and peer not in neighbors
             if relayed and rail_links:
                 raise RuntimeError("ring routes must leave non-neighbors unconnected")
             if peer != self.rank and not relayed and len(rail_links) != rails:

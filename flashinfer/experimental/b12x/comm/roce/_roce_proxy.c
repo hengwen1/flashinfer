@@ -204,6 +204,7 @@ typedef struct {
   uint64_t ops_posted;
   uint64_t writes_completed;
   uint8_t* ring;
+  int ring_open;  // the ring is a line: no link between rank 0 and rank world - 1
   struct ibv_mr* ring_mr[ROCE_MAX_HCAS];
   uint64_t ring_addr[ROCE_MAX_PEERS];
   uint32_t ring_rkey[ROCE_MAX_RAILS][ROCE_MAX_PEERS];
@@ -232,14 +233,18 @@ static ring_descriptor_t* ring_outgoing(const roce_ctx_t* c, int origin, int rai
   return (ring_descriptor_t*)(c->ring +
                               ring_outgoing_offset(c->world, ring_slot(origin, rail, slot)));
 }
+// Next hop toward target: on a line always toward it; on a cycle the shorter way, clockwise on a
+// tie.
 static int ring_next(const roce_ctx_t* c, int target) {
+  if (c->ring_open) return target > c->rank ? c->rank + 1 : c->rank - 1;
   int clockwise = (target - c->rank + c->world) % c->world;
   int counter = (c->rank - target + c->world) % c->world;
   return clockwise <= counter ? (c->rank + 1) % c->world : (c->rank + c->world - 1) % c->world;
 }
 static int ring_relayed(const roce_ctx_t* c, int peer) {
-  return c->ring != NULL && peer != c->rank && peer != (c->rank + 1) % c->world &&
-         peer != (c->rank + c->world - 1) % c->world;
+  if (c->ring == NULL || peer == c->rank) return 0;
+  if (c->ring_open) return peer != c->rank + 1 && peer != c->rank - 1;
+  return peer != (c->rank + 1) % c->world && peer != (c->rank + c->world - 1) % c->world;
 }
 
 void roce_destroy(roce_ctx_t* c);
@@ -453,6 +458,7 @@ roce_ctx_t* roce_create(int world, int rank, const char* const* hca_names, int n
 }
 
 // Enable before exchanging blobs; startup allocation, never during replay.
+int roce_enable_ring_open(roce_ctx_t* c);
 int roce_enable_ring(roce_ctx_t* c) {
   if ((c->world < 2 || c->world > ROCE_MAX_PEERS) || c->started || c->ring != NULL) {
     snprintf(c->err, sizeof(c->err), "experimental ring requires 2..16 ranks before connect");
@@ -474,6 +480,13 @@ int roce_enable_ring(roce_ctx_t* c) {
       return -1;
     }
   }
+  return 0;
+}
+
+// The ring as a line in rank order: ranks 0 and world - 1 have one neighbor each and share no link.
+int roce_enable_ring_open(roce_ctx_t* c) {
+  if (roce_enable_ring(c) != 0) return -1;
+  c->ring_open = 1;
   return 0;
 }
 
@@ -735,8 +748,9 @@ static int ring_submit(roce_ctx_t* c, int origin, int rail, int slot, int next,
   return 0;
 }
 
-static int ring_distance(int a, int b, int world) {
-  int cw = (b - a + world) % world, ccw = (a - b + world) % world;
+static int ring_distance(const roce_ctx_t* c, int a, int b) {
+  if (c->ring_open) return a > b ? a - b : b - a;
+  int cw = (b - a + c->world) % c->world, ccw = (a - b + c->world) % c->world;
   return cw < ccw ? cw : ccw;
 }
 
@@ -758,7 +772,7 @@ static int ring_service_slot(roce_ctx_t* c, int origin, int rail, int slot) {
   if (serial < seen || (serial - 1) % RING_WINDOW != (uint64_t)slot ||
       d->target >= (uint64_t)c->world || d->previous >= (uint64_t)c->world || previous == c->rank ||
       ring_relayed(c, previous) || target == c->rank ||
-      ring_distance(previous, target, c->world) != ring_distance(c->rank, target, c->world) + 1 ||
+      ring_distance(c, previous, target) != ring_distance(c, c->rank, target) + 1 ||
       d->nbytes > RING_CHUNK_BYTES || d->offset > c->region_bytes ||
       d->nbytes > c->region_bytes - d->offset ||
       (d->flag_offset != UINT64_MAX &&
@@ -1326,7 +1340,9 @@ uint64_t roce_stat(roce_ctx_t* c, int which) {
     case 3:
       return c->ring_forwarded;
     case 4:
-      return c->ring == NULL ? c->world - 1 : (c->world == 2 ? 1 : 2);
+      if (c->ring == NULL) return c->world - 1;
+      if (c->world == 2 || (c->ring_open && (c->rank == 0 || c->rank == c->world - 1))) return 1;
+      return 2;
     default:
       return 0;
   }

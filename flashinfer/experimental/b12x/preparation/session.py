@@ -2018,7 +2018,6 @@ class PreparationJob:
                 with self._timing.span("trial_reclamation"):
                     self._program_cache.clear()
                     evict_unretained(())
-                    gc.collect()
                 self._timing.record(
                     "batch_end",
                     request=request.name,

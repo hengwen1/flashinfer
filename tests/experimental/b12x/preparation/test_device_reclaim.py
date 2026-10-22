@@ -18,7 +18,6 @@ def test_race_releases_factory_results_between_batches(tmp_path, monkeypatch):
     class State:
         def __init__(self, width):
             self.value = width * 3
-            self.cycle = self
 
     @program_cache.program_cache(scope="preparation")
     def factory(width):

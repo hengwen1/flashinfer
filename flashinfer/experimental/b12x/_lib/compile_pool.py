@@ -537,6 +537,7 @@ class CompilePool:
         max_shared_memory_per_block: int,
         max_shared_memory_per_multiprocessor: int,
         workers: int,
+        compile_spool: str | None = None,
     ):
         if type(device_ordinal) is not int or device_ordinal < 0:
             raise ValueError("compiler pool needs a nonnegative visible device ordinal")
@@ -585,21 +586,26 @@ class CompilePool:
         self._cute_count = self._triton_count = self._requested_jobs = self._jobs = 0
         context = multiprocessing.get_context("spawn")
         self._activity = context.Array("q", (0, 0))
-        with _offline_compiler_spawn_environment():
-            self._pool: Pool | None = context.Pool(
-                processes=workers,
-                initializer=_initialize_worker,
-                initargs=(
-                    device_ordinal,
-                    compute_capability,
-                    device_uuid,
-                    product_name,
-                    sm_count,
-                    max_shared_memory_per_block,
-                    max_shared_memory_per_multiprocessor,
-                    self._activity,
-                ),
-            )
+        target = (
+            device_ordinal,
+            compute_capability,
+            device_uuid,
+            product_name,
+            sm_count,
+            max_shared_memory_per_block,
+            max_shared_memory_per_multiprocessor,
+        )
+        if compile_spool is not None:
+            from .compile_exchange import ExchangePool
+
+            self._pool = ExchangePool(compile_spool, processes=workers, target=target)
+        else:
+            with _offline_compiler_spawn_environment():
+                self._pool = context.Pool(
+                    processes=workers,
+                    initializer=_initialize_worker,
+                    initargs=(*target, self._activity),
+                )
         self._workers = tuple(self._pool._pool)
 
     def _finish(self, result):

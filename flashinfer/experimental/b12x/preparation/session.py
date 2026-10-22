@@ -354,6 +354,7 @@ class PreparationSession:
         cache_dir=None,
         namespace=None,
         compile_workers=None,
+        compile_spool=None,
         rounds=SURVIVOR_ROUNDS,
         samples=DEFAULT_SAMPLES,
         cache_only=False,
@@ -367,6 +368,7 @@ class PreparationSession:
         safe to call there. A timeout does not cancel that callback; another
         preparation job cannot begin until the callback exits.
         """
+        self.compile_spool = compile_spool
         self.device = (
             device if isinstance(device, DetectedDevice) else detect_device(device)
         )
@@ -646,6 +648,7 @@ class PreparationSession:
                     self.device.max_shared_memory_per_multiprocessor
                 ),
                 workers=self.compile_workers,
+                compile_spool=self.compile_spool,
             )
         return self._pool
 
@@ -1255,6 +1258,10 @@ class PreparationJob:
         )
 
     def _direct_compilation(self):
+        if self.session.compile_spool is not None:
+            raise RuntimeError(
+                "external compilation requires autotuning; direct warmup compilation is disabled"
+            )
         if self._direct_ready:
             return
         if self.session._pool is not None:
@@ -1601,6 +1608,10 @@ class PreparationJob:
                     f"missing required compiled artifact for {obligation.request.name}"
                 )
             if self.session.compile_workers == 0:
+                if self.session.compile_spool is not None:
+                    raise ValueError(
+                        "external compilation requires at least one compile worker"
+                    )
                 # No compiler workers: compile in this process, the way a
                 # kernel compiles on first use without startup preparation.
                 with self.session._gpu_scope():

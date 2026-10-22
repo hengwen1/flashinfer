@@ -3,13 +3,16 @@ from __future__ import annotations
 import inspect
 import linecache
 import os
+import weakref
 from functools import wraps
+from types import MethodType
 from typing import Any
 
 _COMPILE_ONLY_CACHE_WARNING = "Cache is disabled as user wants to compile only."
 _WARNING_PATCHED = False
 _MEMORY_DEBUG_PATCHED = False
 _DIRECT_FRAMEINFO_PATCHED = False
+_EXECUTOR_LIFETIME_PATCHED = False
 _MEMORY_DEBUG_SNAPSHOT = {
     "free": None,
     "total": None,
@@ -27,10 +30,11 @@ def apply_cutlass_runtime_patches() -> None:
     _apply_compile_only_warning_patch()
     _apply_memory_debug_patch()
     _apply_direct_frameinfo_patch()
+    _apply_executor_lifetime_patch()
 
 
 def cutlass_runtime_patch_status() -> tuple[tuple[str, bool], ...]:
-    """Return effective patch state for compile-manifest provenance."""
+    """Return compilation-affecting patch state for compile manifests."""
     return (
         ("compile_only_warning", _WARNING_PATCHED),
         ("memory_debug", _MEMORY_DEBUG_PATCHED),
@@ -43,6 +47,28 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _apply_executor_lifetime_patch() -> None:
+    global _EXECUTOR_LIFETIME_PATCHED
+    if _EXECUTOR_LIFETIME_PATCHED:
+        return
+
+    from cutlass.base_dsl.jit_executor import JitExecutor
+
+    original_init = JitExecutor.__init__
+
+    @wraps(original_init)
+    def initialize(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # The cached bound method must not keep its owning executor alive.
+        pack = MethodType(type(self)._get_invoke_packed_args, weakref.proxy(self))
+        self._get_invoke_packed_args_func = (
+            self.profiler(pack) if self.profiler is not None else pack
+        )
+
+    JitExecutor.__init__ = initialize
+    _EXECUTOR_LIFETIME_PATCHED = True
 
 
 def _apply_compile_only_warning_patch() -> None:

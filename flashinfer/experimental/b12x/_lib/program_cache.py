@@ -239,11 +239,10 @@ def _local_memory_bytes(executable):
 def reclaim_device_memory(keep, *, stack_limit):
     """Return the device memory that losing candidates leave behind after eviction.
 
-    An evicted CuTe executable unloads its CUDA library when it is collected,
-    but the DSL's executor objects sit in reference cycles, so the collection
-    runs here rather than at an arbitrary later allocation. The CUDA driver
-    also grows the context's per-thread local memory (stack) to the largest
-    static requirement of any kernel launched so far and never shrinks it on
+    Collect residual Python reference cycles at the preparation boundary. CuTe
+    executors keep their CUDA modules alive until their final owner releases them.
+    The CUDA driver also grows the context's per-thread local memory (stack) to
+    the largest static requirement of any kernel launched so far and never shrinks it on
     its own, so one losing candidate that spills registers keeps hundreds of
     MiB allocated. With `stack_limit`, the limit before the preparation, the
     stack is reset and set to the larger of that limit and the retained

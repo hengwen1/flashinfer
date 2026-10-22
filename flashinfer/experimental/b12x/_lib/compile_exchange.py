@@ -131,7 +131,7 @@ class ExchangePool:
             if k.startswith("B12X_") and k != "B12X_COMPILE_CACHE_DIR"
         }
 
-    def _run(self, payload, expected):
+    def _request(self, body):
         name = uuid.uuid4().hex
         request = self.directory / f"{name}.request"
         result = self.directory / f"{name}.result"
@@ -142,8 +142,7 @@ class ExchangePool:
                     "target": self.target,
                     "toolchain": self.versions,
                     "environment": self.environment,
-                    "payload": payload,
-                    "expected": expected,
+                    **body,
                 },
                 protocol=5,
             ),
@@ -161,12 +160,27 @@ class ExchangePool:
             raise RuntimeError(
                 f"external kernel compilation failed: {response['error']}"
             )
+        return response
+
+    def _run(self, payload, expected):
+        response = self._request(
+            {"operation": "compile", "payload": payload, "expected": expected}
+        )
         install_artifacts(response["artifacts"], expected)
         return response["summary"]
 
+    def _describe(self, payloads):
+        response = self._request(
+            {"operation": "describe", "payloads": tuple(payloads)}
+        )
+        return response["descriptions"]
+
     def apply_async(self, function, args, callback, error_callback):
+        # The pool submits two operations: device-independent program discovery
+        # and artifact compilation. Route each to the matching request.
+        operation = self._describe if getattr(function, "__name__", "") == "_describe_jobs" else self._run
         self.threads.apply_async(
-            self._run, args, callback=callback, error_callback=error_callback
+            operation, args, callback=callback, error_callback=error_callback
         )
 
     def close(self):
@@ -182,12 +196,14 @@ class ExchangePool:
 
 
 def compile_request(request):
-    """Compile one request inside an initialized offline compiler process."""
-    from .compile_pool import _run_job
+    """Service one exchange request inside an initialized offline compiler process."""
+    from .compile_pool import _describe_jobs, _run_job
 
     try:
         if request["toolchain"] != toolchain():
             raise ValueError("preparation and compiler toolchains differ")
+        if request.get("operation") == "describe":
+            return {"descriptions": _describe_jobs(tuple(request["payloads"]))}
         summary = _run_job(request["payload"], request["expected"])
         return {"summary": summary, "artifacts": collect_artifacts(request["expected"])}
     except Exception as error:

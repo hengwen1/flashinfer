@@ -1,20 +1,9 @@
-"""Unified FUSED indexer kernel: score q·k AND select top-k in one launch.
+"""Stream index scores into shared top-k carries and merge cooperating CTAs.
 
-Design (see plan): a row-cooperative persistent kernel where each CTA streams a
-slice of one query row's K, scores q·k via ``mxfp8`` MMA into shared memory
-(m = heads / MQA), folds each scored sub-tile into an in-SMEM running top-k via
-the ``tiled_topk`` radix (coarse-8-bit-histogram + byte-refine), and CTAs merge
-in turn. Logits never reach global memory — peak per-row working set is
-O(topk), not O(K). contiguous K/V vs paged K/V is a constexpr K-loader
-specialization; the score assembly and top-k are identical (always m = heads).
-
-This module is the SCAFFOLD: launch config, dispatch gates, scratch trio, and
-the kernel class shell. The fused score→select kernel body lands per the phased
-plan (Phase 1 = paged; Phase 2 = CONTIGUOUS_MLA loader; Phase 3 = topk 512 /
-paged_output). The m=heads score helpers are reused from
-``b12x/attention/indexer/kernel.py`` (``_compute_mxfp8_tile_partials`` et al.)
-and the radix select / virtual-index loaders from
-``b12x/attention/indexer/tiled_topk.py``; nothing is reinvented here.
+Cache encoding and paged/contiguous addressing are compile-time specializations.
+FP8 scoring and MXFP4's BF16 arithmetic boundaries feed the same radix selection
+and cross-CTA merge. Fused scoring requires all contributing query heads on the
+rank; callers requiring an external score sum use the staged score/select API.
 """
 
 from __future__ import annotations
@@ -362,8 +351,8 @@ assert _FUSED_WIDE_RADIX == 4 * _RADIX_THREADS
 
 
 @cute.jit
-def _fused_state_offset(group_id: Int32, word: Int32) -> Int32:
-    return group_id * Int32(_COOP_STATE_WORDS) + word
+def _fused_state_offset(group_id: Int32, word: Int32) -> Int64:
+    return Int64(group_id) * Int64(_COOP_STATE_WORDS) + Int64(word)
 
 
 @cute.jit
@@ -1556,6 +1545,10 @@ class DSAFusedIndexerKernel:
         max_seq_capacity: int = 1 << 30,
         vectorized_q_load: bool = False,
         q_row_stride_bytes: int = 0,
+        mxfp4: bool = False,
+        candidates: bool = False,
+        page_size: int = 64,
+        score_width: int = 0,
     ):
         self.num_heads_static = int(num_heads_static)
         self.topk = int(topk)
@@ -1565,6 +1558,23 @@ class DSAFusedIndexerKernel:
         self.max_seq_capacity = max(0, int(max_seq_capacity))
         self.vectorized_q_load = bool(vectorized_q_load)
         self.q_row_stride_bytes = int(q_row_stride_bytes)
+        self.mxfp4 = bool(mxfp4)
+        self.candidates = bool(candidates)
+        self.page_size = int(page_size)
+        self.score_width = int(score_width)
+        if self.mxfp4:
+            from .mxfp4 import _TensorCorePagedScore
+
+            if (
+                self.kv_layout != KV_LAYOUT_PAGED
+                or bool(paged_output)
+                or self.topk != 512
+            ):
+                raise ValueError("fused MXFP4 requires paged logical top-512 output")
+            self.vectorized_q_load = False
+            self.mxfp4_scorer = _TensorCorePagedScore(
+                self.num_heads_static, self.candidates, self.page_size
+            )
         # dim-0 byte stride of k_quant_bytes for the PAGED wide load. Defaults to
         # the contiguous 8192 (64*128); the packed paged cache interleaves per-page
         # scales so its real page stride is 8448 -- run_fused_paged_indexer passes
@@ -1615,6 +1625,8 @@ class DSAFusedIndexerKernel:
             and self.num_q_head_tiles == 4
             and self.ctas_per_group <= 16
         )
+        if self.mxfp4:
+            self.direct_k_score = True
         self.score_warps = self.token_groups * self.num_q_head_tiles
         self.score_threads = self.score_warps * _WARP_THREADS
         # Over-sized accumulator: scored tokens append until topk+slack, then
@@ -1626,6 +1638,8 @@ class DSAFusedIndexerKernel:
             num_heads=self.num_heads_static,
             topk=self.topk,
         )
+        if self.mxfp4:
+            batch_slack = 1024
         self.carry_cap = int(self.topk) + int(batch_slack)
         # The trim radix runs over <= carry_cap elements, so its threshold-bin
         # candidate set is bounded by carry_cap -> size cand0/cand1 to that.
@@ -1685,6 +1699,7 @@ class DSAFusedIndexerKernel:
         pack_indices: cute.Tensor,
         merge_state: cute.Tensor,
         stream: cuda.CUstream,
+        mxfp4_operands: tuple = (),
     ):
         self.kernel(
             q_bytes,
@@ -1700,6 +1715,7 @@ class DSAFusedIndexerKernel:
             pack_values,
             pack_indices,
             merge_state,
+            mxfp4_operands,
         ).launch(
             grid=(q_bytes.shape[0] * self.ctas_per_group, 1, 1),
             block=[_RADIX_THREADS, 1, 1],
@@ -1726,6 +1742,7 @@ class DSAFusedIndexerKernel:
         pack_values: cute.Tensor,
         pack_indices: cute.Tensor,
         merge_state: cute.Tensor,
+        mxfp4_operands: tuple = (),
     ):
         tx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
@@ -1862,9 +1879,23 @@ class DSAFusedIndexerKernel:
         else:
             abs_start = Int32(k_start[q_idx])
             seq_len = Int32(k_end[q_idx]) - abs_start
+        if cutlass.const_expr(self.mxfp4):
+            seq_len = cutlass.min(seq_len, mxfp4_operands[1][0])
+            if cutlass.const_expr(self.candidates):
+                seq_len = cutlass.min(Int32(self.score_width), mxfp4_operands[3][q_idx])
+                if seqlens_per_query[q_idx] <= Int32(0) or mxfp4_operands[1][
+                    0
+                ] <= Int32(0):
+                    seq_len = Int32(0)
+            else:
+                seq_len = cutlass.min(seq_len, Int32(self.score_width))
         if seq_len < Int32(0):
             seq_len = Int32(0)
         total_pages = (seq_len + Int32(_PAGE_SIZE - 1)) // Int32(_PAGE_SIZE)
+        if cutlass.const_expr(self.mxfp4):
+            total_pages = Int32(
+                (Int64(seq_len) + Int64(_PAGE_SIZE - 1)) // Int64(_PAGE_SIZE)
+            )
         # This CTA's page-slice of the row (balanced split across ctas_pg CTAs).
         pages_per_cta = (total_pages + ctas_pg - Int32(1)) // ctas_pg
         page_start = cta_in_group * pages_per_cta
@@ -1912,7 +1943,7 @@ class DSAFusedIndexerKernel:
         if cutlass.const_expr(self.vectorized_q_load):
             if q_owner != Int32(0):
                 st_shared_v4_u32(q_dst_addr, q_v0, q_v1, q_v2, q_v3)
-        else:
+        elif cutlass.const_expr(not self.mxfp4):
             # Preserve arbitrary tensor head/row strides.  Each thread moves
             # individual bytes directly into the same XOR-permuted granules as
             # the vectorized loader; this is the correctness fallback for views
@@ -1950,7 +1981,123 @@ class DSAFusedIndexerKernel:
         head_tile_slot = warp_idx % Int32(self.num_q_head_tiles)
         token_group = warp_idx // Int32(self.num_q_head_tiles)
 
-        if cutlass.const_expr(self.direct_k_score):
+        if cutlass.const_expr(self.mxfp4):
+            carry_count = Int32(0)
+            span_first = Int32(
+                cutlass.min(Int64(page_start) * Int64(_PAGE_SIZE), Int64(seq_len))
+            )
+            span_end = Int32(
+                cutlass.min(Int64(page_end) * Int64(_PAGE_SIZE), Int64(seq_len))
+            )
+            tile_start = span_first
+            q_flat = cute.make_tensor(
+                q_bytes.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            qs_flat = cute.make_tensor(
+                mxfp4_operands[0].iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            weights_flat = cute.make_tensor(
+                weights.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            pool_flat = cute.make_tensor(
+                k_quant_bytes.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            pages_flat = cute.make_tensor(
+                real_page_table.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            candidates_flat = cute.make_tensor(
+                mxfp4_operands[2].iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            while tile_start < span_end:
+                count = cutlass.min(Int32(512), span_end - tile_start)
+                if carry_count + Int32(512) > Int32(self.carry_cap):
+                    cute.arch.sync_threads()
+                    _fused_radix_select(
+                        s_c0_values,
+                        s_c0_gindex,
+                        s_c1_values,
+                        s_c1_gindex,
+                        carry_count,
+                        topk_static,
+                        self.cands,
+                        tx,
+                        s_hist0,
+                        s_hist1,
+                        s_out,
+                        s_cand0,
+                        s_cand1,
+                        h0,
+                        ctr,
+                        thr,
+                        ni0,
+                        ni1,
+                        lr,
+                    )
+                    cute.arch.sync_threads()
+                    i = Int32(tx)
+                    while i < topk_static:
+                        s_c0_values[i] = Float32(s_c1_values[i])
+                        s_c0_gindex[i] = Int32(s_c1_gindex[i])
+                        i += Int32(_RADIX_THREADS)
+                    cute.arch.sync_threads()
+                    carry_count = topk_static
+                self.mxfp4_scorer._score_tile(
+                    q_flat,
+                    qs_flat,
+                    weights_flat,
+                    pool_flat,
+                    pages_flat,
+                    seqlens_per_query,
+                    mxfp4_operands[1],
+                    candidates_flat,
+                    mxfp4_operands[3],
+                    s_c0_values,
+                    Int32(q_bytes.shape[0]),
+                    Int32(self.score_width),
+                    Int32(real_page_table.shape[1]),
+                    Int64(real_page_table.stride[0]),
+                    Int64(self.k_quant_page_stride),
+                    Int64(k_quant_bytes.shape[0]),
+                    tile_start,
+                    row_index=q_idx,
+                    local_output=True,
+                    output_base=carry_count,
+                    logical_indices=s_c0_gindex,
+                )
+                carry_count += count
+                tile_start += count
+            cute.arch.sync_threads()
+            if carry_count > topk_static:
+                _fused_radix_select(
+                    s_c0_values,
+                    s_c0_gindex,
+                    s_c1_values,
+                    s_c1_gindex,
+                    carry_count,
+                    topk_static,
+                    self.cands,
+                    tx,
+                    s_hist0,
+                    s_hist1,
+                    s_out,
+                    s_cand0,
+                    s_cand1,
+                    h0,
+                    ctr,
+                    thr,
+                    ni0,
+                    ni1,
+                    lr,
+                )
+                cute.arch.sync_threads()
+                i = Int32(tx)
+                while i < topk_static:
+                    s_c0_values[i] = Float32(s_c1_values[i])
+                    s_c0_gindex[i] = Int32(s_c1_gindex[i])
+                    i += Int32(_RADIX_THREADS)
+                cute.arch.sync_threads()
+                carry_count = topk_static
+        elif cutlass.const_expr(self.direct_k_score):
             # Warp-owns-tokens score: every warp streams 8 consecutive tokens
             # per round with K fragments read straight from L2 (no staging,
             # no producer pipeline, no per-page barrier). Slot bookkeeping is
@@ -2509,7 +2656,7 @@ class DSAFusedIndexerKernel:
             ctas_pg = Int32(self.ctas_per_group)
             barrier_phase = Int32(0)
             cap = Int32(self.pack_cap)
-            slab_base = group_id * cap
+            slab_base = Int64(group_id) * Int64(cap)
             pack_v_row = cute.make_tensor(
                 pack_values.iterator + slab_base,
                 cute.make_layout((self.pack_cap,), stride=(1,)),

@@ -1,9 +1,9 @@
-"""V4.1 paged DSA specialization with a staged TP reduction boundary.
+"""Paged MXFP4 scoring with distinct BF16 arithmetic boundaries.
 
-Unlike the FP8 fused route, the published V4.1 score rounds the dot, weighted
-product, and head sum to BF16 (model.py:550-559). Selection must follow the TP
-sum. Reuse the exact native row selector, not the MSA page/head-max reduction
-or the streaming top-k's unrelated candidate folds.
+The staged score/select API permits an external tensor-parallel score sum.
+Fused selection requires every query head contributing to the score on each
+rank; Flare replicates all 32 V4.1 index heads. Hierarchical block selection
+retains its mandatory newest block.
 """
 
 from __future__ import annotations
@@ -582,14 +582,21 @@ class _TensorCorePagedScore(_PagedScore):
         pool_stride: Int64,
         pool_pages: Int64,
         tile_start: Int32,
+        row_index: Int32 | None = None,
+        local_output: cutlass.Constexpr[bool] = False,
+        output_base: Int32 = 0,
+        logical_indices: cute.Tensor | None = None,
     ):
         tx, _, _ = cute.arch.thread_idx()
         _, row, _ = cute.arch.block_idx()
+        if cutlass.const_expr(row_index is not None):
+            row = row_index
         lane = Int32(tx) % Int32(32)
-        col = tile_start + (Int32(tx) // Int32(32)) * Int32(16) + lane // Int32(4)
+        col = Int64(tile_start) + Int64(tx // 32) * Int64(16) + Int64(lane // 4)
         kb = cute.make_rmem_tensor((2,), Int64)
         sb = cute.make_rmem_tensor((2,), Int64)
         valid_key = cute.make_rmem_tensor((2,), cutlass.Boolean)
+        logical_ids = cute.make_rmem_tensor((2,), Int32)
         totals = cute.make_rmem_tensor((2,), Float32)
         totals.fill(0.0)
         for part in cutlass.range_constexpr(2):
@@ -599,7 +606,7 @@ class _TensorCorePagedScore(_PagedScore):
             if cutlass.const_expr(self.candidates):
                 valid = valid and column < candidate_lengths[row]
                 if valid:
-                    pos = candidates[Int64(row) * Int64(width) + Int64(column)]
+                    pos = Int64(candidates[Int64(row) * Int64(width) + Int64(column)])
             valid = valid and pos >= Int32(0) and pos < lengths[row] and pos < active[0]
             valid = valid and pos // Int32(self.page_size) < page_width
             page = Int64(-1)
@@ -613,6 +620,7 @@ class _TensorCorePagedScore(_PagedScore):
             valid = valid and page >= Int64(0) and page < pool_pages
             token = Int64(pos % Int32(self.page_size))
             valid_key[part] = valid
+            logical_ids[part] = Int32(pos)
             kb[part] = page * pool_stride + token * Int64(64)
             sb[part] = (
                 page * pool_stride + Int64(self.page_size * 64) + token * Int64(4)
@@ -685,7 +693,14 @@ class _TensorCorePagedScore(_PagedScore):
                     value = BFloat16(-float("inf"))
                     if valid_key[part]:
                         value = BFloat16(totals[part])
-                    scores[Int64(row) * Int64(width) + Int64(column)] = value
+                    offset = Int64(row) * Int64(width) + Int64(column)
+                    if cutlass.const_expr(local_output):
+                        offset = Int64(output_base) + Int64(column - tile_start)
+                    scores[offset] = value
+                    if cutlass.const_expr(logical_indices is not None):
+                        logical_indices[offset] = (
+                            logical_ids[part] if valid_key[part] else Int32(-1)
+                        )
 
 
 class _SelectPrepare:
@@ -777,188 +792,6 @@ class _SelectPrepare:
             col += cutlass.min(grid_stride, extent - col)
 
 
-class _SortPositions:
-    def __init__(self, topk: int, expand_blocks: bool):
-        self.topk = topk
-        self.expand_blocks = expand_blocks
-
-    @cute.jit
-    def __call__(
-        self,
-        indices: cute.Pointer,
-        values: cute.Pointer,
-        out: cute.Pointer,
-        out_values: cute.Pointer,
-        lengths: cute.Pointer,
-        active: cute.Pointer,
-        out_lengths: cute.Pointer,
-        rows: Int32,
-        stream: cuda.CUstream,
-    ):
-        self.kernel(
-            _flat(indices),
-            _flat(values),
-            _flat(out),
-            _flat(out_values),
-            _flat(lengths),
-            _flat(active),
-            _flat(out_lengths),
-        ).launch(grid=(rows, 1, 1), block=(256, 1, 1), stream=stream)
-
-    @cute.kernel
-    def kernel(
-        self,
-        indices: cute.Tensor,
-        values: cute.Tensor,
-        out: cute.Tensor,
-        out_values: cute.Tensor,
-        lengths: cute.Tensor,
-        active: cute.Tensor,
-        out_lengths: cute.Tensor,
-    ):
-        tx, _, _ = cute.arch.thread_idx()
-        row, _, _ = cute.arch.block_idx()
-        smem = cutlass.utils.SmemAllocator()
-        # Each of the eight warps owns one element from every 256-slot stripe.
-        # The first five bitonic levels are therefore warp-local; retain them in
-        # registers and publish only the completed 32-element runs.  Higher
-        # levels retain shared storage only for compare-exchanges that actually
-        # cross a warp boundary.
-        si = smem.allocate_tensor(
-            Int32, cute.make_layout((self.topk,)), byte_alignment=16
-        )
-        if cutlass.const_expr(not self.expand_blocks):
-            sv = smem.allocate_tensor(
-                Float32, cute.make_layout((self.topk,)), byte_alignment=16
-            )
-        visible = cutlass.min(
-            cutlass.max(lengths[row], Int32(0)), cutlass.max(active[0], Int32(0))
-        )
-        for slot in cutlass.range(Int32(tx), self.topk, 256):
-            base = Int64(row) * Int64(self.topk) + Int64(slot)
-            idx = indices[base]
-            value = values[base]
-            valid = idx >= Int32(0) and value > Float32(-float("inf"))
-            if cutlass.const_expr(self.expand_blocks):
-                valid = valid and idx * Int32(8) < visible
-            else:
-                valid = valid and idx < visible
-            if not valid:
-                idx = Int32(2147483647)
-
-            for level in cutlass.range_constexpr(1, 6):
-                for step in cutlass.range_constexpr(level - 1, -1, -1):
-                    other_idx = cute.arch.shuffle_sync_bfly(idx, offset=1 << step)
-                    ascending = ((slot & Int32(1 << level)) == Int32(0)) == (
-                        (slot & Int32(1 << step)) == Int32(0)
-                    )
-                    swap = (ascending and idx > other_idx) or (
-                        not ascending and idx < other_idx
-                    )
-                    if cutlass.const_expr(not self.expand_blocks):
-                        other_value = cute.arch.shuffle_sync_bfly(
-                            value, offset=1 << step
-                        )
-                    if swap:
-                        idx = other_idx
-                        if cutlass.const_expr(not self.expand_blocks):
-                            value = other_value
-            si[slot] = idx
-            if cutlass.const_expr(not self.expand_blocks):
-                sv[slot] = value
-        cute.arch.sync_threads()
-
-        for level in cutlass.range_constexpr(6, self.topk.bit_length()):
-            # Steps >= 5 pair lanes from distinct warps, so shared storage and a
-            # CTA fence are required only for these exchanges.
-            for step in cutlass.range_constexpr(level - 1, 4, -1):
-                for slot in cutlass.range(Int32(tx), self.topk, 256):
-                    other = slot ^ Int32(1 << step)
-                    if other > slot:
-                        idx, other_idx = si[slot], si[other]
-                        ascending = (slot & Int32(1 << level)) == Int32(0)
-                        if (ascending and idx > other_idx) or (
-                            not ascending and idx < other_idx
-                        ):
-                            si[slot], si[other] = other_idx, idx
-                            if cutlass.const_expr(not self.expand_blocks):
-                                value, other_value = sv[slot], sv[other]
-                                sv[slot], sv[other] = other_value, value
-                cute.arch.sync_threads()
-
-            # The remaining low-bit stages are again confined to each warp.
-            for slot in cutlass.range(Int32(tx), self.topk, 256):
-                idx = si[slot]
-                if cutlass.const_expr(not self.expand_blocks):
-                    value = sv[slot]
-                for step in cutlass.range_constexpr(4, -1, -1):
-                    other_idx = cute.arch.shuffle_sync_bfly(idx, offset=1 << step)
-                    ascending = ((slot & Int32(1 << level)) == Int32(0)) == (
-                        (slot & Int32(1 << step)) == Int32(0)
-                    )
-                    swap = (ascending and idx > other_idx) or (
-                        not ascending and idx < other_idx
-                    )
-                    if cutlass.const_expr(not self.expand_blocks):
-                        other_value = cute.arch.shuffle_sync_bfly(
-                            value, offset=1 << step
-                        )
-                    if swap:
-                        idx = other_idx
-                        if cutlass.const_expr(not self.expand_blocks):
-                            value = other_value
-                si[slot] = idx
-                if cutlass.const_expr(not self.expand_blocks):
-                    sv[slot] = value
-            cute.arch.sync_threads()
-
-        for slot in cutlass.range(Int32(tx), self.topk, 256):
-            idx = si[slot]
-            valid = idx != Int32(2147483647)
-            if cutlass.const_expr(self.expand_blocks):
-                for offset in cutlass.range_constexpr(8):
-                    pos = idx * Int32(8) + Int32(offset)
-                    out_pos = (Int64(row) * Int64(self.topk) + Int64(slot)) * Int64(
-                        8
-                    ) + Int64(offset)
-                    out[out_pos] = Int32(-1)
-                    if valid and pos < visible:
-                        out[out_pos] = pos
-            else:
-                out_pos = Int64(row) * Int64(self.topk) + Int64(slot)
-                out[out_pos] = Int32(-1)
-                out_values[out_pos] = Float32(-float("inf"))
-                if valid:
-                    out[out_pos] = idx
-                    out_values[out_pos] = sv[slot]
-
-        if cutlass.const_expr(self.expand_blocks):
-            # Reuse the now-dead first eight index slots for a two-stage CTA
-            # reduction; this counts only selected, visible (including partial)
-            # blocks and avoids a serial thread-0 scan.
-            count = Int32(0)
-            for slot in cutlass.range(Int32(tx), self.topk, 256):
-                idx = si[slot]
-                if idx != Int32(2147483647):
-                    count += cutlass.min(Int32(8), visible - idx * Int32(8))
-            lane = Int32(tx) & Int32(31)
-            warp = Int32(tx) >> Int32(5)
-            for offset in cutlass.range_constexpr(5):
-                count += cute.arch.shuffle_sync_bfly(count, offset=1 << offset)
-            cute.arch.sync_threads()
-            if lane == Int32(0):
-                si[warp] = count
-            cute.arch.sync_threads()
-            if warp == Int32(0):
-                count = Int32(0)
-                if lane < Int32(8):
-                    count = si[lane]
-                for offset in cutlass.range_constexpr(5):
-                    count += cute.arch.shuffle_sync_bfly(count, offset=1 << offset)
-                if lane == Int32(0):
-                    out_lengths[row] = count
-
-
 @dataclass(frozen=True)
 class _CompiledLauncher:
     raw: object
@@ -977,6 +810,35 @@ class _CompiledLauncher:
 
 @program_cache
 def _compile(kind: str, recipe: tuple, device_index: int):
+    if kind == "deepselect":
+        from ._deepselect import prepare
+
+        raise_if_kernel_resolution_frozen(
+            "DeepSelect preparation", target=prepare, cache_key=(kind, recipe)
+        )
+        return prepare(recipe[0], device_index)
+    if kind == "sort":
+        from ._position_sort import _sort_positions
+
+        topk, expand = recipe
+        raise_if_kernel_resolution_frozen(
+            "triton.compile", target=_sort_positions, cache_key=(kind, recipe)
+        )
+        with torch.cuda.device(device_index):
+            raw = _sort_positions.warmup(
+                torch.int32,
+                torch.float32,
+                torch.int32,
+                torch.float32,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                K=topk,
+                EXPAND=expand,
+                num_warps=8 if expand else 4,
+                grid=(1, 1, 1),
+            )
+        return _CompiledLauncher(raw, ())
     # Pointer-only launch ABIs: all live row/page/width/stride quantities are
     # runtime scalars and do not contribute to compile identity.
     if kind == "quantize":
@@ -1005,9 +867,7 @@ def _compile(kind: str, recipe: tuple, device_index: int):
         dtypes = (BFloat16, Float32, Int32, Int32, Int32, Int32)
         scalars = (Int32(1), Int32(64), Int32(64))
     else:
-        obj = _SortPositions(*recipe)
-        dtypes = (Int32, Float32, Int32, Float32, Int32, Int32, Int32)
-        scalars = (Int32(1),)
+        raise ValueError(f"unknown MXFP4 indexer kernel {kind}")
     key = (kind, recipe)
     raise_if_kernel_resolution_frozen("cute.compile", target=obj, cache_key=key)
     pointers = tuple(
@@ -1029,6 +889,9 @@ def _launch(kind, recipe, tensors, scalars, *, launcher=None):
     with torch.cuda.device(tensors[0].device):
         if launcher is None:
             launcher = _compile(kind, recipe, tensors[0].device.index)
+        if kind == "sort":
+            launcher.raw[(scalars[0], 1, 1)](*tensors, *recipe)
+            return
         launcher.raw(
             *(
                 _ptr(t, dtype)
@@ -1037,6 +900,284 @@ def _launch(kind, recipe, tensors, scalars, *, launcher=None):
             *scalars,
             current_cuda_stream(),
         )
+
+
+@dataclass(frozen=True)
+class _PreparedFusedMXFP4:
+    launcher: object
+    args: tuple
+    sort_launcher: object
+    sort_tensors: tuple
+    scratch: tuple
+    owners: tuple
+    rows: int
+
+    @property
+    def __b12x_dependencies__(self):
+        return (self.launcher, self.sort_launcher)
+
+    @property
+    def __b12x_programs__(self):
+        from b12x._lib.compile_plan import program_keys
+
+        return program_keys((self.launcher, self.sort_launcher))
+
+    def __call__(self):
+        from b12x._lib.compiler import run_compiled
+
+        with torch.cuda.device(self.scratch[-1].device):
+            self.scratch[-1].zero_()
+            args = (*self.args[:13], current_cuda_stream(), self.args[14])
+            run_compiled(self.launcher, args)
+            _launch(
+                "sort",
+                (512, False),
+                self.sort_tensors,
+                (self.rows,),
+                launcher=self.sort_launcher,
+            )
+
+
+def prepare_fused_mxfp4(
+    *,
+    q_mxfp4,
+    q_scales,
+    query_weights,
+    index_k_cache,
+    page_table,
+    cache_lengths,
+    active_width,
+    output_indices,
+    output_scores=None,
+    candidate_indices=None,
+    candidate_lengths=None,
+    page_size=64,
+    ctas_per_row=None,
+):
+    """Prepare streaming top-512 selection with complete per-rank head scores.
+
+    Queries and keys use packed E2M1 with four UE8M0 scales per head. Inputs
+    remain mutable at fixed addresses. The returned callable resets its fixed
+    merge arena, scores and selects without a context-sized score tensor, and
+    sorts selected logical positions. Hierarchical block production is separate.
+    """
+    from .fused_indexer import (
+        DSAFusedIndexerKernel,
+        KV_LAYOUT_PAGED,
+        _alloc_merge_scratch,
+    )
+    from .kernel import _to_kernel_tensor
+
+    raise_if_kernel_resolution_frozen(
+        "fused MXFP4 preparation", target=prepare_fused_mxfp4
+    )
+    device = q_mxfp4.device
+    if device.type != "cuda" or q_mxfp4.ndim != 3:
+        raise ValueError("q_mxfp4 must be a CUDA [rows, heads, 64] tensor")
+    rows, heads, packed = map(int, q_mxfp4.shape)
+    if rows <= 0 or rows >= 2**31 or heads != 32 or packed != 64:
+        raise ValueError(
+            "fused MXFP4 requires positive rows and 32 complete index heads"
+        )
+    if page_size not in (64, 128):
+        raise ValueError("fused MXFP4 requires page_size 64 or 128")
+
+    def checked(tensor, name, shape, dtype, *, contiguous=True, align=1):
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tuple(tensor.shape) != tuple(shape)
+            or tensor.dtype != dtype
+            or tensor.device != device
+        ):
+            raise ValueError(f"{name} must be {dtype} {tuple(shape)} on {device}")
+        if contiguous and not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        if tensor.data_ptr() % align:
+            raise ValueError(f"{name} requires {align}-byte alignment")
+        return tensor
+
+    checked(q_mxfp4, "q_mxfp4", (rows, heads, 64), torch.uint8, align=4)
+    checked(q_scales, "q_scales", (rows, heads, 4), torch.uint8, align=2)
+    checked(query_weights, "query_weights", (rows, heads), torch.bfloat16, align=2)
+    checked(cache_lengths, "cache_lengths", (rows,), torch.int32, align=4)
+    checked(active_width, "active_width", (1,), torch.int32, align=4)
+    checked(output_indices, "output_indices", (rows, 512), torch.int32, align=4)
+    if output_scores is None:
+        output_scores = torch.empty((rows, 512), device=device, dtype=torch.float32)
+    checked(output_scores, "output_scores", (rows, 512), torch.float32, align=4)
+    if (
+        index_k_cache.ndim != 2
+        or index_k_cache.shape[1] < page_size * 68
+        or index_k_cache.stride(1) != 1
+        or index_k_cache.stride(0) < page_size * 68
+        or index_k_cache.stride(0) % 4
+    ):
+        raise ValueError("index_k_cache must contain aligned packed MXFP4 pages")
+    checked(
+        index_k_cache,
+        "index_k_cache",
+        index_k_cache.shape,
+        torch.uint8,
+        contiguous=False,
+        align=4,
+    )
+    if (
+        page_table.ndim != 2
+        or page_table.shape[0] not in (1, rows)
+        or page_table.stride(1) != 1
+        or page_table.stride(0) < 0
+    ):
+        raise ValueError("page_table must have one shared row or one row per query")
+    checked(
+        page_table,
+        "page_table",
+        page_table.shape,
+        torch.int32,
+        contiguous=False,
+        align=4,
+    )
+    if page_table.shape[0] == 1:
+        page_table = page_table.expand(rows, -1)
+    max_width = int(page_table.shape[1]) * page_size
+    candidates = candidate_indices is not None
+    if candidates:
+        if candidate_indices.ndim != 2 or candidate_indices.shape[0] != rows:
+            raise ValueError("candidate_indices must have one row per query")
+        checked(
+            candidate_indices,
+            "candidate_indices",
+            candidate_indices.shape,
+            torch.int32,
+            align=4,
+        )
+        checked(candidate_lengths, "candidate_lengths", (rows,), torch.int32, align=4)
+        width = int(candidate_indices.shape[1])
+    else:
+        if candidate_lengths is not None:
+            raise ValueError("candidate_lengths requires candidate_indices")
+        width = max_width
+        candidate_indices = output_indices
+        candidate_lengths = cache_lengths
+    if not 0 < width < 2**31 or max_width >= 2**31:
+        raise ValueError("logical positions must fit int32")
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if ctas_per_row is None:
+        ctas_per_row = max(1, min((width + 511) // 512, sms // rows))
+    ctas_per_row = int(ctas_per_row)
+    if ctas_per_row < 1 or (ctas_per_row > 1 and rows * ctas_per_row > sms):
+        raise ValueError("cooperating fused CTAs must fit one resident GPU wave")
+    raw_indices = torch.empty_like(output_indices)
+    raw_values = torch.empty_like(output_scores)
+    pack_v, pack_i, state = _alloc_merge_scratch(rows, 512, ctas_per_row, device)
+    kernel = DSAFusedIndexerKernel(
+        num_heads_static=heads,
+        topk=512,
+        kv_layout=KV_LAYOUT_PAGED,
+        ctas_per_group=ctas_per_row,
+        num_sms=sms,
+        merge_threshold=0,
+        max_seq_capacity=width,
+        k_quant_page_stride=int(index_k_cache.stride(0)),
+        mxfp4=True,
+        candidates=candidates,
+        page_size=page_size,
+        score_width=width,
+    )
+    tensors = (
+        q_mxfp4,
+        query_weights,
+        index_k_cache,
+        q_scales,
+        page_table,
+        cache_lengths,
+        cache_lengths,
+        cache_lengths,
+        raw_indices,
+        raw_values,
+        pack_v,
+        pack_i,
+        state,
+    )
+    dtypes = (
+        Uint8,
+        BFloat16,
+        Uint8,
+        Uint8,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Int32,
+        Float32,
+        Float32,
+        Int32,
+        Int32,
+    )
+    key = (
+        "mxfp4",
+        rows,
+        heads,
+        page_size,
+        width,
+        ctas_per_row,
+        sms,
+        candidates,
+        tuple(
+            (tuple(t.shape), tuple(t.stride()), str(t.dtype))
+            for t in (*tensors, active_width, candidate_indices)
+        ),
+    )
+    with torch.cuda.device(device):
+        args = tuple(
+            _to_kernel_tensor(t, d, assumed_align=1)
+            for t, d in zip(tensors, dtypes, strict=True)
+        )
+        operands = tuple(
+            _to_kernel_tensor(t, d, assumed_align=1)
+            for t, d in (
+                (q_scales, Uint8),
+                (active_width, Int32),
+                (candidate_indices, Int32),
+                (candidate_lengths, Int32),
+            )
+        )
+        args = (*args, current_cuda_stream(), operands)
+        launcher = b12x_compile(
+            kernel,
+            *args,
+            compile_spec=KernelCompileSpec.from_key(
+                "attention.indexer.fused_indexer", 3, key
+            ),
+        )
+        sort_launcher = _compile("sort", (512, False), device.index)
+    sort_tensors = (
+        raw_indices,
+        raw_values,
+        output_indices,
+        output_scores,
+        cache_lengths,
+        active_width,
+        cache_lengths,
+    )
+    owners = (
+        *tensors,
+        active_width,
+        candidate_indices,
+        candidate_lengths,
+        output_indices,
+        output_scores,
+    )
+    prepared = _PreparedFusedMXFP4(
+        launcher,
+        args,
+        sort_launcher,
+        sort_tensors,
+        (raw_indices, raw_values, pack_v, pack_i, state),
+        owners,
+        rows,
+    )
+    prepared()
+    return prepared
 
 
 def _check(tensor, name, shape, dtype, device):
@@ -1382,47 +1523,81 @@ def select_mxfp4(binding, *, launchers=None):
             launcher=None if launchers is None else launchers[(kind, recipe)],
         )
 
-    launch(
-        "prepare",
-        (bool(caps.max_candidates), False),
-        (
-            s["scores"],
-            s["logits"],
-            rt.cache_lengths,
-            rt.active_width,
-            candidate_lengths,
-            s["lengths"],
-        ),
-        (rows, s["scores"].shape[1], s["logits"].shape[1]),
-    )
-    run_row_topk(
-        row_logits=s["logits"],
-        lengths=s["lengths"],
-        topk=caps.topk,
-        output_values=s["values"],
-        output_indices=s["indices"],
-        output_gather_table=rt.candidate_indices,
-        launcher=None if launchers is None else launchers[("topk", caps.topk)][0],
-    )
     out_values = (
         binding.output_scores
         if binding.output_scores is not None
         else s["sorted_values"]
     )
-    launch(
-        "sort",
-        (caps.topk, False),
-        (
+    width = s["scores"].shape[1]
+    deepselect = ("deepselect", (bool(caps.max_candidates),))
+    if (
+        caps.mode == "decode"
+        and 512 <= width < 2**23
+        and width % 512 == 0
+        and s["scores"].data_ptr() % 16 == 0
+        and s["indices"].data_ptr() % 32 == 0
+        and (
+            (launchers is not None and deepselect in launchers)
+            or (
+                launchers is None
+                and torch.cuda.get_device_capability(caps.device) == (12, 0)
+            )
+        )
+    ):
+        recipe = (bool(caps.max_candidates),)
+        selector = (
+            _compile("deepselect", recipe, s["scores"].device.index)
+            if launchers is None
+            else launchers[("deepselect", recipe)]
+        )
+        selector(
+            s["scores"],
             s["indices"],
-            s["values"],
-            binding.output_indices,
-            out_values,
+            rt.candidate_indices if caps.max_candidates else s["indices"],
+            candidate_lengths,
             rt.cache_lengths,
             rt.active_width,
             s["lengths"],
-        ),
-        (rows,),
-    )
+            binding.output_indices,
+            out_values,
+        )
+    else:
+        launch(
+            "prepare",
+            (bool(caps.max_candidates), False),
+            (
+                s["scores"],
+                s["logits"],
+                rt.cache_lengths,
+                rt.active_width,
+                candidate_lengths,
+                s["lengths"],
+            ),
+            (rows, s["scores"].shape[1], s["logits"].shape[1]),
+        )
+        run_row_topk(
+            row_logits=s["logits"],
+            lengths=s["lengths"],
+            topk=caps.topk,
+            output_values=s["values"],
+            output_indices=s["indices"],
+            output_gather_table=rt.candidate_indices,
+            launcher=None if launchers is None else launchers[("topk", caps.topk)][0],
+        )
+        launch(
+            "sort",
+            (caps.topk, False),
+            (
+                s["indices"],
+                s["values"],
+                binding.output_indices,
+                out_values,
+                rt.cache_lengths,
+                rt.active_width,
+                s["lengths"],
+            ),
+            (rows,),
+        )
     if caps.candidate_topk_blocks:
         launch(
             "prepare",
@@ -1587,6 +1762,11 @@ def materialize_mxfp4(caps, *, device_index, score_kind=None):
         ("prepare", (bool(caps.max_candidates), False)),
         ("sort", (caps.topk, False)),
     ]
+    if caps.mode == "decode" and torch.cuda.get_device_capability(caps.device) == (
+        12,
+        0,
+    ):
+        recipes.append(("deepselect", (bool(caps.max_candidates),)))
     if caps.candidate_topk_blocks:
         recipes.extend(
             (

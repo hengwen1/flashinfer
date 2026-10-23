@@ -488,6 +488,11 @@ def plan(
                 candidate_topk_blocks=query.candidate_topk_blocks,
             )
             layout = plan_mxfp4(mx_caps, score_kind=selection.config.mxfp4_score_kind)
+            selector = programs.launchers.get(
+                ("deepselect", (bool(query.max_candidates),))
+            )
+            if selector is not None:
+                selector.validate_device(device.ordinal)
             return MXFP4PreparedState(layout, programs.launchers)
         layout = plan_indexer_scratch(
             _scratch_caps(query, device=caps.device, config=selection.config),

@@ -16,7 +16,6 @@ source query, never generated candidate ids.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.metadata
 import json
 import os
@@ -38,12 +37,10 @@ from b12x.attention import dsa_indexer as api
 from benchmarks.experimental.b12x.benchmark_mxfp4_indexer import (
     check_selection,
     quantized_reference,
-    tensor_hash,
+    score_reference,
 )
-from benchmarks.experimental.b12x.benchmark_v41_serving import repository_state
 from benchmarks.experimental.b12x.common import nvidia_smi_gpu_mode_snapshot
 from benchmarks.experimental.b12x.deepseek_attention_profiles import (
-    integration_provenance,
     load_attention_profile,
 )
 
@@ -109,10 +106,7 @@ def _mxfp4_oracle(
     candidate_lengths=None,
     lengths=None,
 ):
-    scores = (
-        torch.einsum("rhd,kd->rhk", decoded_q[:rows], decoded_k[:visible]).relu()
-        * weights[:rows, :, None]
-    ).sum(1)
+    scores = score_reference(decoded_q[:rows], decoded_k[:visible], weights[:rows])
     if lengths is not None:
         scores.masked_fill_(
             torch.arange(visible, device=scores.device)[None] >= lengths[:rows, None],
@@ -599,7 +593,6 @@ def _run_mxfp4_form(args, profile, form):
                         "high_pid_byte_offset": base * page_stride,
                         "raw_samples_us": samples,
                         "median_us": {k: median(v) for k, v in samples.items()},
-                        "score_sha256": tensor_hash(actual),
                         "allocation_bytes": before,
                         "correctness": "Exact independent BF16-stage MXFP4 score and top-k; source candidate block oracle; fixed-capacity frozen live-count reuse; physical page offset checks.",
                     }
@@ -836,7 +829,6 @@ def _run_v4_c4(args, profile, form):
                         "high_pid_byte_offset": base * page_stride,
                         "raw_samples_us": samples,
                         "median_us": {k: median(v) for k, v in samples.items()},
-                        "score_sha256": tensor_hash(expected),
                         "allocation_bytes": before,
                         "correctness": "Independent quantization-aware FP8 "
                         "paged oracle and native V4 fused score/select. FP8 has no "
@@ -876,9 +868,6 @@ def main():
     parser.add_argument("--model-path", type=Path)
     parser.add_argument("--tp-size", type=int, default=4)
     parser.add_argument("--block-size", type=int, default=256)
-    parser.add_argument(
-        "--vllm-path", help="integration checkout for source provenance"
-    )
     parser.add_argument(
         "--mode",
         choices=("decode", "prefill", "extend"),
@@ -949,7 +938,6 @@ def main():
         parser.error("--forms must name one or more forms in the selected profile")
     result = {
         "command": [sys.executable, *sys.argv],
-        "repository": repository_state(ROOT),
         "arguments": {
             **vars(args),
             "output": str(args.output),
@@ -965,19 +953,10 @@ def main():
             for k, v in os.environ.items()
             if k.startswith(("CUDA_", "CUTE_", "B12X_", "OMP_"))
         },
-        "source_sha256": {
-            str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in (
-                Path(__file__),
-                ROOT / "benchmarks/experimental/b12x/deepseek_attention_profiles.py",
-                ROOT / "flashinfer/experimental/b12x/attention/dsa_indexer/mxfp4.py",
-            )
-        },
         "gpu_before": nvidia_smi_gpu_mode_snapshot(),
         "scope": "Native DSA plans over synthetic prepared Q/K. Timings exclude learned projections, cache writes, TP collective and whole-model forward.",
         "results": [],
     }
-    result["integration"] = integration_provenance(args.vllm_path)
     result["cache_sharing"] = (
         "All query rows share one physical prefix; queries and source/reindex weights differ."
     )

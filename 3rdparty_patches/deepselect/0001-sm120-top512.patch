@@ -1,0 +1,136 @@
+diff --git a/README.md b/README.md
+index 7a15375..ce863f0 100644
+--- a/README.md
++++ b/README.md
+@@ -70,6 +70,20 @@ git submodule update --init --recursive
+ pip install -v .
+ ```
+
++For SM120, build the CUDA extension for the device architecture:
++
++```bash
++DEEP_SELECT_CUDA_ARCHS=120a NVCC_THREADS=1 MAX_JOBS=6 \
++  python -m pip install --no-build-isolation --no-deps .
++```
++
++The SM120 specialization in `csrc/sm120_topk512.cu` supports BF16 inputs,
++int32 indices, `topk <= 512`, `sorted=False`, `sorted_index=False`, and
++`return_value=False`. Its 256-thread, single-resident-block configuration
++uses two TMA load buffers to fit the SM120 shared-memory limit. Input row
++strides must be multiples of 1024 bytes and vocabulary width must be below
++2²³. Equal-score ties do not require prefix-index selection.
++
+ ## Usage
+
+ ```python
+diff --git a/csrc/api.cpp b/csrc/api.cpp
+index 03ce550..7f21b78 100644
+--- a/csrc/api.cpp
++++ b/csrc/api.cpp
+@@ -33,6 +33,9 @@
+ #error "Exactly one of DEEP_SELECT_IS_BUILD_ON_CUDA / DEEP_SELECT_IS_BUILD_ON_ASCEND must be defined (see setup.py)"
+ #endif
+
++void run_sm120_bf16_topk512(const TopkSelectArgs &args);
++bool sm120_topk512_available();
++
+ void topk(
+     torch::Tensor &input,
+     int topk,
+@@ -147,6 +150,10 @@ void topk(
+     // Contract: sorted_value is a 32-bit-value-only feature.
+     TORCH_CHECK(!(sorted_value && value_t == at::kBFloat16), "`sorted_value` is only supported for float32 input");
+
++    if (device_prop->major == 12 && device_prop->minor == 0 && value_t == at::kBFloat16 && output_index_t == at::kInt && topk <= 512 && !sorted_value && !sorted_index && !return_value) {
++        run_sm120_bf16_topk512(args);
++        return;
++    }
+     uint32_t num_sm = device_prop->multiProcessorCount;
+     uint32_t num_waves = (uint32_t)(batch_size + num_sm - 1) / num_sm;
+
+@@ -254,4 +261,7 @@ std::pair<uint32_t, uint32_t> get_alignment_requirement() {
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("topk", &topk);
+     m.def("get_alignment_requirement", &get_alignment_requirement);
++#ifdef DEEP_SELECT_IS_BUILD_ON_CUDA
++    m.def("sm120_topk512_available", &sm120_topk512_available);
++#endif
+ }
+diff --git a/deep_select/__version__.py b/deep_select/__version__.py
+index 5becc17..a327ec3 100644
+--- a/deep_select/__version__.py
++++ b/deep_select/__version__.py
+@@ -1 +1 @@
+-__version__ = "1.0.0"
++__version__ = "1.0.0+sm120.top512"
+diff --git a/setup.py b/setup.py
+index 879a770..371120b 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1,6 +1,5 @@
+ import os
+ import subprocess
+-from datetime import datetime
+ from pathlib import Path
+
+ from setuptools import setup, find_packages
+@@ -11,6 +10,7 @@ exec(open("deep_select/__version__.py").read())
+
+ CUDA_SOURCES = [
+     "csrc/api.cpp",
++    "csrc/sm120_topk512.cu",
+
+     # Generated via `scripts/generate_instantiations.py`
+
+@@ -262,16 +262,6 @@ if overrided_platform is not None:
+     build_target_platform = overrided_platform_dict[overrided_platform]
+ print(f"Build target: {build_target_platform}")
+
+-try:
+-    cmd = ['git', 'rev-parse', '--short', 'HEAD']
+-    git_rev = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode('ascii').rstrip()
+-except Exception:
+-    # e.g. building from a source tarball that has no `.git`. Keep the version
+-    # a valid PEP 440 local version in that case.
+-    git_rev = "unknown"
+-
+-datetime_rev = datetime.now().strftime("%Y%m%d.%H%M%S")
+-
+ if build_target_platform == kk.Platform.CUDA:
+     ext_modules, build_ext = build_on_cuda_platform()
+ elif build_target_platform == kk.Platform.ASCEND:
+@@ -282,7 +272,7 @@ else:
+
+ setup(
+     name="deep_select",
+-    version=f"{__version__}+{git_rev}.{datetime_rev}",
++    version=__version__,
+     packages=find_packages(include=['deep_select']),
+     ext_modules=ext_modules,
+     cmdclass={"build_ext": build_ext},
+diff --git a/csrc/sm120_topk512.cu b/csrc/sm120_topk512.cu
+new file mode 100644
+index 0000000..8e01d40
+--- /dev/null
++++ b/csrc/sm120_topk512.cu
+@@ -0,0 +1,20 @@
++#include "cuda_kernels/v3/topk_select.cuh"
++
++using Sm120Topk512Config = TopkSelectConfig<
++    nv_bfloat16, int32_t, false, false, false, 512, 256, 1, 4096, 4096, 2>;
++
++bool sm120_topk512_available() {
++    using Kernel = topk_select_bf16_normal::TopkSelectKernelBF16Normal<Sm120Topk512Config>;
++    cudaFuncAttributes attributes;
++    auto status = cudaFuncGetAttributes(&attributes, topk_select_bf16_normal::topk_kernel<Kernel>);
++    if (status == cudaErrorNoKernelImageForDevice || status == cudaErrorInvalidDeviceFunction) {
++        cudaGetLastError();
++        return false;
++    }
++    KU_CUDA_CHECK(status);
++    return true;
++}
++
++void run_sm120_bf16_topk512(const TopkSelectArgs &args) {
++    topk_select_bf16_normal::run_topk_select_kernel<Sm120Topk512Config>(args);
++}

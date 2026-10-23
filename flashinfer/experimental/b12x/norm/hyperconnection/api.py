@@ -46,6 +46,18 @@ def run_grouped_rmsnorm(state, weight, *, eps, binding: Binding, zero_centered=T
     return binding.normalized
 
 
+def run_indexed_rmsnorm(state, weight, indices, *, eps, out, plan: Plan):
+    """Normalize selected rows into caller-owned output.
+
+    Indices are contiguous int32/int64 values in [0, state.shape[0]); duplicates
+    and arbitrary ordering are supported. Values are supplied by the caller.
+    """
+    torch.ops.b12x.hyperconnection_indexed_rmsnorm(
+        state, weight, indices, out, float(eps), plan.handle
+    )
+    return out
+
+
 def run_scaled_silu(projected_down, *, binding: Binding):
     if projected_down.shape[0] != binding.tokens:
         raise ValueError("projection rows differ from bound live rows")
@@ -169,6 +181,7 @@ __all__ = [
     "plan",
     "bind",
     "run_grouped_rmsnorm",
+    "run_indexed_rmsnorm",
     "run_scaled_silu",
     "run_gate_mean",
     "run_combine",

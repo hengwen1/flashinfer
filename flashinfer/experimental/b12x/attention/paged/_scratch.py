@@ -504,6 +504,7 @@ class B12XPagedAttentionScratch:
     _prepared_plane_tma_descs: object | None = None
 
     _prefill_graph_max_q_rows_per_req: int | None = None
+    _external_prefill_schedule: bool = False
     msa_block_sparse: bool = False
     msa_union_tile: bool = False
     _q2k_indices_data_ptr: int | None = None
@@ -667,8 +668,10 @@ class B12XPagedAttentionScratch:
                         f"{int(active_total_q)}"
                     )
                 self._bind_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
-                self._copy_cached_plan_metadata(self._plan_metadata_cache)
-                self._update_prefill_graph_replay_metadata_from_runtime()
+                if not self._plan.split_kv:
+                    self._copy_cached_plan_metadata(self._plan_metadata_cache)
+                if not self._external_prefill_schedule:
+                    self._update_prefill_graph_replay_metadata_from_runtime()
                 return self
 
             if self.use_cuda_graph and torch.cuda.is_current_stream_capturing():
@@ -1095,37 +1098,13 @@ class B12XPagedAttentionScratch:
             raise RuntimeError(
                 "prefill graph replay shape is only valid for graph extend/verify"
             )
-        active_work_items = [
-            (request_idx, q_tile_idx, kv_tile_idx)
-            for request_idx, q_tile_idx, kv_tile_idx, valid in zip(
-                self._plan.request_indices,
-                self._plan.qo_tile_indices,
-                self._plan.kv_tile_indices,
-                self._plan.block_valid_mask,
-                strict=False,
-            )
-            if valid
-        ]
-        if not active_work_items:
-            raise RuntimeError("prefill graph replay plan contains no active work")
-        max_q_tiles_per_req = (
-            max(q_tile_idx for _, q_tile_idx, _ in active_work_items) + 1
-        )
-        max_chunks_per_q_tile = (
-            max(kv_tile_idx for _, _, kv_tile_idx in active_work_items) + 1
-        )
-        max_q_rows_per_req = max(
-            1,
-            (
-                int(max_q_tiles_per_req) * int(self._plan.cta_tile_q)
-                + int(self._plan.gqa_group_size)
-                - 1
-            )
-            // int(self._plan.gqa_group_size),
-        )
-        self._prefill_graph_max_q_tiles_per_req = int(max_q_tiles_per_req)
-        self._prefill_graph_max_chunks_per_q_tile = int(max_chunks_per_q_tile)
-        self._prefill_graph_max_q_rows_per_req = int(max_q_rows_per_req)
+        from .schedule import replay_shape
+
+        (
+            self._prefill_graph_max_q_tiles_per_req,
+            self._prefill_graph_max_chunks_per_q_tile,
+            self._prefill_graph_max_q_rows_per_req,
+        ) = replay_shape(self._plan)
 
     def _update_prefill_graph_replay_metadata_from_runtime(self) -> None:
         if self._plan is None:
@@ -1179,6 +1158,8 @@ class B12XPagedAttentionScratch:
             page_size=int(self.page_size),
             split_kv=bool(self._plan.split_kv),
             window_left=int(self._plan.window_left),
+            msa_block_sparse=bool(self._plan.msa_block_sparse),
+            fixed_kv_chunk_size=int(self._plan.kv_chunk_size),
         )
 
     def _validate_decode_graph_replay_capacity(self, *, batch: int) -> None:
@@ -2345,6 +2326,7 @@ class B12XPagedAttentionScratchPlan:
         relative_attention_bias: torch.Tensor | None = None,
         q2k_indices: torch.Tensor | None = None,
         metadata_launchers: object | None = None,
+        external_schedule: object | None = None,
     ) -> B12XPagedAttentionBinding:
         scratch_storage = scratch_tensor(
             scratch,
@@ -2368,6 +2350,8 @@ class B12XPagedAttentionScratchPlan:
             owner_scratch_plan=self,
         )
         scratch_views.install_prepared_resources(metadata_launchers=metadata_launchers)
+        if external_schedule is not None:
+            external_schedule.install(scratch_views, self)
         scratch_views._q2k_indices_data_ptr = self._q2k_indices_data_ptr
         binding = build_paged_attention_binding(
             scratch=scratch_views,
@@ -2484,7 +2468,14 @@ def _compile_lengths(
         q_lengths = (1,) * batch
     else:
         requested = int(invocation.get("query_len", 0))
-        if requested > 0 and requested * batch == total_q:
+        if requested > 0 and (
+            requested * batch == total_q
+            or (
+                caps.mode == "verify"
+                and caps.msa_block_sparse
+                and requested * batch < total_q
+            )
+        ):
             q_lengths = (requested,) * batch
         else:
             base, remainder = divmod(total_q, batch)
@@ -2570,7 +2561,9 @@ def make_compile_bindings(
         tensors["cache_seqlens"],
         tensors["cu_seqlens_q"],
         mode=caps.mode,
-        fixed_split_size=int(invocation.get("fixed_split_size", -1)),
+        fixed_split_size=config.chunk_pages_lut()[-1]
+        if caps.msa_block_sparse and caps.mode == "verify"
+        else int(invocation.get("fixed_split_size", -1)),
         disable_split_kv=bool(invocation.get("disable_split_kv", False)),
         force_split_kv=force_split,
         enable_cuda_graph=caps.use_cuda_graph,

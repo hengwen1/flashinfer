@@ -62,3 +62,59 @@ def _fake(
     a4_prefill,
 ) -> None:
     pass
+
+
+@torch.library.custom_op(
+    "b12x::prepared_routed_moe_out",
+    mutates_args=("topk_weights", "topk_ids", "selected_logits", "output", "scratch"),
+)
+def prepared_routed_moe_out(
+    a: torch.Tensor,
+    router_logits: torch.Tensor,
+    selected_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    scratch: torch.Tensor,
+    plan_handle: int,
+    correction_bias: torch.Tensor | None,
+    image_correction_bias: torch.Tensor | None,
+    image_mask: torch.Tensor | None,
+    num_valid_tokens: torch.Tensor | None,
+    scales_expanded: bool,
+) -> None:
+    state = require_prepared(plan_from_handle(plan_handle), "moe.decode", a.device)
+    binding = state.bind(
+        a=a,
+        router_logits=router_logits,
+        selected_logits=selected_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output=output,
+        scratch=scratch,
+        correction_bias=correction_bias,
+        image_correction_bias=image_correction_bias,
+        image_mask=image_mask,
+        num_valid_tokens=num_valid_tokens,
+        scales_expanded=scales_expanded,
+    )
+    state.run(binding)
+
+
+@prepared_routed_moe_out.register_fake
+def _fake_routed(
+    a,
+    router_logits,
+    selected_logits,
+    topk_weights,
+    topk_ids,
+    output,
+    scratch,
+    plan_handle,
+    correction_bias,
+    image_correction_bias,
+    image_mask,
+    num_valid_tokens,
+    scales_expanded,
+) -> None:
+    pass

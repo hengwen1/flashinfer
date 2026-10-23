@@ -15,6 +15,7 @@ from b12x.preparation import BackendConfig, FrozenMapping, make_fixed_contract
 SURFACES = {
     "OneshotAllReduce.all_reduce": (2, 3, 4, 6, 8, 10),
     "OneshotAllReduce.all_reduce_fused_add_rms_norm": (2, 3, 4, 6, 8, 10),
+    "OneshotAllReduce.all_reduce_fused_add": (2, 3, 4, 6, 8, 10),
     "OneshotAllReducePool.all_reduce": (2, 3, 4, 6, 8, 10),
     "OneshotAllReducePool.all_reduce_fused_add_rms_norm": (2, 3, 4, 6, 8, 10),
     "DmaAllReduce.all_reduce": (2, 3, 4, 6, 8, 10),
@@ -80,6 +81,6 @@ def _validate_query(query: PcieQuery, device) -> None:
         )
 
 
-TUNING = replace(TUNING, query_schema_version=24, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=29, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]

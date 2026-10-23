@@ -38,6 +38,9 @@ META = OpMeta(
     group="attention",
     api_style="planned",
     entry_points=(
+        "MSACaps",
+        "plan_msa",
+        "run_msa",
         "Caps",
         "Plan",
         "Binding",

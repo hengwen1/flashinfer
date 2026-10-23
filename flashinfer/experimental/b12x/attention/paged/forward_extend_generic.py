@@ -36,7 +36,6 @@ from b12x._lib.intrinsics.mma import (
     mxfp8_mma_m16n8k32_f32_e4m3,
 )
 from b12x._lib.intrinsics.packed import (
-    bf16_rowsum_m16k16_f32,
     bfloat2_mul,
     bfloat2_to_float2_scaled,
     broadcast_f32_to_bfloat2,
@@ -45,7 +44,6 @@ from b12x._lib.intrinsics.packed import (
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
     fp8x4_e4m3_to_bfloat2x2_via_f16,
     fp8x4_e4m3_to_half2x2,
-    f16_rowsum_m16k16_f32,
     pack_f32x2_to_bfloat2,
     pack_f32x2_to_half2,
     frag_layout_swizzle_16b_to_8b,
@@ -3151,6 +3149,14 @@ def _literal_update_mdo_states_fp32_pack_p(
                         )
                     )
                 )
+                probability_sum = Float32((p0 + p1) + (p2 + p3))
+                probability_sum += cute.arch.shuffle_sync_bfly(
+                    probability_sum, offset=2
+                )
+                probability_sum += cute.arch.shuffle_sync_bfly(
+                    probability_sum, offset=1
+                )
+                d_frag[mma_q, row_slot] += probability_sum
                 if const_expr(assume_finite):
                     p_frag[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_half2(p0, p1)
                     p_frag[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_half2(p2, p3)
@@ -6335,28 +6341,6 @@ class PagedForwardKernel:
                             dst_word_offset,
                         )
                     _exit_thread()
-                for mma_q in cutlass.range_constexpr(num_mma_q):
-                    for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                        if const_expr(self.use_kv_repack_fp16):
-                            d0, d1 = f16_rowsum_m16k16_f32(
-                                d_frag[mma_q, 0],
-                                d_frag[mma_q, 1],
-                                p_frag[mma_q, mma_kv, 0],
-                                p_frag[mma_q, mma_kv, 1],
-                                p_frag[mma_q, mma_kv, 2],
-                                p_frag[mma_q, mma_kv, 3],
-                            )
-                        else:
-                            d0, d1 = bf16_rowsum_m16k16_f32(
-                                d_frag[mma_q, 0],
-                                d_frag[mma_q, 1],
-                                p_frag[mma_q, mma_kv, 0],
-                                p_frag[mma_q, mma_kv, 1],
-                                p_frag[mma_q, mma_kv, 2],
-                                p_frag[mma_q, mma_kv, 3],
-                            )
-                        d_frag[mma_q, 0] = d0
-                        d_frag[mma_q, 1] = d1
                 if const_expr(self.kv_is_fp8 and self.traits.num_warps_kv > 1):
                     if warp_kv_base >= tile_tokens:
                         for mma_q in cutlass.range_constexpr(num_mma_q):

@@ -361,7 +361,8 @@ class _Plane:
 
 
 class _Pair:
-    def __init__(self, first, second, indexed=False):
+    def __init__(self, first, second, indexed=False, fuse_tasks=False):
+        self.fuse_tasks = fuse_tasks
         plane = _Plane
         if indexed:
             from b12x._lib.quant.nvfp4_csf_indexed import IndexedNvfp4Plane
@@ -411,6 +412,11 @@ class _Pair:
         barrier_count_ptr: cute.Pointer,
         barrier_epoch_ptr: cute.Pointer,
         barrier_slots: Int32,
+        counts_ptr: cute.Pointer,
+        task_expert_ptr: cute.Pointer,
+        task_begin_ptr: cute.Pointer,
+        task_slots: Int32,
+        task_block_m: Int32,
         stream: cuda.CUstream,
     ):
         first = self.first.tensors(f13, e13, p13, o13, lut13, experts, bytes13)
@@ -432,6 +438,10 @@ class _Pair:
             barrier_count,
             barrier_epoch,
             barrier_slots,
+            cute.make_tensor(counts_ptr, cute.make_layout((experts,))),
+            cute.make_tensor(task_expert_ptr, cute.make_layout((task_slots,))),
+            cute.make_tensor(task_begin_ptr, cute.make_layout((task_slots,))),
+            task_block_m,
         ).launch(
             grid=(capacity * Int32(self.first.tasks + self.second.tasks), 1, 1),
             block=(self.threads, 1, 1),
@@ -450,6 +460,10 @@ class _Pair:
         barrier_count,
         barrier_epoch,
         barrier_slots: Int32,
+        counts,
+        task_expert,
+        task_begin,
+        task_block_m: Int32,
     ):
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
@@ -487,6 +501,21 @@ class _Pair:
                     if cute.arch.vote_any_sync(duplicate):
                         expert = Int32(-1)
         if expert >= Int32(0) and expert < experts:
+            if cutlass.const_expr(self.fuse_tasks):
+                if task == Int32(0) and Int32(tid) < Int32(32):
+                    previous = Int32(tid)
+                    prefix = Int32(0)
+                    while previous < expert:
+                        count = counts[previous]
+                        prefix += (count + task_block_m - Int32(1)) // task_block_m
+                        previous += Int32(32)
+                    prefix = cute.arch.warp_reduction_sum(prefix)
+                    tiles = (counts[expert] + task_block_m - Int32(1)) // task_block_m
+                    tile = Int32(tid)
+                    while tile < tiles:
+                        task_expert[prefix + tile] = expert
+                        task_begin[prefix + tile] = tile * task_block_m
+                        tile += Int32(32)
             if task < Int32(self.first.tasks):
                 self.first.decode(first, expert, task, Int32(tid))
             else:
@@ -496,9 +525,9 @@ class _Pair:
 
 
 @program_cache
-def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False):
-    launch = _Pair(first, second, indexed)
-    key = (first, second, bool(ids64), bool(indexed))
+def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False, fuse_tasks=False):
+    launch = _Pair(first, second, indexed, fuse_tasks)
+    key = (first, second, bool(ids64), bool(indexed), bool(fuse_tasks))
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     plane = (
         make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -525,8 +554,13 @@ def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False):
         make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         0,
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
+        0,
+        1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 7, key),
+        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 8, key),
     )
 
 
@@ -562,8 +596,15 @@ def decode_nvfp4_csf_pair(
     program=None,
     barriers=None,
     indexed_scales=None,
+    task_metadata=None,
+    task_block_m=0,
 ):
-    """Launch the precompiled pair into caller-owned native NVFP4 scale grids."""
+    """Launch the precompiled pair into caller-owned native NVFP4 scale grids.
+
+    Optional task metadata contains counts, expert indices, and row starts. The
+    caller clears expert indices to -1 and provides capacity for the sum of
+    ceil(count / task_block_m) across experts; inactive row starts are untouched.
+    """
     if first.num_experts != second.num_experts or mode not in (0, 1, 2, 3):
         raise ValueError("NVFP4-CSF expert counts or routing mode disagree")
     if (
@@ -590,8 +631,8 @@ def decode_nvfp4_csf_pair(
     if mode == 2 and capacity != first.num_experts:
         raise ValueError("NVFP4-CSF count routing requires one count per expert")
     if not capacity:
-        if barriers is not None:
-            raise ValueError("Fused barrier reset requires a nonempty decoder grid")
+        if barriers is not None or task_metadata is not None:
+            raise ValueError("Fused decoder writes require a nonempty decoder grid")
         return
     if barriers is not None and (
         len(barriers) != 2
@@ -607,12 +648,30 @@ def decode_nvfp4_csf_pair(
         raise ValueError(
             "Fused barrier reset requires two equally sized CUDA int32 arrays"
         )
+    if task_metadata is not None and (
+        len(task_metadata) != 3
+        or task_block_m <= 0
+        or task_metadata[0].shape != (first.num_experts,)
+        or task_metadata[1].shape != task_metadata[2].shape
+        or task_metadata[1].ndim != 1
+        or any(
+            t.dtype != torch.int32
+            or not t.numel()
+            or t.device != first.fixed.device
+            or not t.is_contiguous()
+            for t in task_metadata
+        )
+    ):
+        raise ValueError(
+            "Fused task metadata requires counts and two CUDA int32 vectors"
+        )
     if program is None:
         program = compile_nvfp4_csf_pair(
             first.geometry,
             second.geometry,
             ids.dtype == torch.int64,
             indexed_scales is not None,
+            task_metadata is not None,
         )
 
     sources = []
@@ -636,6 +695,10 @@ def decode_nvfp4_csf_pair(
         out2,
         None if barriers is None else barriers[0],
         None if barriers is None else barriers[1],
+        None if task_metadata is None else task_metadata[0],
+        None if task_metadata is None else task_metadata[1],
+        None if task_metadata is None else task_metadata[2],
+        task_block_m,
         first.num_experts,
         capacity,
         mode,
@@ -645,7 +708,14 @@ def decode_nvfp4_csf_pair(
 
 @torch.library.custom_op(
     "b12x::nvfp4_csf_pair",
-    mutates_args=("out13", "out2", "barrier_count", "barrier_epoch"),
+    mutates_args=(
+        "out13",
+        "out2",
+        "barrier_count",
+        "barrier_epoch",
+        "task_expert",
+        "task_begin",
+    ),
 )
 def _decode_pair_op(
     sources: list[torch.Tensor],
@@ -654,6 +724,10 @@ def _decode_pair_op(
     out2: torch.Tensor,
     barrier_count: torch.Tensor | None,
     barrier_epoch: torch.Tensor | None,
+    counts: torch.Tensor | None,
+    task_expert: torch.Tensor | None,
+    task_begin: torch.Tensor | None,
+    task_block_m: int,
     num_experts: int,
     capacity: int,
     routing_mode: int,
@@ -707,6 +781,13 @@ def _decode_pair_op(
             sources[2] if barrier_epoch is None else barrier_epoch, cutlass.Int32, 4
         ),
         0 if barrier_count is None else barrier_count.numel(),
+        device_ptr(sources[2] if counts is None else counts, cutlass.Int32, 4),
+        device_ptr(
+            sources[2] if task_expert is None else task_expert, cutlass.Int32, 4
+        ),
+        device_ptr(sources[2] if task_begin is None else task_begin, cutlass.Int32, 4),
+        0 if task_expert is None else task_expert.numel(),
+        task_block_m,
         current_cuda_stream(),
     )
 
@@ -719,6 +800,10 @@ def _decode_pair_fake(
     out2,
     barrier_count,
     barrier_epoch,
+    counts,
+    task_expert,
+    task_begin,
+    task_block_m,
     num_experts,
     capacity,
     routing_mode,

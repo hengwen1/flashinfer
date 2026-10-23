@@ -1984,7 +1984,9 @@ def create_paged_plan(
             raise ValueError("host length metadata must match page_table batch")
         if any(length <= 0 for length in q_lengths):
             raise ValueError("host query lengths must be positive")
-        if sum(q_lengths) != total_q:
+        if sum(q_lengths) != total_q and not (
+            mode == "verify" and msa_block_sparse and sum(q_lengths) < total_q
+        ):
             raise ValueError("host query lengths must sum to q total_q")
         inferred_mode = (
             "decode"
@@ -1993,6 +1995,8 @@ def create_paged_plan(
         )
     if any(cache_len <= 0 for cache_len in cache_lengths):
         raise ValueError("primary paged backend requires cache_seqlens > 0")
+    if mode == "verify" and msa_block_sparse:
+        total_q = sum(q_lengths)
     cache_pages_arr = [_ceil_div(cache_len, page_size) for cache_len in cache_lengths]
     if any(cache_pages > max_pages_per_request for cache_pages in cache_pages_arr):
         raise ValueError("page_table width is smaller than required by cache_seqlens")
@@ -2008,9 +2012,9 @@ def create_paged_plan(
     if msa_union_tile and not (msa_block_sparse and mode == "extend"):
         raise ValueError("MSA union-tile prefill requires an MSA extend plan")
     if msa_block_sparse:
-        if mode not in ("decode", "extend"):
+        if mode not in ("decode", "verify", "extend"):
             raise ValueError(
-                "MSA block-sparse paged attention currently supports decode and extend plans only"
+                "MSA block-sparse paged attention requires decode, verify, or extend mode"
             )
         if page_size not in (64, 128):
             raise ValueError(
@@ -2201,6 +2205,9 @@ def create_paged_plan(
             _ceil_div(packed_qo_len, cta_tile_q) for packed_qo_len in packed_qo_len_arr
         )
 
+    if msa_block_sparse and mode == "verify":
+        cta_tile_q = gqa_group_size
+        total_num_qo_tiles = total_q
     if msa_block_sparse and mode == "extend":
         cta_tile_q = gqa_group_size * (8 if msa_union_tile else 1)
         if enable_cuda_graph:

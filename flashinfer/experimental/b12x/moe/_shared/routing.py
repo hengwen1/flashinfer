@@ -6,25 +6,19 @@ import triton.language.extra.cuda.libdevice as libdevice
 import torch
 
 
-@triton.jit(do_not_specialize=["num_experts"])
-def _route_topk_kernel(
+@triton.jit
+def _route_topk_values(
     logits_ptr,
-    topk_logits_ptr,
-    topk_ids_ptr,
-    topk_weights_ptr,
     correction_bias_ptr,
     image_correction_bias_ptr,
     image_mask_ptr,
+    pid,
     logits_row_stride,
-    topk_row_stride,
-    ids_row_stride,
-    weights_row_stride,
     correction_bias_stride,
     image_correction_bias_stride,
     image_mask_stride,
     routed_scaling_factor,
     num_experts,
-    num_valid_tokens_ptr,
     BLOCK_E: tl.constexpr,
     TOP_K: tl.constexpr,
     TOPK_BLOCK: tl.constexpr,
@@ -32,28 +26,12 @@ def _route_topk_kernel(
     SCORE_FUNC: tl.constexpr,
     HAS_CORRECTION_BIAS: tl.constexpr,
     HAS_IMAGE_BIAS: tl.constexpr,
-    HAS_VALID_TOKENS: tl.constexpr,
 ):
-    pid = tl.program_id(0).to(tl.int64)
     expert_offsets = tl.arange(0, BLOCK_E)
     expert_offsets_i32 = expert_offsets.to(tl.int32)
     topk_offsets = tl.arange(0, TOPK_BLOCK)
     topk_mask = topk_offsets < TOP_K
     neg_inf = float("-inf")
-
-    if HAS_VALID_TOKENS:
-        if pid >= tl.load(num_valid_tokens_ptr):
-            tl.store(
-                topk_logits_ptr + pid * topk_row_stride + topk_offsets, 0.0, topk_mask
-            )
-            tl.store(topk_ids_ptr + pid * ids_row_stride + topk_offsets, -1, topk_mask)
-            tl.store(
-                topk_weights_ptr + pid * weights_row_stride + topk_offsets,
-                0.0,
-                topk_mask,
-            )
-            return
-
     row_ptr = logits_ptr + pid * logits_row_stride
     logits = tl.load(
         row_ptr + expert_offsets, mask=expert_offsets < num_experts, other=neg_inf
@@ -112,6 +90,75 @@ def _route_topk_kernel(
     else:
         topk_weights = topk_logits
     topk_weights *= routed_scaling_factor
+
+    return topk_logits, topk_ids, topk_weights
+
+
+@triton.jit(do_not_specialize=["num_experts"])
+def _route_topk_kernel(
+    logits_ptr,
+    topk_logits_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    correction_bias_ptr,
+    image_correction_bias_ptr,
+    image_mask_ptr,
+    logits_row_stride,
+    topk_row_stride,
+    ids_row_stride,
+    weights_row_stride,
+    correction_bias_stride,
+    image_correction_bias_stride,
+    image_mask_stride,
+    routed_scaling_factor,
+    num_experts,
+    num_valid_tokens_ptr,
+    BLOCK_E: tl.constexpr,
+    TOP_K: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+    RENORMALIZE: tl.constexpr,
+    SCORE_FUNC: tl.constexpr,
+    HAS_CORRECTION_BIAS: tl.constexpr,
+    HAS_IMAGE_BIAS: tl.constexpr,
+    HAS_VALID_TOKENS: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    topk_offsets = tl.arange(0, TOPK_BLOCK)
+    topk_mask = topk_offsets < TOP_K
+
+    if HAS_VALID_TOKENS:
+        if pid >= tl.load(num_valid_tokens_ptr):
+            tl.store(
+                topk_logits_ptr + pid * topk_row_stride + topk_offsets, 0.0, topk_mask
+            )
+            tl.store(topk_ids_ptr + pid * ids_row_stride + topk_offsets, -1, topk_mask)
+            tl.store(
+                topk_weights_ptr + pid * weights_row_stride + topk_offsets,
+                0.0,
+                topk_mask,
+            )
+            return
+
+    topk_logits, topk_ids, topk_weights = _route_topk_values(
+        logits_ptr,
+        correction_bias_ptr,
+        image_correction_bias_ptr,
+        image_mask_ptr,
+        pid,
+        logits_row_stride,
+        correction_bias_stride,
+        image_correction_bias_stride,
+        image_mask_stride,
+        routed_scaling_factor,
+        num_experts,
+        BLOCK_E,
+        TOP_K,
+        TOPK_BLOCK,
+        RENORMALIZE,
+        SCORE_FUNC,
+        HAS_CORRECTION_BIAS,
+        HAS_IMAGE_BIAS,
+    )
 
     out_base = pid * topk_row_stride + topk_offsets
     tl.store(topk_logits_ptr + out_base, topk_logits, mask=topk_mask)

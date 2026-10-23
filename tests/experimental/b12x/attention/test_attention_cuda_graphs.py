@@ -630,10 +630,6 @@ class _PagedGraphScratchHarness:
 
 
 @torch.inference_mode()
-@pytest.mark.xfail(
-    reason="stale vs current decode-graph planner heuristics: capacity derivation from a live plan, LUT staging shape, and prepare ordering all need a refresh",
-    strict=False,
-)
 def test_paged_attention_decode_replays_under_cuda_graph_with_variable_metadata() -> (
     None
 ):
@@ -719,10 +715,6 @@ def test_paged_attention_decode_replays_under_cuda_graph_with_variable_metadata(
 
 
 @torch.inference_mode()
-@pytest.mark.xfail(
-    reason="stale vs current decode-graph planner heuristics: capacity derivation from a live plan, LUT staging shape, and prepare ordering all need a refresh",
-    strict=False,
-)
 def test_paged_attention_extend_replays_under_cuda_graph_with_smaller_metadata() -> (
     None
 ):
@@ -794,16 +786,12 @@ def test_paged_attention_extend_replays_under_cuda_graph_with_smaller_metadata()
     torch.cuda.synchronize()
     assert (output[: q_2.shape[0]] - ref_out_2).abs().max().item() <= 0.02
     assert (
-        _lse_base2_to_natural(workspace.current_lse_view()) - ref_lse_2
+        _lse_base2_to_natural(workspace.current_lse_view()[: q_2.shape[0]]) - ref_lse_2
     ).abs().max().item() <= 0.03
     assert _cosine_similarity(output[: q_2.shape[0]], ref_out_2) >= 0.99999
 
 
 @torch.inference_mode()
-@pytest.mark.xfail(
-    reason="stale vs current decode-graph planner heuristics: capacity derivation from a live plan, LUT staging shape, and prepare ordering all need a refresh",
-    strict=False,
-)
 def test_paged_attention_fp8_kv_replays_under_cuda_graph() -> None:
     require_b12x()
     clear_attention_caches()

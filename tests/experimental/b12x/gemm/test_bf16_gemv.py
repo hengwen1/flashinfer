@@ -76,6 +76,172 @@ def _op():
 
 
 @cuda_required
+def test_mixed_vector_columns_preserve_fp32_weight_bits():
+    source = torch.zeros(33, 72, device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(65, 72, device="cuda")
+    source[:, -1] = 1
+    weight[:, -1] = 1 + 2**-12
+    bias = torch.full((65,), -1.0, device="cuda")
+    output = _mm(
+        source,
+        weight,
+        bias=bias,
+        output_dtype=torch.float32,
+        override=bf16_gemv.GemvConfig(
+            backend="mixed_vector", rows_per_tile=4, block_threads=128
+        ),
+    )
+    torch.testing.assert_close(output, torch.full_like(output, 2**-12), rtol=0, atol=0)
+
+
+def _check_mixed_vector_columns(
+    shape,
+    output_dtype,
+    with_bias,
+    strided,
+    projection_session,
+    *,
+    rows_per_tile=4,
+    block_threads=128,
+    offset_views=False,
+):
+    capacity, columns, width = shape
+    torch.manual_seed(71903)
+    source = (
+        torch.randn(capacity, width * 2, device="cuda", dtype=torch.bfloat16) * 0.125
+    )[:, ::2]
+    weight = (torch.randn(columns, width * 2, device="cuda") * 0.125)[:, ::2]
+    source[0] = ((torch.arange(width, device="cuda") % 2) * 2 - 1).to(
+        torch.bfloat16
+    ) * 0.125
+    weight[0, ::2] = 1 + 2**-12
+    weight[0, 1::2] = 1
+    if not strided:
+        source = source.contiguous()
+        weight = weight.contiguous()
+    if offset_views:
+        source_view = torch.empty(
+            source.numel() + 1, device="cuda", dtype=source.dtype
+        )[1:].view_as(source)
+        weight_view = torch.empty(
+            weight.numel() + 1, device="cuda", dtype=weight.dtype
+        )[1:].view_as(weight)
+        source_view.copy_(source)
+        weight_view.copy_(weight)
+        source, weight = source_view, weight_view
+        assert source.is_contiguous() and weight.is_contiguous()
+        assert source.data_ptr() % 16 != 0 and weight.data_ptr() % 16 != 0
+    bias = torch.linspace(-0.03, 0.04, columns, device="cuda") if with_bias else None
+    max_error = 0.0
+    storage = [
+        torch.full(
+            (capacity + 1, columns + 3), 123.0, device="cuda", dtype=output_dtype
+        )
+        for _ in range(2)
+    ]
+    outputs = [value[:capacity, :columns] for value in storage]
+    plans = [
+        _prepare_projection(
+            projection_session,
+            source,
+            weight,
+            out=output,
+            bias=bias,
+            override=bf16_gemv.GemvConfig(
+                backend=backend,
+                rows_per_tile=rows_per_tile,
+                block_threads=block_threads,
+            ),
+        )
+        for backend, output in zip(("simt", "mixed_vector"), outputs, strict=True)
+    ]
+
+    def launch(rows):
+        for output, plan in zip(outputs, plans, strict=True):
+            bf16_gemv.mm(source[:rows], weight, out=output[:rows], bias=bias, plan=plan)
+
+    def check(rows):
+        nonlocal max_error
+        reference = source[:rows].double() @ weight.double().T
+        if bias is not None:
+            reference += bias.double()
+        expected = reference.to(output_dtype)
+        if rows:
+            max_error = max(
+                max_error, (outputs[1][:rows].double() - reference).abs().max().item()
+            )
+        torch.testing.assert_close(
+            outputs[1][:rows],
+            expected,
+            rtol=2e-5 if output_dtype == torch.float32 else 1e-2,
+            atol=2e-5 if output_dtype == torch.float32 else 1e-2,
+        )
+        for value in storage:
+            assert (value[rows:] == 123).all()
+            assert (value[:, columns:] == 123).all()
+
+    for rows in dict.fromkeys((0, 1, capacity - 1, capacity)):
+        for value in storage:
+            value.fill_(123)
+        launch(rows)
+        check(rows)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(capacity)
+    projection_session.freeze()
+    try:
+        for _ in range(3):
+            source.neg_()
+            weight.add_(0.0001)
+            if bias is not None:
+                bias.add_(0.03125)
+            for value in storage:
+                value.fill_(123)
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            check(capacity)
+    finally:
+        graph.reset()
+    print(
+        f"mixed_vector shape={shape} output={output_dtype} bias={with_bias} strided={strided} offset={offset_views} rows_per_tile={rows_per_tile} threads={block_threads} max_abs_vs_fp64={max_error:.9g}"
+    )
+
+
+@cuda_required
+@pytest.mark.parametrize("shape", [(1, 97, 131), (48, 128, 6144), (4096, 129, 6144)])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("strided", [False, True])
+def test_mixed_vector_columns_match_fp64_oracle(
+    shape, output_dtype, with_bias, strided, projection_session
+):
+    _check_mixed_vector_columns(
+        shape, output_dtype, with_bias, strided, projection_session
+    )
+
+
+@cuda_required
+@pytest.mark.parametrize("rows_per_tile", [4, 8])
+@pytest.mark.parametrize("rows", [47, 48, 49])
+@pytest.mark.parametrize("offset_views", [False, True])
+def test_mixed_vector_selected_rows(
+    rows_per_tile, rows, offset_views, projection_session
+):
+    _check_mixed_vector_columns(
+        (rows, 128, 6144),
+        torch.float32,
+        False,
+        False,
+        projection_session,
+        rows_per_tile=rows_per_tile,
+        block_threads=256,
+        offset_views=offset_views,
+    )
+
+
+@cuda_required
 @pytest.mark.parametrize(
     "with_bias,output_dtype",
     [(False, torch.bfloat16), (True, torch.bfloat16), (False, torch.float32)],

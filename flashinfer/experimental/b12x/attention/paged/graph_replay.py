@@ -403,6 +403,9 @@ def build_msa_prefill_union_metadata_triton(
             tl.store(union_masks_ptr + union_base + union_count, bit, mask=do_store)
             union_count += tl.where(do_store, 1, 0)
 
+    empty = active & (union_count == 0)
+    tl.store(union_blocks_ptr + union_base, -1, mask=empty)
+    tl.store(union_masks_ptr + union_base, 0, mask=empty)
     tl.store(union_counts_ptr + union_count_offset, union_count, mask=work_valid)
 
 
@@ -607,6 +610,8 @@ def update_prefill_graph_work_metadata_triton(
     WINDOW_LEFT: tl.constexpr,
     SPLIT_KV: tl.constexpr,
     ADAPTIVE_CHUNKING: tl.constexpr,
+    MSA_BLOCK_SPARSE: tl.constexpr,
+    FIXED_KV_CHUNK_SIZE: tl.constexpr,
     BLOCK_BATCH: tl.constexpr,
     BLOCK_WORK_ITEMS: tl.constexpr,
 ):
@@ -639,6 +644,8 @@ def update_prefill_graph_work_metadata_triton(
         window_start_page = first_window_key // PAGE_SIZE
         window_start_page = tl.minimum(window_start_page, tl.maximum(num_pages - 1, 0))
     effective_pages = tl.maximum(num_pages - window_start_page, 1)
+    if MSA_BLOCK_SPARSE:
+        effective_pages = tl.minimum(effective_pages, 16 * (128 // PAGE_SIZE))
 
     if ADAPTIVE_CHUNKING:
         batch_offsets = tl.arange(0, BLOCK_BATCH)
@@ -669,6 +676,9 @@ def update_prefill_graph_work_metadata_triton(
             kv_chunk_size,
             mask=offsets == 0,
         )
+    elif FIXED_KV_CHUNK_SIZE > 0:
+        kv_chunk_size = tl.full((), FIXED_KV_CHUNK_SIZE, tl.int32)
+        tl.store(kv_chunk_size_ptr + offsets, kv_chunk_size, mask=offsets == 0)
     else:
         kv_chunk_size = tl.load(kv_chunk_size_ptr).to(tl.int32)
     chunk_pages = tl.maximum((kv_chunk_size + PAGE_SIZE - 1) // PAGE_SIZE, 1)
@@ -1912,6 +1922,8 @@ def update_prefill_graph_chunk_metadata(
     split_kv: bool,
     window_left: int = -1,
     adaptive_chunking: bool = False,
+    msa_block_sparse: bool = False,
+    fixed_kv_chunk_size: int = 0,
     _prepared: Mapping[str, object] | None = None,
 ) -> None:
     device = cache_seqlens.device
@@ -2055,6 +2067,8 @@ def update_prefill_graph_chunk_metadata(
             "WINDOW_LEFT": int(window_left),
             "SPLIT_KV": bool(split_kv),
             "ADAPTIVE_CHUNKING": bool(adaptive_chunking),
+            "MSA_BLOCK_SPARSE": bool(msa_block_sparse),
+            "FIXED_KV_CHUNK_SIZE": int(fixed_kv_chunk_size),
             "BLOCK_BATCH": triton.next_power_of_2(bs),
             "BLOCK_WORK_ITEMS": _PREFILL_BLOCK_WORK_ITEMS,
         },
@@ -2358,6 +2372,8 @@ def compile_graph_replay(binding: object) -> Mapping[str, object]:
         WINDOW_LEFT=int(plan.window_left),
         SPLIT_KV=True,
         ADAPTIVE_CHUNKING=False,
+        MSA_BLOCK_SPARSE=bool(plan.msa_block_sparse),
+        FIXED_KV_CHUNK_SIZE=int(plan.kv_chunk_size),
         BLOCK_BATCH=triton.next_power_of_2(batch),
         BLOCK_WORK_ITEMS=_PREFILL_BLOCK_WORK_ITEMS,
     )

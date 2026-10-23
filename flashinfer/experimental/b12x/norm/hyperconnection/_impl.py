@@ -277,6 +277,49 @@ def _require_eps(eps: float) -> float:
     return value
 
 
+def run_indexed_rmsnorm_impl(state, weight, indices, out, *, eps, plan):
+    _require_cuda(plan)
+    plan.require_operation("grouped_rmsnorm", eps=eps)
+    query, caps = plan.query, plan.caps
+    if not query.indexed_rows:
+        raise ValueError("plan does not declare indexed normalization")
+    tokens = plan._live_tokens(indices.numel())
+    _validate_input(
+        state,
+        shape=(query.indexed_rows, caps.hidden_size),
+        caps=caps,
+        name="state",
+        row_strided=True,
+    )
+    if (
+        indices.ndim != 1
+        or not indices.is_contiguous()
+        or indices.dtype != getattr(torch, query.index_dtype)
+        or indices.device != caps.device
+    ):
+        raise ValueError("indices must retain their declared contiguous integer vector")
+    if (
+        weight.shape != (caps.hidden_size,)
+        or not weight.is_contiguous()
+        or weight.dtype != getattr(torch, query.weight_dtype)
+        or weight.device != caps.device
+    ):
+        raise ValueError("affine weight differs from indexed normalization declaration")
+    _validate_capacity(
+        out,
+        tokens=tokens,
+        tail=(caps.hidden_size,),
+        dtype=getattr(torch, query.output_dtype),
+        device=caps.device,
+        name="out",
+    )
+    _validate_output_disjoint(
+        "normalized", out, (("state", state), ("weight", weight), ("indices", indices))
+    )
+    if tokens:
+        plan.launch(state, weight, out, eps=eps, indices=indices)
+
+
 def run_grouped_rmsnorm_impl(
     state,
     weight,
@@ -293,6 +336,8 @@ def run_grouped_rmsnorm_impl(
     if bool(zero_centered) != plan.query.zero_centered:
         raise ValueError("normalization recipe differs from preparation")
     caps = plan.caps
+    if plan.query.indexed_rows:
+        raise ValueError("indexed normalization requires explicit indices")
     tokens = plan._live_tokens(state.shape[0])
     width = caps.streams * caps.hidden_size
     _validate_input(
@@ -633,13 +678,14 @@ def run_swiglu_impl(
     round_silu: bool = False,
     plan: _HyperConnectionState,
 ) -> torch.Tensor:
-    """Compute FP32 SiLU*up with the prepared gate-clamp placement.
+    """Compute FP32 gated activation with prepared scaling and clamp placement.
 
     Inputs are BF16 FC1 outputs, with gate followed by up along the last axis.
     The invocation's ``clamp_after_silu`` moves the upper clamp from gate to
     SiLU(gate); up is always clamped symmetrically.
     ``round_silu=True`` rounds SiLU to BF16 before multiplying for vision.
-    ``limit=inf`` disables clamping. No activation scaling is applied.
+    The invocation computes ``gate * sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)``.
+    ``limit=inf`` disables clamping; alpha=1 and beta=0 give ordinary SwiGLU.
     Warm once before capture; ``out`` is disjoint caller-owned BF16 storage.
     """
     _require_cuda(plan)

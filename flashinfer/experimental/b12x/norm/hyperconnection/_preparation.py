@@ -68,6 +68,7 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
             getattr(torch, query.weight_dtype),
             getattr(torch, query.output_dtype),
             getattr(torch, query.right_dtype if query.add_residual else query.dtype),
+            getattr(torch, query.index_dtype if query.indexed_rows else query.dtype),
             query.eps,
             hidden * streams,
             hidden * streams,
@@ -77,6 +78,7 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
             ZERO_CENTERED=query.zero_centered,
             ADD_RESIDUAL=query.add_residual,
             PAIRED=query.paired,
+            INDEXED=bool(query.indexed_rows),
             num_warps=config.reduction_num_warps,
             enable_fp_fusion=False,
             grid=(query.max_tokens * streams,),
@@ -172,6 +174,8 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
             query.clamp_after_silu,
             query.streams if role == "head_gate" else 1,
             query.gate_stride,
+            query.swiglu_alpha,
+            query.swiglu_beta,
         )
         return native._compile(
             key,
@@ -184,6 +188,8 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
                 query.clamp_after_silu,
                 query.streams if role == "head_gate" else 1,
                 query.gate_stride,
+                query.swiglu_alpha,
+                query.swiglu_beta,
             ),
             3,
             device,
@@ -200,7 +206,9 @@ def _launcher(query, config, compiled):
     role = query.operation
     if _uses_triton_reduction(query):
 
-        def invoke(state, weight, output, *, eps=None, residual=None, paired=None):
+        def invoke(
+            state, weight, output, *, eps=None, residual=None, paired=None, indices=None
+        ):
             kernels._norm_launch(
                 state,
                 weight,
@@ -213,6 +221,7 @@ def _launcher(query, config, compiled):
                 zero_centered=query.zero_centered,
                 residual=residual,
                 paired=paired,
+                indices=indices,
             )
     elif role == "gate_mean":
 
@@ -281,11 +290,15 @@ def plan_hyperconnection(caps, *, invocation=FrozenMapping(), override=None):
         "limit",
         "round_silu",
         "clamp_after_silu",
+        "swiglu_alpha",
+        "swiglu_beta",
         "zero_centered",
         "weight_dtype",
         "add_residual",
         "gate_stride",
         "paired",
+        "indexed_rows",
+        "index_dtype",
     }
     if set(invocation) - fields or "operation" not in invocation:
         raise ValueError(

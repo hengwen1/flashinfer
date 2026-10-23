@@ -11,14 +11,23 @@ from b12x.preparation import FrozenMapping
 
 @dataclass(frozen=True, kw_only=True)
 class ExecutionCapacity:
-    """Prefill token capacity and exact planned decode specializations."""
+    """Token capacity, decode specializations, and output storage geometry.
+
+    ``token`` outputs hold weighted [tokens, hidden] values. ``routes`` exposes
+    unweighted [tokens, top_k, hidden] GEMM outputs in activation precision for
+    token outer scaling. Invalid route entries are unspecified and consumers
+    must mask them with the route IDs before applying their weights.
+    """
 
     max_tokens: int
     top_k: int
     warmup_token_counts: tuple[int, ...] = ()
     route_num_experts: int | None = None
+    output_layout: str = "token"
 
     def __post_init__(self):
+        if self.output_layout not in ("token", "routes"):
+            raise ValueError("MoE output layout must be token or routes")
         max_tokens, top_k = int(self.max_tokens), int(self.top_k)
         if max_tokens <= 0 or top_k <= 0:
             raise ValueError("max_tokens and top_k must be positive")
@@ -47,6 +56,7 @@ class RoutingSpec:
     has_correction_bias: bool = False
     has_image_correction_bias: bool = False
     has_image_mask: bool = False
+    has_valid_tokens: bool = False
     routed_scaling_factor: float = 1.0
 
 
@@ -60,7 +70,16 @@ def plan_execution(
     scale_expansion=None,
 ):
     """Return a composite declaration, never an executable plan or warmup handle."""
-    from ._preparation import plan
+    if experts.plan.activation.outer_scale == "token":
+        from ._token_outer import plan
+    else:
+        if capacity.output_layout != "token":
+            raise ValueError("route output storage requires token outer scaling")
+        if routing is not None and routing.has_valid_tokens:
+            raise ValueError(
+                "valid-token integrated routing requires token outer scaling"
+            )
+        from ._preparation import plan
 
     return plan(
         experts,

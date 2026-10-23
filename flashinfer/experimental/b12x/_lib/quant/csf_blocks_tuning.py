@@ -133,6 +133,7 @@ TUNING = TuningContract(
     component_id="quantization.csf_block_expansion",
     query_schema_version=9,
     config_schema_version=2,
+    semantic_version=2,
     query_fields=frozenset(CsfExpansionQuery.__dataclass_fields__),
     config_fields=frozenset(CsfExpansionConfig.__dataclass_fields__),
     encode_query=asdict,
@@ -193,7 +194,11 @@ def compile_expansion(query_payload, config_payload, ordinal):
             )
             for ids64 in (False, True)
         )
-    return programs, routing
+        task_programs = tuple(
+            compile_nvfp4_csf_pair(*geometries, ids64, fuse_tasks=True)
+            for ids64 in (False, True)
+        )
+    return programs, routing, task_programs
 
 
 def _scratch(experts, device):
@@ -228,6 +233,7 @@ class _ExpansionState:
     device: torch.device
     bitmap_routes: bool
     direct_routes: bool
+    task_programs: tuple
 
     def decoder(self, scratch):
         active = scratch_tensor(
@@ -305,7 +311,7 @@ def plan_csf_block_expansion(
             )
             for p in (first, second)
         )
-        programs, routing = compile_expansion(
+        programs, routing, task_programs = compile_expansion(
             _program_query_payload(query), TUNING.encode_config(config), device.ordinal
         )
         return _ExpansionState(
@@ -316,6 +322,7 @@ def plan_csf_block_expansion(
             torch.device("cuda", device.ordinal),
             config.bitmap_routes,
             config.direct_routes,
+            task_programs,
         )
 
     return Plan(

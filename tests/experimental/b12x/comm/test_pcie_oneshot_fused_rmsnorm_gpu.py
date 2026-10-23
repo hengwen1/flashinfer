@@ -217,7 +217,7 @@ def _run_mixed_graphs(pool, device, rank):
         for case, (dtype, weight_dtype, output_dtype, centered, rounding) in enumerate(
             cases
         ):
-            for rows in (1, 4, 7, 36):
+            for rows in (1, 4, 7, 36, 48, 49):
                 inp, residual, weight = _make_inputs(rows, hidden, dtype, device, rank)
                 residual = residual.float()
                 weight = weight.to(weight_dtype)
@@ -315,6 +315,85 @@ def _run_mixed_graphs(pool, device, rank):
         for session, result in resources:
             result.close()
             session.close()
+
+
+def _run_stored_residual_normalization(pool, device, rank):
+    """Normalization consumes the rounded residual stored for the next layer."""
+    channel_id = "graph:stored-residual"
+    pool.prepare_channels((channel_id,))
+    for rows in (1, 7, 36):
+        for dtype in (torch.bfloat16, torch.float32):
+            source = torch.zeros((rows, 6144), device=device, dtype=dtype)
+            residual = torch.zeros_like(source, dtype=torch.bfloat16)
+            weight = torch.linspace(
+                -0.5, 0.5, 6144, device=device, dtype=torch.bfloat16
+            )
+            graph = torch.cuda.CUDAGraph()
+            with pool.capture(channel_id=channel_id) as channel:
+                session, result, plan, output = _prepare_fused_execution(
+                    channel,
+                    source,
+                    residual,
+                    weight,
+                    1e-6,
+                    name=f"stored-residual:{rows}:{dtype}",
+                    output_dtype=torch.bfloat16,
+                    zero_centered=True,
+                    reduction_dtype=torch.bfloat16,
+                )
+                with torch.cuda.graph(graph):
+                    pool.all_reduce_fused_add_rms_norm(
+                        source,
+                        residual,
+                        weight,
+                        1e-6,
+                        plan=plan,
+                        out=output,
+                        residual_out=residual,
+                        channel_id=channel_id,
+                        zero_centered=True,
+                        reduction_dtype=torch.bfloat16,
+                    )
+            try:
+                columns = torch.arange(source.numel(), device=device).reshape(
+                    source.shape
+                )
+                initial = ((columns % 5).float() / 8 + 1).bfloat16()
+                source.copy_(
+                    torch.where(columns % 2 == 0, 1 / 256, -1 / 256)
+                    if rank == 0
+                    else torch.zeros_like(source)
+                )
+                residual.copy_(initial)
+                reduced = source.to(torch.float32, copy=True)
+                dist.all_reduce(reduced)
+                expected_residual = (
+                    initial.float() + reduced.bfloat16().float()
+                ).bfloat16()
+                graph.replay()
+                torch.cuda.synchronize(device)
+                torch.testing.assert_close(
+                    residual,
+                    expected_residual,
+                    rtol=0,
+                    atol=0,
+                    msg=lambda message: f"{dtype}, rows={rows}: {message}",
+                )
+                actual = output.clone()
+                source.zero_()
+                residual.copy_(expected_residual)
+                allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize(device)
+                assert (
+                    torch.cuda.memory_stats(device)["allocation.all.allocated"]
+                    == allocated
+                )
+                torch.testing.assert_close(output, actual, rtol=0, atol=0)
+            finally:
+                graph.reset()
+                result.close()
+                session.close()
 
 
 def _run_eager(
@@ -624,6 +703,7 @@ def _worker(rank: int, world_size: int, port: int, mixed: bool) -> None:
     try:
         if mixed:
             _run_mixed_graphs(pool, device, rank)
+            _run_stored_residual_normalization(pool, device, rank)
             return
         pool.prepare_channels(
             (

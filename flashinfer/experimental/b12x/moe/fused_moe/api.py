@@ -238,6 +238,25 @@ def run(*, binding: Binding):
                 if binding.output_cast_target is not None
                 else binding.output
             )
+            if getattr(binding, "router_logits", None) is not None:
+                from ._binding_ops import prepared_routed_moe_out
+
+                prepared_routed_moe_out(
+                    binding.a,
+                    binding.router_logits,
+                    binding.selected_logits,
+                    binding.topk_weights,
+                    binding.topk_ids,
+                    output,
+                    binding.compiler_scratch,
+                    plan._handle,
+                    binding.correction_bias,
+                    binding.image_correction_bias,
+                    binding.image_mask,
+                    binding.num_valid_tokens,
+                    binding.scales_expanded,
+                )
+                return output
             prepared_moe_out(
                 binding.a,
                 binding.topk_weights,
@@ -255,6 +274,10 @@ def run(*, binding: Binding):
                 binding.compiler_a4_prefill,
             )
             return output
+    from ._token_outer import TokenOuterBinding
+
+    if isinstance(binding, TokenOuterBinding):
+        return binding.run()
     return _run(binding=binding)
 
 

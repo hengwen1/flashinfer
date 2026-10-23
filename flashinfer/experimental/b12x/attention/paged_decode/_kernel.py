@@ -36,7 +36,6 @@ from b12x.attention._shared.cute import copy as cute_copy
 from b12x.attention._shared.cute import ops as attention_ops
 from b12x._lib.intrinsics.mma import bf16_mma_m16n16k16_f32
 from b12x._lib.intrinsics.packed import (
-    bf16_rowsum_m16k16_f32,
     fp8x4_e4m3_to_bfloat2x2_native_sm120,
 )
 from b12x._lib.intrinsics.memory import (
@@ -855,16 +854,6 @@ class PagedDecodeKernel:
                             1,
                             self.num_mma_d_vo,
                         )
-                        d0, d1 = bf16_rowsum_m16k16_f32(
-                            d_frag[0, 0],
-                            d_frag[0, 1],
-                            p_frag[0, 0, 0],
-                            p_frag[0, 0, 1],
-                            p_frag[0, 0, 2],
-                            p_frag[0, 0, 3],
-                        )
-                        d_frag[0, 0] = d0
-                        d_frag[0, 1] = d1
                         if const_expr(self.kv_fp8):
                             _pv_fp8_into_ofrag(
                                 o_frag,

@@ -314,6 +314,8 @@ class _Pointwise:
         clamp_after_silu: bool = False,
         heads: int = 1,
         gate_stride: int = 0,
+        swiglu_alpha: float = 1.0,
+        swiglu_beta: float = 0.0,
     ) -> None:
         self.operation = operation
         self.output_dtype = output_dtype
@@ -322,6 +324,7 @@ class _Pointwise:
         self.round_silu = bool(round_silu)
         self.clamp_after_silu = bool(clamp_after_silu)
         self.heads, self.gate_stride = int(heads), int(gate_stride)
+        self.swiglu_alpha, self.swiglu_beta = float(swiglu_alpha), float(swiglu_beta)
 
     @cute.jit
     def __call__(
@@ -362,13 +365,13 @@ class _Pointwise:
                     up = Float32(self.limit)
                 if up < Float32(-self.limit):
                     up = Float32(-self.limit)
-                activated = gate * _sigmoid(gate)
+                activated = gate * _sigmoid(Float32(self.swiglu_alpha) * gate)
                 if cutlass.const_expr(self.clamp_after_silu):
                     if activated > Float32(self.limit):
                         activated = Float32(self.limit)
                 if cutlass.const_expr(self.round_silu):
                     activated = Float32(BFloat16(activated))
-                value = activated * up
+                value = activated * (up + Float32(self.swiglu_beta))
             elif cutlass.const_expr(self.operation == "add"):
                 value = Float32(left[offset]) + Float32(right[offset])
             elif cutlass.const_expr(self.operation == "relu2"):

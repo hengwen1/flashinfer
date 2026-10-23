@@ -70,8 +70,6 @@ def make_benchmark_requests(metadata, *, device, rows) -> list[PreparationReques
     requests = []
     for tokens in rows:
         for fused in (False, True):
-            if fused and tokens > 36:
-                continue
             surface = (
                 "OneshotAllReduce.all_reduce_fused_add_rms_norm"
                 if fused

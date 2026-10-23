@@ -15,6 +15,7 @@ from ._impl import clear_indexer_caches as clear_caches
 from ._preparation import invocation_from_descriptors, invocation_from_tensors, plan
 from .paged import PAGED_INDEX_PAGE_SIZE
 from .mxfp4 import MXFP4_INDEX_PAGE_BYTES, MXFP4PreparedState, index_mxfp4_page_bytes
+from .msa import MSACaps, plan_msa, run_msa
 
 INDEX_HEAD_DIM = 128
 
@@ -327,6 +328,9 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "MSACaps",
+    "plan_msa",
+    "run_msa",
     "Caps",
     "Plan",
     "Binding",

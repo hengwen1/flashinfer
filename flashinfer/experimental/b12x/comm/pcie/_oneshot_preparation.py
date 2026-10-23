@@ -38,6 +38,7 @@ _PLAIN_SURFACES = frozenset(
 _FUSED_SURFACES = frozenset(
     {
         "OneshotAllReduce.all_reduce_fused_add_rms_norm",
+        "OneshotAllReduce.all_reduce_fused_add",
         "OneshotAllReducePool.all_reduce_fused_add_rms_norm",
     }
 )
@@ -59,7 +60,22 @@ def _fused_semantics(
     output_dtype=None,
     zero_centered=False,
     reduction_dtype=None,
+    input_addend=False,
+    group_size=0,
+    group_id_limit=0,
+    group_ids_dtype="int32",
 ):
+    if (
+        type(group_size) is not int
+        or group_size < 0
+        or type(group_id_limit) is not int
+        or group_id_limit < 0
+        or (group_size > 0) != (group_id_limit > 0)
+        or group_ids_dtype not in ("int32", "int64")
+    ):
+        raise ValueError(
+            "weighted group geometry requires a positive size/ID bound and int32/int64 IDs"
+        )
     supported = (torch.float16, torch.bfloat16, torch.float32)
     operands = {
         "residual_dtype": residual_dtype or dtype,
@@ -74,13 +90,35 @@ def _fused_semantics(
         )
     if type(zero_centered) is not bool:
         raise TypeError("zero_centered must be a boolean")
+    if type(input_addend) is not bool:
+        raise TypeError("input_addend must be a boolean")
     return {
+        "input_addend": input_addend,
+        "group_size": int(group_size),
+        "group_id_limit": int(group_id_limit),
+        "group_ids_dtype": group_ids_dtype,
         **{key: _dtype_name(value) for key, value in operands.items()},
         "zero_centered": zero_centered,
         "reduction_dtype": (
             None if reduction_dtype is None else _dtype_name(reduction_dtype)
         ),
     }
+
+
+def _check_input_addend(inp, input_addend):
+    if input_addend is None:
+        return False
+    if not isinstance(input_addend, torch.Tensor) or (
+        input_addend.shape != inp.shape
+        or input_addend.dtype != inp.dtype
+        or input_addend.device != inp.device
+        or not input_addend.is_contiguous()
+        or input_addend.data_ptr() % 16
+    ):
+        raise ValueError(
+            "input addend must match source shape, dtype, device and packed contiguous layout"
+        )
+    return True
 
 
 def _input_from_call(call: Mapping[str, object]) -> torch.Tensor:
@@ -123,6 +161,9 @@ class _InvocationTensor:
     def stride(self):
         return self._stride
 
+    def is_contiguous(self):
+        return self._stride == _contiguous_strides(self.shape)
+
 
 def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
     stride = 1
@@ -131,6 +172,55 @@ def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
         result.append(stride)
         stride *= extent
     return tuple(reversed(result))
+
+
+def _logical_input(inp, group_size=0):
+    if not group_size:
+        return inp
+    if (
+        inp.ndim != 3
+        or inp.shape[1] != group_size
+        or min(inp.shape) <= 0
+        or not inp.is_contiguous()
+    ):
+        raise ValueError(
+            "weighted source requires nonempty [rows, groups, hidden] storage"
+        )
+    shape = (int(inp.shape[0]), int(inp.shape[2]))
+    return _InvocationTensor(shape, inp.dtype, _contiguous_strides(shape), inp.device)
+
+
+def _grouped_inputs(inp, group_weights=None, group_ids=None, group_id_limit=0):
+    if group_weights is None and group_ids is None and group_id_limit == 0:
+        return inp, 0, 0, "int32"
+    if inp.ndim != 3 or not inp.is_contiguous() or inp.data_ptr() % 16:
+        raise ValueError(
+            "weighted source requires aligned contiguous [rows, groups, hidden] storage"
+        )
+    if type(group_id_limit) is not int or group_id_limit <= 0:
+        raise ValueError("weighted group ID bound must be positive")
+    for name, tensor, dtypes in (
+        ("group weights", group_weights, (torch.float32,)),
+        ("group IDs", group_ids, (torch.int32, torch.int64)),
+    ):
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.shape != inp.shape[:2]
+            or tensor.dtype not in dtypes
+            or tensor.device != inp.device
+            or not tensor.is_contiguous()
+            or tensor.data_ptr() % tensor.element_size()
+        ):
+            raise ValueError(
+                f"{name} must match the source row/group geometry and device"
+            )
+    size = int(inp.shape[1])
+    return (
+        _logical_input(inp, size),
+        size,
+        group_id_limit,
+        ("int64" if group_ids.dtype == torch.int64 else "int32"),
+    )
 
 
 def _owned_resident_layout(runtime, native) -> tuple[int, int, int]:
@@ -190,6 +280,10 @@ def query_from_metadata(
     output_dtype: torch.dtype | None = None,
     zero_centered: bool = False,
     reduction_dtype: torch.dtype | None = None,
+    input_addend: bool = False,
+    group_size: int = 0,
+    group_id_limit: int = 0,
+    group_ids_dtype: str = "int32",
 ) -> PcieQuery:
     """Extract a native declaration from immutable invocation metadata only."""
     tensor = _InvocationTensor(
@@ -199,6 +293,10 @@ def query_from_metadata(
         runtime.device,
         alignment,
     )
+    physical = tensor
+    tensor = _logical_input(physical, group_size)
+    if group_size and surface not in _FUSED_SURFACES:
+        raise ValueError("weighted groups require fused collective staging")
     if surface not in _PLAIN_SURFACES | _FUSED_SURFACES:
         raise ValueError(f"unsupported oneshot preparation surface {surface!r}")
     if dtype not in (torch.float16, torch.bfloat16, torch.float32):
@@ -216,6 +314,8 @@ def query_from_metadata(
         launcher = _plain_launcher_metadata(backend, native, tensor)
         registered = not launcher["stage_input"]
     else:
+        if (input_addend or group_size) and not stage_input:
+            raise ValueError("input addend requires staged collective storage")
         if (
             tensor.ndim == 0
             or tensor.numel() == 0
@@ -226,13 +326,11 @@ def query_from_metadata(
                 "fused oneshot input must be nonempty and contiguous with 16-byte row packs"
             )
         mode, single_cta, register_normalize, threads = backend._fused_launch_config(
-            native, tensor
+            native, tensor, reduction_dtype=reduction_dtype
         )
         pack_elems = 16 // tensor.element_size()
         hidden_packs = int(tensor.shape[-1]) // pack_elems
         rows = tensor.numel() // int(tensor.shape[-1])
-        if rows > 36:
-            raise ValueError("fused allreduce RMSNorm supports at most 36 rows")
         min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
         override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
         ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
@@ -245,7 +343,12 @@ def query_from_metadata(
                 output_dtype=output_dtype,
                 zero_centered=zero_centered,
                 reduction_dtype=reduction_dtype,
+                input_addend=input_addend,
+                group_size=group_size,
+                group_id_limit=group_id_limit,
+                group_ids_dtype=group_ids_dtype,
             ),
+            "normalize": not surface.endswith(".all_reduce_fused_add"),
             "dtype": _dtype_name(dtype),
             "mode": mode,
             "single_cta": single_cta,
@@ -255,7 +358,7 @@ def query_from_metadata(
             "hidden_packs": hidden_packs,
             "rows": rows,
             "ctas_per_row": ctas,
-            "blocks": rows * ctas,
+            "blocks": min(rows * ctas, 36),
             "stage_input": stage_input,
         }
         registered = not stage_input
@@ -263,8 +366,9 @@ def query_from_metadata(
         runtime, native
     )
     setup = {
-        "shape": tensor.shape,
-        "stride": tensor.stride(),
+        "shape": physical.shape,
+        "stride": physical.stride(),
+        "logical_shape": tensor.shape,
         "dtype": _dtype_name(dtype),
         "device_index": backend._device_index(runtime.device),
         "elements": tensor.numel(),
@@ -300,6 +404,15 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         raise ValueError(f"unsupported oneshot preparation surface {surface!r}")
     values = dict(call)
     inp = _input_from_call(values)
+    physical = inp
+    inp, group_size, group_id_limit, group_ids_dtype = _grouped_inputs(
+        physical,
+        values.get("group_weights"),
+        values.get("group_ids"),
+        values.get("group_id_limit", 0),
+    )
+    if group_size and surface not in _FUSED_SURFACES:
+        raise ValueError("weighted groups require fused collective staging")
     native = _state(runtime)
     if inp.device != runtime.device:
         raise ValueError("oneshot input device differs from its native runtime")
@@ -321,14 +434,15 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     if surface in _PLAIN_SURFACES:
         launcher = _plain_launcher_metadata(backend, native, inp)
     else:
+        input_addend = _check_input_addend(inp, values.get("input_addend"))
+        if (input_addend or group_size) and not stage_input:
+            raise ValueError("input addend requires staged collective storage")
         mode, single_cta, register_normalize, threads = backend._fused_launch_config(
-            native, inp
+            native, inp, reduction_dtype=values.get("reduction_dtype")
         )
         pack_elems = 16 // inp.element_size()
         hidden_packs = int(inp.shape[-1]) // pack_elems
         rows = inp.numel() // int(inp.shape[-1])
-        if rows > 36:
-            raise ValueError("fused allreduce RMSNorm supports at most 36 rows")
         min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
         override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
         ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
@@ -341,7 +455,12 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
                 output_dtype=getattr(values.get("out"), "dtype", inp.dtype),
                 zero_centered=values.get("zero_centered", False),
                 reduction_dtype=values.get("reduction_dtype"),
+                input_addend=input_addend,
+                group_size=group_size,
+                group_id_limit=group_id_limit,
+                group_ids_dtype=group_ids_dtype,
             ),
+            "normalize": not surface.endswith(".all_reduce_fused_add"),
             "dtype": dtype,
             "mode": mode,
             "single_cta": single_cta,
@@ -351,15 +470,16 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             "hidden_packs": hidden_packs,
             "rows": rows,
             "ctas_per_row": ctas,
-            "blocks": rows * ctas,
+            "blocks": min(rows * ctas, 36),
             "stage_input": stage_input,
         }
     rank_data_nbytes, slab_nbytes, owned_slab_count = _owned_resident_layout(
         runtime, native
     )
     setup = {
-        "shape": tuple(inp.shape),
-        "stride": tuple(inp.stride()),
+        "shape": tuple(physical.shape),
+        "stride": tuple(physical.stride()),
+        "logical_shape": tuple(inp.shape),
         "dtype": dtype,
         "device_index": backend._device_index(inp.device),
         "elements": int(inp.numel()),
@@ -441,6 +561,11 @@ def compile_oneshot_surface(query_payload, ordinal):
                     output_dtype=call["output_dtype"],
                     zero_centered=call["zero_centered"],
                     reduction_dtype=call["reduction_dtype"],
+                    input_addend=call["input_addend"],
+                    group_size=call["group_size"],
+                    group_id_limit=call["group_id_limit"],
+                    group_ids_dtype=call["group_ids_dtype"],
+                    normalize=call["normalize"],
                 )
                 for variant in variants
             }
@@ -508,21 +633,74 @@ class _OneshotExecutionState:
         self._require_bound_input(inp)
         return self.runtime._run_prepared_plain(inp, out, self.query, self.launchers)
 
-    def run_fused(self, inp, residual, weight, out, residual_out, epsilon):
+    def run_fused(
+        self,
+        inp,
+        residual,
+        weight,
+        out,
+        residual_out,
+        epsilon,
+        input_addend=None,
+        group_weights=None,
+        group_ids=None,
+        group_id_limit=0,
+    ):
         self._require_bound_input(inp)
         if self.query.surface not in _FUSED_SURFACES:
             raise ValueError("fused RMSNorm requires a fused preparation plan")
-        for name, tensor, shape, dtype in (
-            ("residual", residual, inp.shape, self.query.call["residual_dtype"]),
-            ("weight", weight, inp.shape[-1:], self.query.call["weight_dtype"]),
-            ("output", out, inp.shape, self.query.call["output_dtype"]),
+        logical, group_size, limit, ids_dtype = _grouped_inputs(
+            inp, group_weights, group_ids, group_id_limit
+        )
+        if (group_size, limit, ids_dtype) != (
+            self.query.call["group_size"],
+            self.query.call["group_id_limit"],
+            self.query.call["group_ids_dtype"],
+        ):
+            raise ValueError("weighted groups differ from the prepared plan")
+        if (
+            _check_input_addend(logical, input_addend)
+            != self.query.call["input_addend"]
+        ):
+            raise ValueError("input addend differs from the prepared plan")
+        operands = (
+            ("residual", residual, logical.shape, self.query.call["residual_dtype"]),
+            ("weight", weight, logical.shape[-1:], self.query.call["weight_dtype"]),
+            ("output", out, logical.shape, self.query.call["output_dtype"]),
             (
                 "residual output",
                 residual_out,
-                inp.shape,
+                logical.shape,
                 self.query.call["residual_dtype"],
             ),
-        ):
+        )
+        if not self.query.call["normalize"]:
+            if weight is not None or out is not None:
+                raise ValueError(
+                    "residual-only collective has no affine weight or normalized output"
+                )
+            operands = (operands[0], operands[-1])
+            begin = residual_out.data_ptr()
+            end = begin + residual_out.numel() * residual_out.element_size()
+            for tensor in (inp, input_addend, group_weights, group_ids):
+                if tensor is not None:
+                    source_begin = tensor.data_ptr()
+                    source_end = source_begin + tensor.numel() * tensor.element_size()
+                    if begin < source_end and source_begin < end:
+                        raise ValueError(
+                            "residual output must not overlap collective contributions"
+                        )
+            residual_begin = residual.data_ptr()
+            residual_end = residual_begin + residual.numel() * residual.element_size()
+            if (
+                begin != residual_begin
+                and begin < residual_end
+                and residual_begin < end
+            ):
+                raise ValueError(
+                    "residual output may only alias the residual input exactly"
+                )
+        for name, tensor, shape, dtype in operands:
             if (
                 tensor.shape != shape
                 or tensor.dtype != getattr(torch, dtype)
@@ -533,7 +711,7 @@ class _OneshotExecutionState:
                 raise ValueError(
                     f"fused RMSNorm {name} metadata differs from the prepared plan"
                 )
-        if out.data_ptr() == residual_out.data_ptr():
+        if out is not None and out.data_ptr() == residual_out.data_ptr():
             raise ValueError("output and residual output must not alias")
         if not epsilon >= 0:
             raise ValueError("epsilon must be non-negative")
@@ -546,6 +724,9 @@ class _OneshotExecutionState:
             epsilon,
             self.query,
             self.launchers,
+            input_addend,
+            group_weights,
+            group_ids,
         )
 
 
@@ -576,10 +757,14 @@ def _prepare_fused_call(
     *,
     inp: torch.Tensor,
     residual: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor,
+    weight: torch.Tensor | None,
+    out: torch.Tensor | None,
     residual_out: torch.Tensor,
     epsilon: float,
+    input_addend: torch.Tensor | None = None,
+    group_weights: torch.Tensor | None = None,
+    group_ids: torch.Tensor | None = None,
+    group_id_limit: int = 0,
     produce=None,
     reset=None,
     restore=None,
@@ -588,8 +773,19 @@ def _prepare_fused_call(
     """Bind and prime the complete fused arithmetic with its actual resources."""
     state.bind_input(inp)
     return PreparedCall(
-        run=lambda: state.run_fused(inp, residual, weight, out, residual_out, epsilon),
-        output=(out, residual_out),
+        run=lambda: state.run_fused(
+            inp,
+            residual,
+            weight,
+            out,
+            residual_out,
+            epsilon,
+            input_addend,
+            group_weights,
+            group_ids,
+            group_id_limit,
+        ),
+        output=residual_out if out is None else (out, residual_out),
         produce=produce,
         reset=reset,
         restore=restore,

@@ -32,12 +32,16 @@ class HyperConnectionQuery:
     limit: float = float("inf")
     round_silu: bool = False
     clamp_after_silu: bool = False
+    swiglu_alpha: float = 1.0
+    swiglu_beta: float = 0.0
     zero_centered: bool = True
     weight_dtype: str = "bfloat16"
     add_residual: bool = False
     gate_stride: int = 0
     paired: bool = False
     autotune_effort: str = "medium"
+    indexed_rows: int = 0
+    index_dtype: str = "int64"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -212,19 +216,42 @@ def _validate_query(query, device):
         raise ValueError(
             "paired normalization requires two BF16 streams without residual addition"
         )
+    if type(query.indexed_rows) is not int or query.indexed_rows < 0:
+        raise ValueError("indexed source row count must be nonnegative")
+    if query.indexed_rows and (
+        query.operation != "grouped_rmsnorm"
+        or query.streams != 1
+        or query.add_residual
+        or query.paired
+    ):
+        raise ValueError(
+            "indexed normalization requires one stream without residual addition"
+        )
+    if query.index_dtype not in ("int32", "int64"):
+        raise ValueError("normalization indices must be int32 or int64")
     if query.operation == "sigmoid" and query.right_dtype != query.left_dtype:
         raise ValueError("sigmoid uses one input dtype")
     if not math.isfinite(query.eps) or query.eps <= 0:
         raise ValueError("normalization epsilon must be finite and positive")
     if math.isnan(query.limit) or query.limit <= 0:
         raise ValueError("activation limit must be positive or infinity")
+    if (
+        not math.isfinite(query.swiglu_alpha)
+        or query.swiglu_alpha <= 0
+        or not math.isfinite(query.swiglu_beta)
+    ):
+        raise ValueError("SwiGLU alpha must be positive and beta must be finite")
     if any(
         type(value) is not bool
         for value in (query.token_mask, query.round_silu, query.clamp_after_silu)
     ):
         raise TypeError("operand and rounding flags must be boolean")
     if query.operation != "swiglu" and (
-        query.round_silu or query.clamp_after_silu or query.limit != float("inf")
+        query.round_silu
+        or query.clamp_after_silu
+        or query.limit != float("inf")
+        or query.swiglu_alpha != 1.0
+        or query.swiglu_beta != 0.0
     ):
         raise ValueError("activation controls apply only to SwiGLU")
     if query.operation != "engram_mix" and query.token_mask:
@@ -236,6 +263,7 @@ def _uses_triton_reduction(query):
         query.zero_centered
         or query.add_residual
         or query.paired
+        or query.indexed_rows
         or query.dtype == "float32"
         or query.output_dtype == "float32"
     )
@@ -291,7 +319,7 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="norm.hyperconnection",
-    query_schema_version=28,
+    query_schema_version=29,
     config_schema_version=22,
     query_fields=frozenset(HyperConnectionQuery.__dataclass_fields__),
     config_fields=frozenset(HyperConnectionConfig.__dataclass_fields__),

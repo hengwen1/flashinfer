@@ -1700,6 +1700,8 @@ class _CuTeOneshotBackend:
         cls,
         state: _CuTeOneshotState,
         inp: torch.Tensor,
+        *,
+        reduction_dtype: torch.dtype | None = None,
     ) -> tuple[str, bool, bool, int]:
         pack_elems = 16 // inp.element_size()
         hidden_packs = int(inp.shape[-1]) // pack_elems
@@ -1732,6 +1734,14 @@ class _CuTeOneshotBackend:
             mode = "stage_push"
         else:
             mode = "stage_pull"
+        if (
+            mode == "stage_pull"
+            and state.world_size == 4
+            and state.transport_policy[3]
+            and inp.dtype in (torch.float16, torch.bfloat16)
+            and reduction_dtype == inp.dtype
+        ):
+            mode = "stage_tp4_owner"
         return mode, ctas_per_row == 1, register_normalize, threads
 
     @staticmethod
@@ -1972,10 +1982,6 @@ class _CuTeOneshotBackend:
         pack_elems = 16 // inp.element_size()
         hidden_packs = int(inp.shape[-1]) // pack_elems
         rows = inp.numel() // int(inp.shape[-1])
-        if rows > _MAX_BLOCKS:
-            raise ValueError(
-                f"fused allreduce RMSNorm supports at most {_MAX_BLOCKS} rows"
-            )
         _, single_cta_check, _, _ = self._fused_launch_config(state, inp)
         # Recover the CTA count from the already-derived single-CTA/config
         # formula without changing the launch contract.
@@ -1989,7 +1995,7 @@ class _CuTeOneshotBackend:
             ctas_per_row = max(max(1, 3 // rows), min_ctas)
         ctas_per_row = max(1, min(ctas_per_row, _MAX_BLOCKS // rows))
         assert single_cta_check == (ctas_per_row == 1)
-        blocks = rows * ctas_per_row
+        blocks = min(rows * ctas_per_row, _MAX_BLOCKS)
 
         from ._oneshot_cute import get_fused_oneshot_launcher
 
@@ -3073,6 +3079,9 @@ class PCIeOneshotAllReduce:
         epsilon: float,
         query,
         launchers,
+        input_addend=None,
+        group_weights=None,
+        group_ids=None,
     ) -> None:
         launcher, state = self._prepared_launcher(launchers, inp)
         call = query.call
@@ -3083,8 +3092,8 @@ class PCIeOneshotAllReduce:
                 state.signal_table_address,
                 inp.data_ptr(),
                 residual.data_ptr(),
-                weight.data_ptr(),
-                out.data_ptr(),
+                0 if weight is None else weight.data_ptr(),
+                0 if out is None else out.data_ptr(),
                 residual_out.data_ptr(),
                 call["hidden_packs"],
                 call["rows"],
@@ -3092,6 +3101,13 @@ class PCIeOneshotAllReduce:
                 int(state.eager_buffer_bytes or inp.numel() * inp.element_size()) // 16,
                 float(epsilon),
                 call["blocks"],
+                input_addend_address=0
+                if input_addend is None
+                else input_addend.data_ptr(),
+                group_weights_address=0
+                if group_weights is None
+                else group_weights.data_ptr(),
+                group_ids_address=0 if group_ids is None else group_ids.data_ptr(),
             )
 
     def _prepare_input(
@@ -3199,11 +3215,17 @@ class PCIeOneshotAllReduce:
         residual_out: Optional[torch.Tensor] = None,
         zero_centered: bool = False,
         reduction_dtype: torch.dtype | None = None,
+        input_addend: torch.Tensor | None = None,
+        group_weights: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        group_id_limit: int = 0,
         peer_input_ptrs: Optional[Sequence[int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """All-reduce, optionally round, add the residual, then apply RMSNorm.
 
-        The plan declares independent residual, weight, and output dtypes.
+        An input addend is added in FP32 and rounded to the input dtype before
+        rank reduction. It requires matching contiguous metadata and staged
+        collective storage. The plan declares independent residual, weight, and output dtypes.
         ``zero_centered`` uses ``1 + weight``; ``reduction_dtype`` rounds the
         FP32 collective sum before residual addition. Residual output may
         alias the residual input, retaining FP32 storage across layers.
@@ -3219,6 +3241,10 @@ class PCIeOneshotAllReduce:
                 residual_out=residual_out,
                 zero_centered=zero_centered,
                 reduction_dtype=reduction_dtype,
+                input_addend=input_addend,
+                group_weights=group_weights,
+                group_ids=group_ids,
+                group_id_limit=group_id_limit,
                 peer_input_ptrs=peer_input_ptrs,
             )
 
@@ -3234,6 +3260,10 @@ class PCIeOneshotAllReduce:
         residual_out: Optional[torch.Tensor] = None,
         zero_centered: bool = False,
         reduction_dtype: torch.dtype | None = None,
+        input_addend: torch.Tensor | None = None,
+        group_weights: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        group_id_limit: int = 0,
         peer_input_ptrs: Optional[Sequence[int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Guarded implementation for the fused public entry point."""
@@ -3245,7 +3275,12 @@ class PCIeOneshotAllReduce:
                 f"input device {inp.device} does not match runtime device {self.device}"
             )
         self._check_stream()
-        if not self.should_allreduce(inp):
+        from ._oneshot_preparation import _grouped_inputs
+
+        logical, group_size, limit, ids_dtype = _grouped_inputs(
+            inp, group_weights, group_ids, group_id_limit
+        )
+        if not self.should_allreduce(logical):
             raise ValueError(
                 "input does not satisfy device/dtype/size/alignment/contiguity "
                 f"requirements (shape={tuple(inp.shape)}, dtype={inp.dtype})"
@@ -3266,20 +3301,46 @@ class PCIeOneshotAllReduce:
         from ._oneshot_preparation import _fused_semantics
 
         semantics = _fused_semantics(
-            inp.dtype, zero_centered=zero_centered, reduction_dtype=reduction_dtype
+            inp.dtype,
+            zero_centered=zero_centered,
+            reduction_dtype=reduction_dtype,
+            input_addend=input_addend is not None,
+            group_size=group_size,
+            group_id_limit=limit,
+            group_ids_dtype=ids_dtype,
         )
         if any(
             semantics[key] != state.query.call[key]
-            for key in ("zero_centered", "reduction_dtype")
+            for key in (
+                "zero_centered",
+                "reduction_dtype",
+                "input_addend",
+                "group_size",
+                "group_id_limit",
+                "group_ids_dtype",
+            )
         ):
             raise ValueError("fused RMSNorm arithmetic differs from the prepared plan")
         if out is None:
-            out = torch.empty_like(
-                inp, dtype=getattr(torch, state.query.call["output_dtype"])
+            out = torch.empty(
+                logical.shape,
+                device=inp.device,
+                dtype=getattr(torch, state.query.call["output_dtype"]),
             )
         if residual_out is None:
             residual_out = torch.empty_like(residual)
-        state.run_fused(inp, residual, weight, out, residual_out, float(epsilon))
+        state.run_fused(
+            inp,
+            residual,
+            weight,
+            out,
+            residual_out,
+            float(epsilon),
+            input_addend,
+            group_weights,
+            group_ids,
+            group_id_limit,
+        )
         return out, residual_out
 
     @contextmanager
@@ -4016,6 +4077,10 @@ class PCIeOneshotAllReducePool:
         residual_out: Optional[torch.Tensor] = None,
         zero_centered: bool = False,
         reduction_dtype: torch.dtype | None = None,
+        input_addend: torch.Tensor | None = None,
+        group_weights: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        group_id_limit: int = 0,
         peer_input_ptrs: Optional[Sequence[int]] = None,
         stream: object = None,
         channel_id: Optional[str] = None,
@@ -4031,6 +4096,10 @@ class PCIeOneshotAllReducePool:
                 residual_out=residual_out,
                 zero_centered=zero_centered,
                 reduction_dtype=reduction_dtype,
+                input_addend=input_addend,
+                group_weights=group_weights,
+                group_ids=group_ids,
+                group_id_limit=group_id_limit,
                 peer_input_ptrs=peer_input_ptrs,
                 stream=stream,
                 channel_id=channel_id,
@@ -4048,6 +4117,10 @@ class PCIeOneshotAllReducePool:
         residual_out: Optional[torch.Tensor] = None,
         zero_centered: bool = False,
         reduction_dtype: torch.dtype | None = None,
+        input_addend: torch.Tensor | None = None,
+        group_weights: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        group_id_limit: int = 0,
         peer_input_ptrs: Optional[Sequence[int]] = None,
         stream: object = None,
         channel_id: Optional[str] = None,
@@ -4067,6 +4140,10 @@ class PCIeOneshotAllReducePool:
                 residual_out=residual_out,
                 zero_centered=zero_centered,
                 reduction_dtype=reduction_dtype,
+                input_addend=input_addend,
+                group_weights=group_weights,
+                group_ids=group_ids,
+                group_id_limit=group_id_limit,
                 peer_input_ptrs=peer_input_ptrs,
             )
 

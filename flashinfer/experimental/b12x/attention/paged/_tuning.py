@@ -89,6 +89,10 @@ class GqaQuery:
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
+    @property
+    def selected_verify(self) -> bool:
+        return self.mode == "verify" and self.abi.get("q2k_indices") is not None
+
     def to_dict(self) -> dict[str, object]:
         return {
             "mode": self.mode,
@@ -245,9 +249,13 @@ def _heuristic(
             head_dim_qk=query.head_dim_qk,
             head_dim_vo=query.head_dim_vo,
             page_size=query.page_size,
-            batch=query.batch_size,
-            max_cache_page_count=(query.cache_tokens + query.page_size - 1)
-            // query.page_size,
+            batch=query.batch_size * (query.query_len if query.selected_verify else 1),
+            max_cache_page_count=min(
+                (query.cache_tokens + query.page_size - 1) // query.page_size,
+                16 * (128 // query.page_size),
+            )
+            if query.selected_verify
+            else (query.cache_tokens + query.page_size - 1) // query.page_size,
             window_left=query.window_left,
             graph_ctas_per_sm=query.requested_graph_ctas_per_sm,
             max_work_items=query.requested_max_work_items,
@@ -255,7 +263,12 @@ def _heuristic(
             force_split_kv=query.force_split_kv,
             apply_chunk_efficiency_policy=apply_chunk_efficiency_policy,
         )
-    return GqaConfig.from_capacity(capacity)
+    config = GqaConfig.from_capacity(capacity)
+    return (
+        replace(config, query_tiles_per_request=query.query_len)
+        if query.selected_verify
+        else config
+    )
 
 
 def _validate(
@@ -286,6 +299,8 @@ def _validate(
     if any(value <= 0 for value in positive) or config.max_partial_rows < 0:
         raise ValueError("paged GQA profile capacities must be non-negative")
     expected_pages = (query.cache_tokens + query.page_size - 1) // query.page_size
+    if query.selected_verify:
+        expected_pages = min(expected_pages, 16 * (128 // query.page_size))
     if query.window_left >= 0:
         expected_pages = min(
             expected_pages,
@@ -297,6 +312,8 @@ def _validate(
         )
     group_size = query.q_heads // query.kv_heads
     expected_query_tiles = (group_size + config.cta_tile_q - 1) // config.cta_tile_q
+    if query.selected_verify:
+        expected_query_tiles *= query.query_len
     if config.query_tiles_per_request != expected_query_tiles:
         raise ValueError("paged GQA profile query tile count is inconsistent")
     if config.max_chunks_per_request > (config.architecture_max_chunks_per_request):
@@ -359,6 +376,8 @@ def _tuning_parameters(
                 "GQA tuning requires divisible heads and positive cache capacity"
             )
         pages = (query.cache_tokens + query.page_size - 1) // query.page_size
+        if query.selected_verify:
+            pages = min(pages, 16 * (128 // query.page_size))
         if query.window_left >= 0:
             pages = min(
                 pages,
@@ -367,6 +386,8 @@ def _tuning_parameters(
                 ),
             )
         query_tiles = (query.q_heads // query.kv_heads + 15) // 16
+        if query.selected_verify:
+            query_tiles *= query.query_len
         # Decode is M16. Ordinary schedules cannot split below one page;
         # the analytic FP8 route can split each page into 64-token stages
         # (planner._plan_decode_graph_capacity_heuristic). Cover both through
@@ -389,7 +410,8 @@ def _tuning_parameters(
         with paged_controls(query.controls):
             default_residency = resolve_decode_graph_ctas_per_sm(
                 kv_dtype=getattr(torch, query.kv_dtype),
-                batch=query.batch_size,
+                batch=query.batch_size
+                * (query.query_len if query.selected_verify else 1),
                 page_size=query.page_size,
                 head_dim_qk=query.head_dim_qk,
                 head_dim_vo=query.head_dim_vo,

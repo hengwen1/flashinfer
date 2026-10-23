@@ -18,6 +18,7 @@ from b12x._lib.compiler import KernelCompileSpec, run_compiled
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
+    ld_global_v2_u32,
     ld_global_v4_u32,
     shared_ptr_to_u32,
     st_shared_v4_u32,
@@ -185,6 +186,7 @@ class SmallNGemvKernel:
                     x_column_stride,
                     weight_column_stride,
                     tid,
+                    vector_loads,
                 )
         else:
             self.scalar_dot(
@@ -198,6 +200,7 @@ class SmallNGemvKernel:
                 x_column_stride,
                 weight_column_stride,
                 tid,
+                vector_loads,
             )
         allocator = cutlass.utils.SmemAllocator()
         warps = self.block_threads // 32
@@ -239,6 +242,7 @@ class SmallNGemvKernel:
         x_column_stride: Int64,
         weight_column_stride: Int64,
         tid: Int32,
+        vector_loads: Int32,
     ):
         index = tid
         while index < Int32(self.k):
@@ -251,6 +255,81 @@ class SmallNGemvKernel:
                         * value
                     )
             index += Int32(self.block_threads)
+
+
+class MixedVectorGemvKernel(SmallNGemvKernel):
+    """Load packed BF16 source and full-bit FP32 weights before scalar FMAs."""
+
+    @cute.jit
+    def scalar_dot(
+        self,
+        source: cute.Tensor,
+        weight: cute.Tensor,
+        acc: cute.Tensor,
+        first_row: Int64,
+        w_base: Int64,
+        rows: Int32,
+        x_stride: Int64,
+        x_column_stride: Int64,
+        weight_column_stride: Int64,
+        tid: Int32,
+        vector_loads: Int32,
+    ):
+        if cutlass.const_expr(self.k % 8 == 0):
+            if vector_loads != Int32(0):
+                index = tid
+                while index < Int32(self.k // 4):
+                    offset = Int64(index) * Int64(4)
+                    w0, w1, w2, w3 = ld_global_v4_u32(
+                        get_ptr_as_int64(weight, w_base + offset)
+                    )
+                    for r in cutlass.range_constexpr(self.rows_per_tile):
+                        row = first_row + Int64(r)
+                        if row < Int64(rows):
+                            x0, x1 = ld_global_v2_u32(
+                                get_ptr_as_int64(source, row * x_stride + offset)
+                            )
+                            acc[r] += u32_as_f32(x0 << Uint32(16)) * u32_as_f32(w0)
+                            acc[r] += u32_as_f32(x0 & Uint32(0xFFFF0000)) * u32_as_f32(
+                                w1
+                            )
+                            acc[r] += u32_as_f32(x1 << Uint32(16)) * u32_as_f32(w2)
+                            acc[r] += u32_as_f32(x1 & Uint32(0xFFFF0000)) * u32_as_f32(
+                                w3
+                            )
+                    index += Int32(self.block_threads)
+            else:
+                index = tid
+                while index < Int32(self.k):
+                    value = Float32(
+                        weight[w_base + Int64(index) * weight_column_stride]
+                    )
+                    for r in cutlass.range_constexpr(self.rows_per_tile):
+                        row = first_row + Int64(r)
+                        if row < Int64(rows):
+                            acc[r] += (
+                                Float32(
+                                    source[
+                                        row * x_stride + Int64(index) * x_column_stride
+                                    ]
+                                )
+                                * value
+                            )
+                    index += Int32(self.block_threads)
+        else:
+            index = tid
+            while index < Int32(self.k):
+                value = Float32(weight[w_base + Int64(index) * weight_column_stride])
+                for r in cutlass.range_constexpr(self.rows_per_tile):
+                    row = first_row + Int64(r)
+                    if row < Int64(rows):
+                        acc[r] += (
+                            Float32(
+                                source[row * x_stride + Int64(index) * x_column_stride]
+                            )
+                            * value
+                        )
+                index += Int32(self.block_threads)
 
 
 class Bf16GemmKernel:
@@ -560,12 +639,13 @@ def compile_projection(
             output_dtype,
         )
     )
-    if backend not in ("simt", "mma", "tc"):
-        raise ValueError(
-            "projection compiler requires a selected SIMT, MMA or TC backend"
+    if backend not in ("simt", "mixed_vector", "mma", "tc"):
+        raise ValueError(f"unsupported native projection algorithm {backend!r}")
+    if backend in ("simt", "mixed_vector"):
+        kernel_type = (
+            MixedVectorGemvKernel if backend == "mixed_vector" else SmallNGemvKernel
         )
-    if backend == "simt":
-        kernel = SmallNGemvKernel(
+        kernel = kernel_type(
             n,
             k,
             x_type == w_type == torch.bfloat16,
@@ -587,8 +667,8 @@ def compile_projection(
     )
     key = (
         backend,
-        rows_per_tile if backend == "simt" else None,
-        block_threads if backend == "simt" else None,
+        rows_per_tile if backend in ("simt", "mixed_vector") else None,
+        block_threads if backend in ("simt", "mixed_vector") else None,
         n,
         k,
         source_dtype,

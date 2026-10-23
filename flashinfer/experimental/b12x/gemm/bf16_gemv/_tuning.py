@@ -171,7 +171,13 @@ def _validate_query(query, device):
 def validate_config(query, config, device):
     if not isinstance(config, GemvConfig):
         raise TypeError("projection config must be GemvConfig")
-    if config.backend == "simt":
+    if config.backend in ("simt", "mixed_vector"):
+        if config.backend == "mixed_vector" and not (
+            query.source_dtype == "bfloat16" and query.weight_dtype == "float32"
+        ):
+            raise ValueError(
+                "mixed vector projection requires BF16 source and FP32 weights"
+            )
         if type(config.rows_per_tile) is not int or config.rows_per_tile not in (
             1,
             2,
@@ -204,6 +210,8 @@ def validate_config(query, config, device):
 
 def _parameters(query, device):
     backends = ["simt"]
+    if query.source_dtype == "bfloat16" and query.weight_dtype == "float32":
+        backends.append("mixed_vector")
     if _mma_eligible(query):
         backends.append("mma")
     if _tc_eligible(query):
@@ -237,7 +245,7 @@ def _parameters(query, device):
 
 
 def _eligible(choice):
-    return choice["backend"] == "simt" or (
+    return choice["backend"] in ("simt", "mixed_vector") or (
         choice["rows_per_tile"] == 8 and choice["block_threads"] == 128
     )
 
@@ -261,7 +269,7 @@ TUNING = TuningContract(
         ),
         Knob(name="block_threads", values=(128, 256), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=8,
+    candidate_contract_version=12,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

@@ -2072,6 +2072,7 @@ class PagedAttentionWorkspace:
             page_size=int(self.page_size),
             split_kv=bool(self._plan.split_kv),
             window_left=int(self._plan.window_left),
+            msa_block_sparse=bool(self._plan.msa_block_sparse),
             adaptive_chunking=bool(
                 self.mode == "verify"
                 and self._plan.split_kv

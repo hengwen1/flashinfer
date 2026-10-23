@@ -45,6 +45,7 @@ def _grouped_rmsnorm_kernel(
     weight_ptr,
     out_ptr,
     residual_ptr,
+    indices_ptr,
     eps,
     state_stride,
     residual_stride,
@@ -54,12 +55,14 @@ def _grouped_rmsnorm_kernel(
     ZERO_CENTERED: tl.constexpr,
     ADD_RESIDUAL: tl.constexpr,
     PAIRED: tl.constexpr,
+    INDEXED: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK_H).to(tl.int64)
     mask = cols < HIDDEN_SIZE
     offsets = row * HIDDEN_SIZE + cols
-    source_offsets = row // STREAMS * state_stride + row % STREAMS * HIDDEN_SIZE + cols
+    source_row = tl.load(indices_ptr + row).to(tl.int64) if INDEXED else row // STREAMS
+    source_offsets = source_row * state_stride + row % STREAMS * HIDDEN_SIZE + cols
     if PAIRED:
         if row % STREAMS == 0:
             values = tl.load(
@@ -174,13 +177,17 @@ def _norm_launch(
     zero_centered=True,
     residual=None,
     paired=None,
+    indices=None,
 ) -> None:
     right = paired if paired is not None else residual
-    _grouped_rmsnorm_kernel[(int(state.shape[0]) * streams,)](
+    _grouped_rmsnorm_kernel[
+        (int(state.shape[0] if indices is None else indices.numel()) * streams,)
+    ](
         state,
         weight,
         out,
         state if right is None else right,
+        state if indices is None else indices,
         float(eps),
         state.stride(0),
         state.stride(0) if right is None else right.stride(0),
@@ -190,6 +197,7 @@ def _norm_launch(
         ZERO_CENTERED=zero_centered,
         ADD_RESIDUAL=residual is not None,
         PAIRED=paired is not None,
+        INDEXED=indices is not None,
         num_warps=num_warps,
         enable_fp_fusion=False,
     )
@@ -251,6 +259,36 @@ def _combine_launch(
         BLOCK_H=block_h,
         num_warps=num_warps,
     )
+
+
+@torch.library.custom_op("b12x::hyperconnection_indexed_rmsnorm", mutates_args=("out",))
+def _indexed_rmsnorm_op(
+    state: torch.Tensor,
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    plan_handle: int,
+) -> None:
+    """Normalize selected rows; indices must lie in [0, state.shape[0])."""
+    from ._impl import run_indexed_rmsnorm_impl
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", state.device
+    )
+    run_indexed_rmsnorm_impl(state, weight, indices, out, eps=eps, plan=prepared)
+
+
+@_indexed_rmsnorm_op.register_fake
+def _indexed_rmsnorm_fake(
+    state: torch.Tensor,
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    plan_handle: int,
+) -> None:
+    pass
 
 
 @torch.library.custom_op("b12x::hyperconnection_grouped_rmsnorm", mutates_args=("out",))

@@ -137,7 +137,11 @@ def _query_from_caps(
         query_len=int(
             invocation.get(
                 "query_len",
-                1 if caps.mode in ("decode", "verify") else caps.max_total_q,
+                1
+                if caps.mode == "decode"
+                else caps.max_total_q // caps.max_batch
+                if caps.mode == "verify"
+                else caps.max_total_q,
             )
         ),
         cache_tokens=int(
@@ -153,7 +157,10 @@ def _query_from_caps(
         requested_max_partial_rows=invocation.get(
             "max_partial_rows", caps.max_partial_rows or None
         ),
-        force_split_kv=invocation.get("force_split_kv"),
+        force_split_kv=invocation.get(
+            "force_split_kv",
+            True if caps.msa_block_sparse and caps.mode == "verify" else None,
+        ),
     )
 
 
@@ -325,8 +332,18 @@ class _PagedState:
     resources: dict = field(default_factory=dict)
 
     def bind(self, *, _preparing=True, **kwargs):
-        with paged_controls(self.controls):
-            binding = self.scratch_plan.bind(metadata_launchers=self.metadata, **kwargs)
+        previous_indices = self.scratch_plan._q2k_indices_data_ptr
+        if _preparing:
+            self.scratch_plan._q2k_indices_data_ptr = None
+        try:
+            with paged_controls(self.controls):
+                binding = self.scratch_plan.bind(
+                    metadata_launchers=self.metadata, **kwargs
+                )
+        finally:
+            if _preparing:
+                # Representative tuning tensors do not become serving bindings.
+                self.scratch_plan._q2k_indices_data_ptr = previous_indices
         key = variant_key(binding)
         if key not in self.programs:
             raise ValueError(
@@ -368,7 +385,7 @@ class _PagedState:
         return run_paged_prepared(binding, launchers)
 
 
-def _install_graph_replay_state(scratch_plan, window_left: int) -> None:
+def _install_graph_replay_state(scratch_plan, window_left: int, query_len: int) -> None:
     """Install the fixed-address replay schedule a capture binds against.
 
     Scratch views are rematerialized on every bind, so the schedule belongs to
@@ -377,6 +394,13 @@ def _install_graph_replay_state(scratch_plan, window_left: int) -> None:
     caps = scratch_plan.caps
     if not caps.use_cuda_graph:
         return
+    if caps.mode == "verify" and (
+        query_len * caps.max_batch > caps.max_total_q
+        or (
+            not caps.msa_block_sparse and query_len * caps.max_batch != caps.max_total_q
+        )
+    ):
+        raise ValueError("verify query count does not fit the prepared row capacity")
     if caps.mode == "decode":
         scratch_plan.prepare_decode_graph_replay_state(
             batch=caps.max_batch,
@@ -411,17 +435,12 @@ def _install_graph_replay_state(scratch_plan, window_left: int) -> None:
         window_left=window_left,
     )
     if caps.mode == "verify":
-        if caps.max_total_q % caps.max_batch:
-            raise ValueError(
-                "verify graph capacity requires an equal query count per request: "
-                f"max_total_q={caps.max_total_q} is not a multiple of "
-                f"max_batch={caps.max_batch}"
-            )
-        query_len = caps.max_total_q // caps.max_batch
         capacity = plan_verify_graph_capacity(**geometry, query_len=query_len)
-        cu_seqlens_q = torch.arange(
-            0, caps.max_total_q + 1, query_len, dtype=torch.int32, device=caps.device
+        cu_seqlens_q = (
+            torch.arange(caps.max_batch + 1, dtype=torch.int32, device=caps.device)
+            * query_len
         )
+        active_total_q = caps.max_batch * query_len
     else:
         capacity = plan_extend_graph_capacity(
             **geometry, total_q_capacity=caps.max_total_q
@@ -430,6 +449,7 @@ def _install_graph_replay_state(scratch_plan, window_left: int) -> None:
             caps.max_batch + 1, dtype=torch.int32, device=caps.device
         )
         cu_seqlens_q[-1] = caps.max_total_q
+        active_total_q = caps.max_total_q
     cache_tokens = int(capacity.representative_cache_seqlen)
     scratch_plan.prepare_graph_replay_state(
         page_table=page_table,
@@ -437,8 +457,11 @@ def _install_graph_replay_state(scratch_plan, window_left: int) -> None:
             (caps.max_batch,), cache_tokens, dtype=torch.int32, device=caps.device
         ),
         cu_seqlens_q=cu_seqlens_q,
-        active_total_q=caps.max_total_q,
+        active_total_q=active_total_q,
         window_left=window_left,
+        fixed_split_size=caps.config.chunk_pages_lut()[-1]
+        if caps.msa_block_sparse and caps.mode == "verify" and caps.config is not None
+        else -1,
     )
 
 
@@ -521,7 +544,9 @@ def plan(
         )
         with paged_controls(invocation["controls"]):
             _install_graph_replay_state(
-                scratch_plan, int(invocation.get("window_left", -1))
+                scratch_plan,
+                int(invocation.get("window_left", -1)),
+                int(invocation.get("query_len", caps.max_total_q // caps.max_batch)),
             )
         return _PagedState(
             scratch_plan=scratch_plan,

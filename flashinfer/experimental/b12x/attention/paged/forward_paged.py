@@ -34,7 +34,6 @@ from b12x._lib.smem import (
 )
 from b12x._lib.intrinsics.mma import bf16_mma_m16n16k16_f32, mxfp8_mma_m16n8k32_f32_e4m3
 from b12x._lib.intrinsics.packed import (
-    bf16_rowsum_m16k16_f32,
     bfloat2_mul,
     broadcast_f32_to_bfloat2,
     cvt_bf16x2x2_to_e4m3x4,
@@ -2810,6 +2809,14 @@ def _literal_update_mdo_states_fp32_pack_p(
                         * sm_scale_log2
                     )
                 )
+                probability_sum = Float32((p0 + p1) + (p2 + p3))
+                probability_sum += cute.arch.shuffle_sync_bfly(
+                    probability_sum, offset=2
+                )
+                probability_sum += cute.arch.shuffle_sync_bfly(
+                    probability_sum, offset=1
+                )
+                d_frag[mma_q, row_slot] += probability_sum
                 p_frag[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p0, p1)
                 p_frag[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p2, p3)
 
@@ -2887,6 +2894,10 @@ def _literal_update_mdo_states_fp32_pack_p_row0(
                     (s_frag[mma_q, mma_kv, 5] - m_new) * sm_scale_log2
                 )
             )
+            probability_sum = Float32((p0 + p1) + (p2 + p3))
+            probability_sum += cute.arch.shuffle_sync_bfly(probability_sum, offset=2)
+            probability_sum += cute.arch.shuffle_sync_bfly(probability_sum, offset=1)
+            d_frag[mma_q, 0] += probability_sum
             p_frag[mma_q, mma_kv, 0] = pack_f32x2_to_bfloat2(p0, p1)
             p_frag[mma_q, mma_kv, 2] = pack_f32x2_to_bfloat2(p2, p3)
             p_frag[mma_q, mma_kv, 1] = Uint32(0)
@@ -2946,6 +2957,10 @@ def _literal_update_mdo_states_fp32_pack_p_row0_1x1(
         if m_new == -Float32.inf
         else _exp2_approx_ftz_f32((s_frag[0, 0, 5] - m_new) * sm_scale_log2)
     )
+    probability_sum = Float32((p0 + p1) + (p2 + p3))
+    probability_sum += cute.arch.shuffle_sync_bfly(probability_sum, offset=2)
+    probability_sum += cute.arch.shuffle_sync_bfly(probability_sum, offset=1)
+    d_frag[0, 0] += probability_sum
     p_frag[0, 0, 0] = pack_f32x2_to_bfloat2(p0, p1)
     p_frag[0, 0, 2] = pack_f32x2_to_bfloat2(p2, p3)
     p_frag[0, 0, 1] = Uint32(0)
@@ -3080,6 +3095,21 @@ def _literal_update_mdo_states_fp32_pack_p_pairwise(
                         - m_new_scaled
                     )
                 )
+                probability_sum0 = Float32((p00 + p01) + (p02 + p03))
+                probability_sum0 += cute.arch.shuffle_sync_bfly(
+                    probability_sum0, offset=2
+                )
+                probability_sum0 += cute.arch.shuffle_sync_bfly(
+                    probability_sum0, offset=1
+                )
+                probability_sum1 = Float32((p10 + p11) + (p12 + p13))
+                probability_sum1 += cute.arch.shuffle_sync_bfly(
+                    probability_sum1, offset=2
+                )
+                probability_sum1 += cute.arch.shuffle_sync_bfly(
+                    probability_sum1, offset=1
+                )
+                d_frag[mma_q, row_slot] += probability_sum0 + probability_sum1
                 p_frag0[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p00, p01)
                 p_frag0[mma_q, mma_kv, row_slot + 2] = pack_f32x2_to_bfloat2(p02, p03)
                 p_frag1[mma_q, mma_kv, row_slot + 0] = pack_f32x2_to_bfloat2(p10, p11)
@@ -4440,6 +4470,7 @@ class PagedForwardKernel:
                 packed_tile_limit < packed_qo_len, packed_tile_limit, packed_qo_len
             )
         kv_chunk_size = mKvChunkSizePtr[0]
+        msa_q_row_idx = q_start + packed_tile_start // group_size
 
         if const_expr(self.analytic_laguna_decode_graph):
             kv_window_start = Int32(0)
@@ -4447,11 +4478,13 @@ class PagedForwardKernel:
             chunk_end = analytic_chunk_end
         elif const_expr(self.msa_block_sparse):
             kv_window_start = Int32(0)
+            msa_token_local = packed_tile_start // group_size
+            msa_visible_len = cache_len - qo_len + msa_token_local + Int32(1)
             selected_token_count = self._msa_selected_token_count(
                 mQ2KIndices,
                 kv_head_idx,
-                q_start,
-                cache_len,
+                msa_q_row_idx,
+                msa_visible_len,
             )
             chunk_start = (
                 kv_tile_idx * kv_chunk_size if const_expr(self.split_kv) else Int32(0)
@@ -5263,7 +5296,7 @@ class PagedForwardKernel:
                     role_page_idx = self._tile_page_idx(
                         mQ2KIndices,
                         kv_head_idx,
-                        q_start,
+                        msa_q_row_idx,
                         role_prefetch_base,
                         page_size,
                     )
@@ -5610,7 +5643,7 @@ class PagedForwardKernel:
                     prefetch_page_idx = self._tile_page_idx(
                         mQ2KIndices,
                         kv_head_idx,
-                        q_start,
+                        msa_q_row_idx,
                         prefetch_base,
                         page_size,
                     )
@@ -5746,7 +5779,7 @@ class PagedForwardKernel:
             tile_key_base = self._tile_key_base(
                 mQ2KIndices,
                 kv_head_idx,
-                q_start,
+                msa_q_row_idx,
                 tile_base,
             )
             tile_tokens = tile_limit - tile_base
@@ -6365,7 +6398,7 @@ class PagedForwardKernel:
                                 next_page_idx = self._tile_page_idx(
                                     mQ2KIndices,
                                     kv_head_idx,
-                                    q_start,
+                                    msa_q_row_idx,
                                     next_tile_base,
                                     page_size,
                                 )
@@ -6500,18 +6533,6 @@ class PagedForwardKernel:
                             lane,
                         )
                     _exit_thread()
-                for mma_q in cutlass.range_constexpr(num_mma_q):
-                    for mma_kv in cutlass.range_constexpr(num_mma_kv):
-                        d0, d1 = bf16_rowsum_m16k16_f32(
-                            d_frag[mma_q, 0],
-                            d_frag[mma_q, 1],
-                            p_frag[mma_q, mma_kv, 0],
-                            p_frag[mma_q, mma_kv, 1],
-                            p_frag[mma_q, mma_kv, 2],
-                            p_frag[mma_q, mma_kv, 3],
-                        )
-                        d_frag[mma_q, 0] = d0
-                        d_frag[mma_q, 1] = d1
                 if const_expr(not decode_row0_k_release_fastpath):
                     pipeline_k.consumer_release(k_consumer_state)
                     if const_expr(not self.role_specialized_decode):
@@ -6520,7 +6541,7 @@ class PagedForwardKernel:
                                 next_page_idx = self._tile_page_idx(
                                     mQ2KIndices,
                                     kv_head_idx,
-                                    q_start,
+                                    msa_q_row_idx,
                                     next_tile_base,
                                     page_size,
                                 )
@@ -6942,7 +6963,7 @@ class PagedForwardKernel:
                             next_page_idx = self._tile_page_idx(
                                 mQ2KIndices,
                                 kv_head_idx,
-                                q_start,
+                                msa_q_row_idx,
                                 next_tile_base,
                                 page_size,
                             )
@@ -8629,16 +8650,6 @@ class PagedFp8DecodeRawForwardKernel:
                         lane,
                     )
                 _exit_thread()
-            d0, d1 = bf16_rowsum_m16k16_f32(
-                d_frag[0, 0],
-                d_frag[0, 1],
-                p_frag[0, 0, 0],
-                p_frag[0, 0, 1],
-                p_frag[0, 0, 2],
-                p_frag[0, 0, 3],
-            )
-            d_frag[0, 0] = d0
-            d_frag[0, 1] = d1
             if const_expr(paged_control("B12X_PAGED_KV_DEBUG_DUMP", "") == "PVREGS"):
                 if (
                     kv_head_idx == Int32(0)
@@ -9567,27 +9578,6 @@ class PagedBf16ExtendRawForwardKernel:
                             self.num_mma_kv,
                             self.num_mma_d_vo,
                         )
-                        for mma_q in cutlass.range_constexpr(self.num_mma_q):
-                            d0, d1 = bf16_rowsum_m16k16_f32(
-                                d_frag[mma_q, 0],
-                                d_frag[mma_q, 1],
-                                p_frag[mma_q, 0, 0],
-                                p_frag[mma_q, 0, 1],
-                                p_frag[mma_q, 0, 2],
-                                p_frag[mma_q, 0, 3],
-                            )
-                            d_frag[mma_q, 0] = d0
-                            d_frag[mma_q, 1] = d1
-                            d0, d1 = bf16_rowsum_m16k16_f32(
-                                d_frag[mma_q, 0],
-                                d_frag[mma_q, 1],
-                                p_frag_pair[mma_q, 0, 0],
-                                p_frag_pair[mma_q, 0, 1],
-                                p_frag_pair[mma_q, 0, 2],
-                                p_frag_pair[mma_q, 0, 3],
-                            )
-                            d_frag[mma_q, 0] = d0
-                            d_frag[mma_q, 1] = d1
 
                         _literal_pv_mma_into_ofrag_plane_bf16_packed(
                             o_frag,
@@ -9633,17 +9623,6 @@ class PagedBf16ExtendRawForwardKernel:
                             self.num_mma_kv,
                             self.num_mma_d_vo,
                         )
-                        for mma_q in cutlass.range_constexpr(self.num_mma_q):
-                            d0, d1 = bf16_rowsum_m16k16_f32(
-                                d_frag[mma_q, 0],
-                                d_frag[mma_q, 1],
-                                p_frag[mma_q, 0, 0],
-                                p_frag[mma_q, 0, 1],
-                                p_frag[mma_q, 0, 2],
-                                p_frag[mma_q, 0, 3],
-                            )
-                            d_frag[mma_q, 0] = d0
-                            d_frag[mma_q, 1] = d1
 
                         _literal_pv_mma_into_ofrag_plane_bf16_packed(
                             o_frag,
@@ -10750,29 +10729,6 @@ class PagedFp8ExtendRawForwardKernel:
                     self.num_mma_kv,
                     self.num_mma_d_vo,
                 )
-                for mma_q in cutlass.range_constexpr(self.num_mma_q):
-                    for mma_kv in cutlass.range_constexpr(self.num_mma_kv):
-                        d0, d1 = bf16_rowsum_m16k16_f32(
-                            d_frag[mma_q, 0],
-                            d_frag[mma_q, 1],
-                            p_frag[mma_q, mma_kv, 0],
-                            p_frag[mma_q, mma_kv, 1],
-                            p_frag[mma_q, mma_kv, 2],
-                            p_frag[mma_q, mma_kv, 3],
-                        )
-                        d_frag[mma_q, 0] = d0
-                        d_frag[mma_q, 1] = d1
-                    for mma_kv in cutlass.range_constexpr(self.num_mma_kv):
-                        d0, d1 = bf16_rowsum_m16k16_f32(
-                            d_frag[mma_q, 0],
-                            d_frag[mma_q, 1],
-                            p_frag_pair[mma_q, mma_kv, 0],
-                            p_frag_pair[mma_q, mma_kv, 1],
-                            p_frag_pair[mma_q, mma_kv, 2],
-                            p_frag_pair[mma_q, mma_kv, 3],
-                        )
-                        d_frag[mma_q, 0] = d0
-                        d_frag[mma_q, 1] = d1
 
                 # K and V share the expanded BF16 MMA tile.  All math warps
                 # must finish QK before the cooperative V conversion replaces
@@ -10977,29 +10933,6 @@ class PagedFp8ExtendRawForwardKernel:
                             self.num_mma_kv,
                             self.num_mma_d_vo,
                         )
-                        for mma_q in cutlass.range_constexpr(self.num_mma_q):
-                            for mma_kv in cutlass.range_constexpr(self.num_mma_kv):
-                                pair_d0, pair_d1 = bf16_rowsum_m16k16_f32(
-                                    d_frag[mma_q, 0],
-                                    d_frag[mma_q, 1],
-                                    p_frag[mma_q, mma_kv, 0],
-                                    p_frag[mma_q, mma_kv, 1],
-                                    p_frag[mma_q, mma_kv, 2],
-                                    p_frag[mma_q, mma_kv, 3],
-                                )
-                                d_frag[mma_q, 0] = pair_d0
-                                d_frag[mma_q, 1] = pair_d1
-                            for mma_kv in cutlass.range_constexpr(self.num_mma_kv):
-                                pair2_d0, pair2_d1 = bf16_rowsum_m16k16_f32(
-                                    d_frag[mma_q, 0],
-                                    d_frag[mma_q, 1],
-                                    p_frag_pair[mma_q, mma_kv, 0],
-                                    p_frag_pair[mma_q, mma_kv, 1],
-                                    p_frag_pair[mma_q, mma_kv, 2],
-                                    p_frag_pair[mma_q, mma_kv, 3],
-                                )
-                                d_frag[mma_q, 0] = pair2_d0
-                                d_frag[mma_q, 1] = pair2_d1
 
                         _literal_pv_mma_into_ofrag_plane_fp8_raw(
                             o_frag,
@@ -11057,18 +10990,6 @@ class PagedFp8ExtendRawForwardKernel:
                             self.num_mma_kv,
                             self.num_mma_d_vo,
                         )
-                        for mma_q in cutlass.range_constexpr(self.num_mma_q):
-                            for mma_kv in cutlass.range_constexpr(self.num_mma_kv):
-                                single_d0, single_d1 = bf16_rowsum_m16k16_f32(
-                                    d_frag[mma_q, 0],
-                                    d_frag[mma_q, 1],
-                                    p_frag[mma_q, mma_kv, 0],
-                                    p_frag[mma_q, mma_kv, 1],
-                                    p_frag[mma_q, mma_kv, 2],
-                                    p_frag[mma_q, mma_kv, 3],
-                                )
-                                d_frag[mma_q, 0] = single_d0
-                                d_frag[mma_q, 1] = single_d1
 
                         _literal_pv_mma_into_ofrag_plane_fp8_raw(
                             o_frag,

@@ -410,6 +410,42 @@ class PCIeAllReduce:
             or output_begin + nbytes <= source_begin
         )
 
+    def all_reduce_fused_add(
+        self,
+        inp,
+        residual,
+        *,
+        plan,
+        input_addend=None,
+        group_weights=None,
+        group_ids=None,
+        group_id_limit=0,
+    ):
+        """Reduce into the residual without producing normalized activations."""
+        if self.algorithm != "oneshot" or not self.single_channel:
+            raise ValueError(
+                "residual-only reduction requires a single-channel oneshot runtime"
+            )
+        channel = self._runtime._prepared_channel_for_stream(None, None)
+        state = require_prepared(plan, "comm.pcie", inp.device)
+        state.require_runtime(channel)
+        channel._check_stream()
+        if not state.query.surface.endswith(".all_reduce_fused_add"):
+            raise ValueError("residual-only reduction requires its prepared operation")
+        state.run_fused(
+            inp,
+            residual,
+            None,
+            None,
+            residual,
+            0.0,
+            input_addend,
+            group_weights,
+            group_ids,
+            group_id_limit,
+        )
+        return residual
+
     def plan(
         self,
         inp: torch.Tensor,
@@ -428,7 +464,11 @@ class PCIeAllReduce:
         """
         from ._preparation import plan, query_from_runtime
 
-        if operation not in ("all_reduce", "all_reduce_fused_add_rms_norm"):
+        if operation not in (
+            "all_reduce",
+            "all_reduce_fused_add_rms_norm",
+            "all_reduce_fused_add",
+        ):
             raise ValueError(f"unsupported all-reduce operation {operation!r}")
         if operation == "all_reduce" and self._use_bf16_twoshot(inp, call.get("out")):
             query = query_from_runtime(
@@ -513,6 +553,10 @@ class PCIeAllReduce:
         residual_out: Optional[torch.Tensor] = None,
         zero_centered: bool = False,
         reduction_dtype: torch.dtype | None = None,
+        input_addend: torch.Tensor | None = None,
+        group_weights: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        group_id_limit: int = 0,
         peer_input_ptrs: Optional[Sequence[int]] = None,
         stream: object = None,
         channel_id: Optional[str] = None,
@@ -529,6 +573,10 @@ class PCIeAllReduce:
             residual_out=residual_out,
             zero_centered=zero_centered,
             reduction_dtype=reduction_dtype,
+            input_addend=input_addend,
+            group_weights=group_weights,
+            group_ids=group_ids,
+            group_id_limit=group_id_limit,
             peer_input_ptrs=peer_input_ptrs,
             stream=stream,
             channel_id=channel_id,

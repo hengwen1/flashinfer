@@ -58,6 +58,11 @@ class ActivationSpec:
     ``swiglu_clamp_after_silu`` clamps SiLU(gate) instead of gate before
     multiplying by the symmetrically clamped up branch. It specializes the
     A4 and A16 kernels at compile time; the default clamps gate before SiLU.
+
+    ``outer_scale="token"`` quantizes each input and activated intermediate
+    row independently. It requires NVFP4 A4 weights with native or CSF block
+    scales and no calibrated input or intermediate scale tensors. The default
+    retains expert scales.
     """
 
     mode: ActivationMode
@@ -69,10 +74,17 @@ class ActivationSpec:
     swiglu_beta: float | None = None
     rotation_dtype: torch.dtype | None = None
     a16_max_tokens: int = 0
+    outer_scale: str = "expert"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", ActivationMode(self.mode))
         object.__setattr__(self, "nonlinearity", str(self.nonlinearity).lower())
+        if self.outer_scale not in ("expert", "token"):
+            raise ValueError("outer_scale must be 'expert' or 'token'")
+        if self.outer_scale == "token" and (
+            self.mode is not ActivationMode.A4 or self.a16_max_tokens
+        ):
+            raise ValueError("token outer scaling requires A4 without an A16 cutoff")
         if self.io_dtype not in {torch.bfloat16, torch.float16}:
             raise TypeError("io_dtype must be torch.bfloat16 or torch.float16")
         if self.rotation_dtype not in (None, torch.float16):
@@ -256,6 +268,10 @@ def plan_weights(
     constraints = constraints or WeightPlanConstraints()
     if not isinstance(constraints, WeightPlanConstraints):
         raise TypeError("constraints must be WeightPlanConstraints")
+    if activation.outer_scale == "token" and (
+        not isinstance(source, PackedSource) or source.format.value != "modelopt_nvfp4"
+    ):
+        raise ValueError("token outer scaling requires ModelOpt NVFP4 weights")
     if isinstance(source, TrellisConfig):
         source = TrellisSource(config=source)
     if activation.rotation_dtype is not None and not isinstance(source, TrellisSource):
@@ -514,7 +530,18 @@ def prepare_weights(
             input_scale = (
                 input_scale.detach().reshape(-1).amin().reshape(1).contiguous()
             )
-        if plan.activation.mode is ActivationMode.A16 and not keep_activation_scales:
+        if plan.activation.outer_scale == "token":
+            if input_scale is not None or intermediate_scale is not None:
+                raise ValueError(
+                    "token outer scaling does not consume static activation scales"
+                )
+            input_scale = torch.ones(
+                plan.geometry.num_experts,
+                dtype=torch.float32,
+                device=weights.w13.device,
+            )
+            intermediate_scale = input_scale
+        elif plan.activation.mode is ActivationMode.A16 and not keep_activation_scales:
             input_scale = torch.ones(
                 plan.geometry.num_experts,
                 dtype=torch.float32,

@@ -13,6 +13,54 @@ from b12x.norm.hyperconnection import _impl
 from ..conftest import require_b12x
 
 
+@pytest.mark.parametrize("rows,width", [(1, 768), (7, 3072), (4096, 768)])
+def test_prepared_swiglu_oai_replays_changed_inputs(rows, width):
+    device = require_b12x()
+    source = torch.empty((rows, 2 * width), dtype=torch.bfloat16, device=device)
+    output = torch.empty((rows, width), dtype=torch.bfloat16, device=device)
+    source.normal_()
+    plan = hc.plan(
+        hc.Caps(device=device, max_tokens=rows, hidden_size=width),
+        invocation={
+            "operation": "swiglu",
+            "limit": 7.0,
+            "swiglu_alpha": 1.702,
+            "swiglu_beta": 1.0,
+        },
+    )
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="swiglu-oai",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.launch(source, source, output), output=output
+                    ),
+                ),
+            )
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            hc.run_swiglu(source, limit=7.0, out=output, plan=plan)
+        for magnitude in (1.0, 12.0):
+            source.normal_().mul_(magnitude)
+            source[0, :8] = torch.tensor([-30, -8, -7, 0, 1, 7, 8, 30], device=device)
+            gate, up = source.float().chunk(2, -1)
+            gate = gate.clamp(max=7)
+            expected = (
+                gate * torch.sigmoid(1.702 * gate) * (up.clamp(-7, 7) + 1)
+            ).bfloat16()
+            output.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(output, expected, rtol=0.008, atol=1e-7)
+        graph.reset()
+
+
 @pytest.mark.parametrize("rows,width", [(1, 257), (32, 5376), (4096, 5376)])
 def test_prepared_relu2_replays_changed_inputs(rows, width):
     device = require_b12x()

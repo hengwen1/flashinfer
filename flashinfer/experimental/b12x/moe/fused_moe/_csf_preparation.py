@@ -123,7 +123,13 @@ def prepare_csf_block_weights(plan, weights):
     native = None if rep is None else rep.value
     a16 = mode is ActivationMode.A16
     destination = 1 if a16 else 0 if nvfp4 else 3 if n % 128 == 64 else 2
-    rotation = n if (plan.source.w13_layout.value == ("w13" if a16 else "w31")) else 0
+    rotation = (
+        0
+        if plan.activation.outer_scale == "token"
+        else n
+        if (plan.source.w13_layout.value == ("w13" if a16 else "w31"))
+        else 0
+    )
     if (
         a16
         and not nvfp4

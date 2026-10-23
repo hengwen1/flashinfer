@@ -92,7 +92,11 @@ def _oracle_scores(q, k, weights):
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
             reduced_precision
         )
-    return (dot.relu() * weights[..., None]).sum(1)
+    products = (dot.relu() * weights[..., None]).float()
+    total = torch.zeros((q.shape[0], k.shape[0]), dtype=torch.float32, device=q.device)
+    for head in range(q.shape[1]):
+        total += products[:, head]
+    return total.bfloat16()
 
 
 def _allocate(
@@ -176,6 +180,7 @@ def _assert_topk(scores, output, output_scores, logical_positions=None):
         valid = torch.isfinite(scores[row])
         count = min(512, int(valid.sum()))
         selected = output[row, :count].long()
+        assert bool((selected >= 0).all())
         assert bool((output[row, count:] == -1).all())
         assert bool((selected[1:] > selected[:-1]).all())
         assert bool(torch.isneginf(output_scores[row, count:]).all())
@@ -183,6 +188,7 @@ def _assert_topk(scores, output, output_scores, logical_positions=None):
         actual = output_scores[row, :count].sort().values
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         if logical_positions is None:
+            assert bool((selected < scores.shape[1]).all())
             torch.testing.assert_close(
                 output_scores[row, :count],
                 scores[row, selected].float(),
@@ -190,8 +196,15 @@ def _assert_topk(scores, output, output_scores, logical_positions=None):
                 atol=0,
             )
         else:
+            matches = (logical_positions[row][None] == selected[:, None]) & valid[None]
+            assert bool(matches.any(1).all())
             assert bool(
-                torch.isin(selected, logical_positions[row, valid].long()).all()
+                (
+                    matches
+                    & (scores[row].float()[None] == output_scores[row, :count, None])
+                )
+                .any(1)
+                .all()
             )
 
 
@@ -248,17 +261,14 @@ def test_per_group_quantization_and_permuted_high_page_writer(
     torch.testing.assert_close(pool[pages[:, None], data_offsets], kp)
     torch.testing.assert_close(pool[pages[:, None], scale_offsets], ks)
     binding = api.bind(plan, query_weights=weights, **args)
-    scores = api.score(binding)
     expected = _oracle_scores(q, keys, weights)
     expected = expected.masked_fill(positions[None] >= lengths[:, None], -torch.inf)
-    torch.testing.assert_close(scores[:, :width], expected, rtol=0, atol=0)
-    assert bool(torch.isneginf(scores[:, width:]).all())
-    api.select(binding)
+    api.run(binding)
     _assert_topk(expected, args["output_indices"], args["output_scores"])
 
 
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
-def test_bf16_stages_and_tp_reduce_before_selection(indexer_session, mode):
+def test_bf16_rounding_and_complete_head_selection(indexer_session, mode):
     torch.manual_seed(555)
     device = torch.device("cuda")
     q = torch.randn((2, 4, 128), dtype=torch.bfloat16, device=device)
@@ -269,17 +279,10 @@ def test_bf16_stages_and_tp_reduce_before_selection(indexer_session, mode):
         indexer_session, q, keys, lengths, query_weights=weights, mode=mode
     )
     binding = api.bind(plan, query_weights=weights, **args)
-    scores = api.score(binding)
     expected = _oracle_scores(q, keys, weights)
     pos = torch.arange(768, device=device)
     expected.masked_fill_(pos[None] >= lengths[:, None], -torch.inf)
-    torch.testing.assert_close(scores, expected, rtol=0, atol=0)
-    # A second rank contributes a different BF16 head-sum; the staged contract
-    # is observable because selection must consume these mutated scores.
-    other = torch.randn_like(expected)
-    scores.add_(other)
-    expected.add_(other)
-    api.select(binding)
+    api.run(binding)
     _assert_topk(expected, args["output_indices"], args["output_scores"])
 
 
@@ -289,7 +292,7 @@ def test_bf16_stages_and_tp_reduce_before_selection(indexer_session, mode):
 def test_compact_score_extent_preserves_selection_and_frozen_replay(
     indexer_session, source, high_pages, mode
 ):
-    """Invisible capacity columns must not be required by score or selection."""
+    """Runtime score extents preserve selection within frozen capacities."""
     torch.manual_seed(4141)
     device = torch.device("cuda")
     q = torch.randn((3, 8, 128), dtype=torch.bfloat16, device=device)
@@ -307,10 +310,12 @@ def test_compact_score_extent_preserves_selection_and_frozen_replay(
         mode=mode,
     )
     full = api.bind(plan, query_weights=weights, **args)
-    expected_scores = api.score(full).clone()
-    api.select(full)
-    expected_indices = args["output_indices"].clone()
-    expected_values = args["output_scores"].clone()
+    expected_scores = _oracle_scores(q, keys, weights).masked_fill(
+        torch.arange(keys.shape[0], device=device)[None] >= lengths[:, None],
+        -torch.inf,
+    )
+    api.run(full)
+    _assert_topk(expected_scores, args["output_indices"], args["output_scores"])
     expected_candidates = args["candidate_output"].clone() if source else None
     expected_lengths = args["candidate_output_lengths"].clone() if source else None
     indexer_session.freeze()
@@ -318,17 +323,11 @@ def test_compact_score_extent_preserves_selection_and_frozen_replay(
     try:
         for width in (641, 768, 1024):
             binding = api.bind(plan, query_weights=weights, score_width=width, **args)
-            scores = api.score(binding)
-            assert scores.shape == (3, width) and scores.is_contiguous()
-            torch.testing.assert_close(
-                scores, expected_scores[:, :width], rtol=0, atol=0
-            )
-            api.select(binding)
-            torch.testing.assert_close(
-                args["output_indices"], expected_indices, rtol=0, atol=0
-            )
-            torch.testing.assert_close(
-                args["output_scores"], expected_values, rtol=0, atol=0
+            api.run(binding)
+            _assert_topk(
+                expected_scores[:, :width],
+                args["output_indices"],
+                args["output_scores"],
             )
             if source:
                 torch.testing.assert_close(
@@ -341,13 +340,14 @@ def test_compact_score_extent_preserves_selection_and_frozen_replay(
             stream.wait_stream(torch.cuda.current_stream())
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                api.score(binding)
-                api.select(binding)
+                api.run(binding)
             torch.cuda.current_stream().wait_stream(stream)
             args["scratch"].fill_(0xA5)
             graph.replay()
-            torch.testing.assert_close(
-                args["output_indices"], expected_indices, rtol=0, atol=0
+            _assert_topk(
+                expected_scores[:, :width],
+                args["output_indices"],
+                args["output_scores"],
             )
             graph.reset()
     finally:
@@ -376,9 +376,9 @@ def test_compact_score_extent_rejects_invalid_reservations(
         api.bind(plan, query_weights=weights, score_width=width, **args)
 
 
-@pytest.mark.parametrize("heads", [1, 2, 4, 8, 16, 32])
+@pytest.mark.parametrize("heads", [1, 2, 4, 8, 16, 32, 64])
 @pytest.mark.parametrize("high_pages", [False, True])
-def test_tensorcore_prefill_preserves_bf16_scores_and_selection(
+def test_prefill_preserves_bf16_scores_and_selection(
     indexer_session, heads, high_pages
 ):
     torch.manual_seed(41016 + heads)
@@ -394,38 +394,27 @@ def test_tensorcore_prefill_preserves_bf16_scores_and_selection(
         query_weights=weights,
         high_pages=high_pages,
         max_rows=256,
+        mode="prefill",
     )
-    scalar = api.bind(plan, query_weights=weights, **args)
-    expected = api.score(scalar).clone()
-    tensorcore = api.plan(
-        api.Caps(
-            device=q.device,
-            num_q_heads=heads,
-            max_q_rows=256,
-            max_page_table_width=12,
-            topk=512,
-            cache_format="mxfp4",
-            mode="prefill",
-        )
+    expected = _oracle_scores(q, keys, weights).masked_fill(
+        torch.arange(keys.shape[0], device=q.device)[None] >= lengths[:, None],
+        -torch.inf,
     )
-    _prime_indexer(indexer_session, tensorcore, args, weights)
-    binding = api.bind(tensorcore, query_weights=weights, **args)
-    actual = api.score(binding)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    api.select(binding)
+    binding = api.bind(plan, query_weights=weights, **args)
+    api.run(binding)
     _assert_topk(expected, args["output_indices"], args["output_scores"])
 
 
 @pytest.mark.parametrize("exponents", [(-40, -4, 6, 40), (-6, -2, 3, 7)])
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
 @pytest.mark.parametrize("heads", [8, 32, 64])
-def test_varied_scales_preserve_staged_rounding_against_fp64(
+def test_varied_scales_preserve_bf16_rounding_against_fp64(
     indexer_session, exponents, mode, heads
 ):
     """Use FP64 dots so the oracle does not lose opposed exponent products.
 
     A BF16 einsum differs from the FP64 dot rounded to BF16 at 130 output
-    positions in the opposed-exponent fixture. Both scoring kernels must
+    positions in the opposed-exponent fixture. Fused scoring must
     preserve the explicit BF16 stage boundaries and ordered FP32 head sum.
     """
     torch.manual_seed(41081)
@@ -459,18 +448,15 @@ def test_varied_scales_preserve_staged_rounding_against_fp64(
         torch.arange(641, device="cuda")[None] >= lengths[:, None], -torch.inf
     )
     binding = api.bind(plan, query_weights=weights, **args)
-    actual = api.score(binding)
-    torch.testing.assert_close(actual[:, :641], expected, rtol=0, atol=0)
-    assert bool(torch.isneginf(actual[:, 641:]).all())
-    api.select(binding)
+    api.run(binding)
     _assert_topk(expected, args["output_indices"], args["output_scores"])
 
 
 @pytest.mark.parametrize("high_pages", [False, True])
-def test_tensorcore_score_clears_invisible_tiles_in_captured_capacity(
+def test_fused_selection_omits_invisible_tiles_in_captured_capacity(
     indexer_session, high_pages
 ):
-    """GPU visibility may change while the public score capacity stays fixed."""
+    """GPU visibility may change while prepared capacity stays fixed."""
     torch.manual_seed(41065)
     q = torch.randn((4, 32, 128), device="cuda", dtype=torch.bfloat16)
     keys = torch.randn((2048, 128), device="cuda", dtype=torch.bfloat16)
@@ -501,16 +487,14 @@ def test_tensorcore_score_clears_invisible_tiles_in_captured_capacity(
     args["scratch"] = torch.empty(spec.shape, device="cuda", dtype=spec.dtype)
     _prime_indexer(indexer_session, plan, args, weights)
     binding = api.bind(plan, query_weights=weights, **args)
-    scores = api.score(binding)
-    api.select(binding)
+    api.run(binding)
     expected_full = _oracle_scores(q, keys, weights)
     indexer_session.freeze()
     graph = torch.cuda.CUDAGraph()
     try:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            api.score(binding)
-            api.select(binding)
+            api.run(binding)
         for live_lengths, active in (
             ([0, 63, 511, 2048], 2048),
             ([128, 0, 2048, 1], 1024),
@@ -518,15 +502,15 @@ def test_tensorcore_score_clears_invisible_tiles_in_captured_capacity(
         ):
             lengths.copy_(torch.tensor(live_lengths, device="cuda", dtype=torch.int32))
             args["active_width"].fill_(active)
-            scores.fill_(42)
+            args["scratch"].fill_(0xA5)
+            args["output_indices"].fill_(-42)
+            args["output_scores"].fill_(torch.nan)
             graph.replay()
             extent = torch.minimum(lengths, args["active_width"])
             expected = expected_full.masked_fill(
                 torch.arange(2048, device="cuda")[None] >= extent[:, None],
                 -torch.inf,
             )
-            torch.testing.assert_close(scores[:, :2048], expected, rtol=0, atol=0)
-            assert bool(torch.isneginf(scores[:, 2048:]).all())
             _assert_topk(expected, args["output_indices"], args["output_scores"])
     finally:
         graph.reset()
@@ -537,10 +521,15 @@ def test_source_blockmax_newest_and_bounded_candidate_reindex(indexer_session, m
     torch.manual_seed(2048)
     device = torch.device("cuda")
     width = 16448  # More than 2048 blocks; the newest visible block is partial.
-    q = torch.ones((3, 4, 128), dtype=torch.bfloat16, device=device)
-    keys = torch.ones((width, 128), dtype=torch.bfloat16, device=device)
+    q = torch.zeros((3, 4, 128), dtype=torch.bfloat16, device=device)
+    q[:, 0] = 1
+    q[:, 1] = -1
+    keys = torch.full((width, 128), -0.03125, dtype=torch.bfloat16, device=device)
+    keys[: 2047 * 8] = 0.03125
     lengths = torch.tensor([0, 9, 16441], dtype=torch.int32, device=device)
-    weights = torch.ones((3, 4), dtype=torch.bfloat16, device=device)
+    weights = torch.zeros((3, 4), dtype=torch.bfloat16, device=device)
+    weights[:, 0] = 1
+    weights[:, 1] = -1
     plan, args = _allocate(
         indexer_session, q, keys, lengths, query_weights=weights, source=True, mode=mode
     )
@@ -549,18 +538,14 @@ def test_source_blockmax_newest_and_bounded_candidate_reindex(indexer_session, m
         query_weights=weights,
         **args,
     )
-    scores = api.score(binding)
-    # Directly supply the globally reduced published index_score: every block
-    # has a distinct max, with the newest block deliberately worst-ranked.
+    # Opposed query heads produce +4 for the first 2047 blocks and -4 afterward.
     position = torch.arange(width, device=device)
-    logits = (-(position // 8)).float().expand(3, -1).clone()
-    # BF16 has too few distinct negative magnitudes at this width; assign a
-    # representable score gap at the selected/unselected block boundary.
-    logits[:, : 2047 * 8] = 4
-    logits[:, 2047 * 8 :] = -4
+    logits = _oracle_scores(q, keys, weights)
+    assert logits[:, : 2047 * 8].eq(4).all()
+    assert logits[:, 2047 * 8 :].eq(-4).all()
     logits.masked_fill_(position[None] >= lengths[:, None], -torch.inf)
-    scores.copy_(logits)
-    api.select(binding)
+    api.run(binding)
+    _assert_topk(logits, args["output_indices"], args["output_scores"])
     candidates = args["candidate_output"]
     candidate_lengths = args["candidate_output_lengths"]
     assert candidate_lengths.tolist() == [0, 9, 16377]
@@ -590,12 +575,10 @@ def test_source_blockmax_newest_and_bounded_candidate_reindex(indexer_session, m
     )
     rargs.update(candidate_indices=candidates, candidate_lengths=candidate_lengths)
     reindex = api.bind(rplan, query_weights=weights, **rargs)
-    rescored = api.score(reindex)
     expected_full = _oracle_scores(rq, keys, weights)
     expected = expected_full.gather(1, candidates.clamp_min(0).long())
     expected.masked_fill_(candidates < 0, -torch.inf)
-    torch.testing.assert_close(rescored, expected, rtol=0, atol=0)
-    api.select(reindex)
+    api.run(reindex)
     _assert_topk(expected, rargs["output_indices"], rargs["output_scores"], candidates)
 
 
@@ -681,7 +664,7 @@ def test_fixed_graph_buffers_multiple_live_rows_and_visibility(
 def test_bounded_score_width_reuses_capacity_and_preserves_selection(
     indexer_session, source
 ):
-    """A live column bound must shrink real score work, not its allocation."""
+    """A live column bound reuses prepared storage and preserves selection."""
     torch.manual_seed(416)
     device = torch.device("cuda")
     q = torch.randn((3, 4, 128), dtype=torch.bfloat16, device=device)
@@ -708,15 +691,11 @@ def test_bounded_score_width_reuses_capacity_and_preserves_selection(
                 torch.tensor([0, width // 2, width], dtype=torch.int32, device=device)
             )
             binding = api.bind(plan, query_weights=weights, score_width=width, **args)
-            scores = api.score(binding)
-            assert scores.shape == (3, width)
-            assert scores.is_contiguous()
             positions = torch.arange(width, device=device)
             expected = expected_scores[:, :width].masked_fill(
                 positions[None] >= lengths[:, None], -torch.inf
             )
-            torch.testing.assert_close(scores, expected, atol=0, rtol=0)
-            api.select(binding)
+            api.run(binding)
             _assert_topk(expected, args["output_indices"], args["output_scores"])
             if source:
                 for row, count in enumerate((0, width // 2, width)):
@@ -742,10 +721,10 @@ def test_bounded_score_width_reuses_capacity_and_preserves_selection(
 
 
 @pytest.mark.parametrize("mode,heads", [("decode", 32), ("prefill", 8)])
-def test_full_capacity_replay_preserves_all_heads_and_clears_idle_columns(
+def test_full_capacity_replay_preserves_all_heads_and_omits_invalid_pages(
     indexer_session, mode, heads
 ):
-    """A serving-sized output must not retain poisoned or invalid-page scores."""
+    """Serving-sized selection excludes invalid pages and poisoned scratch."""
     torch.manual_seed(4132)
     device = torch.device("cuda")
     rows, populated, capacity = 3, 32769, 1048576
@@ -779,19 +758,16 @@ def test_full_capacity_replay_preserves_all_heads_and_clears_idle_columns(
     args["scratch"] = torch.empty(spec.shape, dtype=spec.dtype, device=device)
     _prime_indexer(indexer_session, plan, args, weights)
     binding = api.bind(plan, query_weights=weights, **args)
-    scores = api.score(binding)
-    api.select(binding)
+    api.run(binding)
     reference = _oracle_scores(q, keys, weights)
     reference[:, 128:256] = -torch.inf
     positions = torch.arange(populated, device=device)
-    expected = torch.full_like(scores, -torch.inf)
     indexer_session.freeze()
     graph = torch.cuda.CUDAGraph()
     try:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            api.score(binding)
-            api.select(binding)
+            api.run(binding)
         for live_lengths in (
             (0, 129, 32769),
             (65, 17001, 16417),
@@ -804,11 +780,9 @@ def test_full_capacity_replay_preserves_all_heads_and_clears_idle_columns(
             args["scratch"].fill_(0x7F)
             graph.replay()
             torch.cuda.synchronize(device)
-            expected.fill_(-torch.inf)
-            expected[:, :populated] = reference.masked_fill(
+            expected = reference.masked_fill(
                 positions[None] >= lengths[:, None], -torch.inf
             )
-            torch.testing.assert_close(scores, expected, rtol=0, atol=0)
             _assert_topk(expected, args["output_indices"], args["output_scores"])
     finally:
         graph.reset()
@@ -820,10 +794,12 @@ def test_source_selection_replay_reaches_newest_block_beyond_first_stripe(
     """The source selector must consume distant live blocks, not poisoned tails."""
     device = torch.device("cuda")
     capacity = 1048576
-    q = torch.ones((1, 1, 128), dtype=torch.bfloat16, device=device)
-    keys = torch.ones((128, 128), dtype=torch.bfloat16, device=device)
+    q = torch.ones((1, 2, 128), dtype=torch.bfloat16, device=device)
+    q[:, 1] = -1
+    keys = torch.full((384, 128), -0.03125, dtype=torch.bfloat16, device=device)
+    keys[:248] = 0.03125
     lengths = torch.tensor([128], dtype=torch.int32, device=device)
-    weights = torch.ones((1, 1), dtype=torch.bfloat16, device=device)
+    weights = torch.tensor([[1, -1]], dtype=torch.bfloat16, device=device)
     _, args = _allocate(
         indexer_session,
         q,
@@ -837,7 +813,7 @@ def test_source_selection_replay_reaches_newest_block_beyond_first_stripe(
     plan = api.plan(
         api.Caps(
             device=device,
-            num_q_heads=1,
+            num_q_heads=2,
             max_q_rows=1,
             max_page_table_width=capacity // 128,
             page_size=128,
@@ -848,27 +824,28 @@ def test_source_selection_replay_reaches_newest_block_beyond_first_stripe(
     )
     (spec,) = plan.scratch_specs()
     args["scratch"] = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+    physical = args["page_table"][0].clone()
+    pages = physical[2].expand(1, capacity // 128).clone()
+    pages[:, :127] = physical[0]
+    pages[:, 127] = physical[1]
+    args["page_table"] = pages
     _prime_indexer(indexer_session, plan, args, weights)
     binding = api.bind(
         plan,
         query_weights=weights,
         **args,
     )
-    scores = api.score(binding)
-    api.select(binding)
+    api.run(binding)
     indexer_session.freeze()
     graph = torch.cuda.CUDAGraph()
     try:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            api.select(binding)
+            api.run(binding)
         for visible in (524293, capacity):
             lengths.fill_(visible)
             args["active_width"].fill_(visible)
             args["scratch"].fill_(0x7F)
-            # Supply the caller-reduced BF16 scores across the public TP boundary.
-            scores.fill_(-4)
-            scores[:, : 2047 * 8] = 4
             args["candidate_output"].fill_(-99)
             graph.replay()
             torch.cuda.synchronize(device)
@@ -887,5 +864,8 @@ def test_source_selection_replay_reaches_newest_block_beyond_first_stripe(
                 args["candidate_output"][0, :count], expected, rtol=0, atol=0
             )
             assert bool((args["candidate_output"][0, count:] == -1).all())
+            assert args["output_indices"].ge(0).all()
+            assert args["output_indices"].lt(2047 * 8).all()
+            assert args["output_scores"].eq(4).all()
     finally:
         graph.reset()

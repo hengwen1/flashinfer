@@ -1,116 +1,144 @@
-# MXFP4 sparse selection
+# Fused MXFP4 sparse indexing
 
-The MXFP4 indexer publishes BF16 scores and selects 512 logical positions.
-SM120 decode bindings with 16-byte-aligned score storage, 32-byte-aligned
-internal index storage, and score widths divisible by 512 and below 2²³ use
-DeepSelect's BF16 kernel. The selected values are widened exactly to FP32,
-candidate slots are mapped to logical positions, and outputs are ordered by
-logical position. Other score widths, storage alignments, prefill, and device
-architectures use the existing FP32 radix selector. Hierarchical candidate
-selection retains the radix selector for 2048 blocks and the mandatory
-newest-block priority.
+The prepared MXFP4 indexer computes exact scores and selects up to 512 logical
+key positions on SM12x GPUs. Dense indexing scans paged keys; candidate consumers
+score only the supplied logical positions. A hierarchical source also publishes
+up to 2048 eight-token blocks for a consumer. Scores flow through bounded token
+and block carries. Execution does not allocate or expose a context-sized score
+matrix.
 
-DeepSelect-eligible bindings require NaN-free visible scores. Positive infinity
-participates in selection; negative infinity marks omitted positions and padding.
-DeepSelect traps on visible NaNs, whereas the radix path ranks their bit
-patterns and removes their positions from the output. Equal-score cutoff ties
-may select different logical IDs.
+## Preparation and execution
 
-Preparation requires `deep-select==1.0.0+sm120.top512`. The
-[dependency patch](../../../../../3rdparty_patches/deepselect/0001-sm120-top512.patch)
-adds the SM120 specialization, CUDA dispatch and capability query, build source
-entry, and exact package version to the `deepinfer-sm120` branch at commit
-`ef20ee1a5c77a9365137573e2327402296a2a0e5`. Unmodified upstream source does not
-provide this package version or the required specialization.
+Use `b12x.attention.dsa_indexer` with `Caps(cache_format="mxfp4", ...)`.
+The lifecycle is `plan(Caps(...), invocation=...)`,
+`PreparationSession.prepare`, `bind(Plan, ...)`, then `run(binding)`.
+`invocation_from_tensors` describes actual operand shapes, strides, and storage
+alignment for preparation. The preparation callback binds trial storage and
+returns a `PreparedCall` whose `run` performs the complete operation being tuned.
+For a query-to-selection measurement, that callback includes query quantization
+and indexing. Cache writes prepare stored keys separately.
 
-Run these commands from the FlashInfer checkout root, using the Python
-environment that will prepare models. It must already contain PyTorch,
-setuptools, wheel, and ninja, with a CUDA toolkit that supports `sm_120a`:
+Preparation selects concrete kernel configurations, compiles and loads the
+programs, plans scratch, and warms execution before capture. After preparation,
+allocate caller-owned scratch from `Plan.scratch_specs()` and bind the input,
+output, and scratch tensors. Keep the prepared session, bindings, tensor owners,
+and compiled programs alive throughout capture and replay. `run` computes
+selection and orders its output; `quantize_q_mxfp4` and
+`quantize_write_index_k_mxfp4` prepare packed queries and paged keys respectively.
+MXFP4 does not provide a separate score/select boundary for an external score
+reduction. Each rank must supply every contributing index head.
 
-```bash
-flashinfer_checkout="$(pwd)"
-git clone --branch deepinfer-sm120 https://github.com/lucifer1004/DeepSelect.git ../DeepSelect-sm120-top512
-git -C ../DeepSelect-sm120-top512 checkout --detach ef20ee1a5c77a9365137573e2327402296a2a0e5
-git -C ../DeepSelect-sm120-top512 submodule update --init --recursive
-git -C ../DeepSelect-sm120-top512 apply "$flashinfer_checkout/3rdparty_patches/deepselect/0001-sm120-top512.patch"
-cd ../DeepSelect-sm120-top512
-DEEP_SELECT_BUILD_TARGET_PLATFORM=CUDA DEEP_SELECT_CUDA_ARCHS=120a \
-  NVCC_THREADS=1 MAX_JOBS=6 \
-  python setup.py build_ext --inplace build_py bdist_wheel
-python -m pip install --no-deps dist/deep_select-1.0.0+sm120.top512-*.whl
-cd "$flashinfer_checkout"
-python -m pip install --no-build-isolation -e '.[b12x]'
-```
+Supported index-head counts are 1, 2, 4, 8, 16, 32, and 64, with head dimension
+128. Page sizes are positive multiples of eight tokens. Each physical page uses
+`index_mxfp4_page_bytes(page_size)` bytes: 64 packed E2M1 bytes per token followed
+by four UE8M0 scale bytes per token. The page table maps logical pages to
+physical pages. Physical page strides may exceed the page payload. Packed query
+and scale tensors accept contiguous byte-offset views; preparation selects loads
+compatible with their actual alignment. Query weights use BF16. Outputs contain
+512 int32 logical positions and, when requested, associated FP32 values.
 
-The wheel is specific to the Python ABI and platform used to build it. SM120
-preparation checks that the installed CUDA extension contains a loadable
-specialization before warming or capture. Native serving uses the cubins in
-the exported model package and does not install this Python dependency.
+`max_q_rows`, `max_page_table_width`, and `max_candidates` reserve capacities.
+Bindings may use fewer rows and a bounded `score_width`; device lengths and
+`active_width` control visibility during replay. `score_width` limits the fused
+scan without allocating scores. For candidate consumers it bounds candidate
+slots, while returned positions remain logical key positions. Negative candidate
+IDs, unavailable pages, inactive rows, and positions outside the live bounds are
+omitted. Unused output positions are `-1`, with values `-inf`.
 
-DeepSelect is MIT licensed, copyright 2025 DeepSeek. The patch directory
-includes its [license](../../../../../3rdparty_patches/deepselect/LICENSE), and
-the patched checkout and wheel retain the upstream license. The prepared state
-retains the loaded extension and compiled length/position kernels throughout
-graph capture and export.
+Capture only prepared configurations with fixed-address input, output, and
+scratch storage. Mutable query data, weights, page tables, lengths, candidate
+lists, and visibility bounds may change between replays. Scratch needs no
+persistent initialization: each invocation initializes its required state.
+Replay performs no compilation, host kernel selection, or GPU allocation.
 
-## Fused MXFP4 benchmark
+## Arithmetic and hierarchical candidates
 
-`prepare_fused_mxfp4` specializes the existing fused DSA kernel for packed
-MXFP4 queries and paged keys. It prepares a fixed callable for 32 replicated
-query heads, page sizes 64 or 128, and top-512 selection, including gathered
-candidate consumers. The callable retains its inputs, compiled programs, and
-scratch. Its execution resets merge state, computes scores and selection, and
-orders the selected logical positions. Hierarchical 2048-block candidate
-publication is unsupported. The factory is used explicitly by benchmarks;
-production preparation and dispatch do not select it.
+Quantization uses per-group scales for four groups of 32 elements and
+round-to-nearest-even E2M1 encoding. Query and key values dequantize to BF16.
+Each dot accumulates in FP32 and rounds to BF16 before ReLU; multiplication by
+its head weight rounds to BF16. Head contributions accumulate in increasing
+head order in FP32, followed by a final BF16 score round. Selected scores widen
+exactly to FP32. Top-k is exact; equal-score cutoff ties may choose different
+logical IDs. Outputs are sorted by logical position and preserve each selected
+position's associated score.
 
-From the checkout root, with the dependency above installed:
+Set `candidate_topk_blocks=2048` for a hierarchical source. Its block scores are
+maxima of the final BF16 token scores over eight-token blocks. When the newest
+visible block intersects the scored extent, selection retains it even when its
+score would otherwise exclude it.
+Selected blocks are ordered and expanded into at most 16384 logical token IDs,
+with partial blocks clipped to live visibility. Expansion can include positions
+beyond `score_width` within a selected block. `candidate_output_lengths`
+records the number of published IDs; padding is `-1`. Token top-512 output is
+selected independently of block publication.
+
+A consumer declares `max_candidates` and binds `candidate_indices` and
+`candidate_lengths`. It evaluates those keys with its own query and weights;
+source scores are not reused. Source publication and consumer execution have
+separate preparation and scratch ownership. Global intermediates hold bounded
+partial selections rather than full token or block score arrays.
+
+## Configuration and measurement
+
+The preparation tuner measures eligible concrete configurations under the
+session's cache policy; the benchmark requests warm-cache tuning. Choices include
+work partitioning, scoring schedule, merge
+organization, output stores, and load alignment. Semantic, alignment, shared
+memory, and residency constraints determine eligibility. Selection completes
+before capture, and the selected configuration is retained by the prepared Plan.
+A work- and resource-based heuristic supplies a concrete configuration when
+measurement is disabled. A pinned configuration must resolve dependent geometry,
+state, and ordering choices together.
+
+The benchmark uses this production Plan and `run` path:
 
 ```bash
 python benchmarks/experimental/b12x/benchmark_mxfp4_indexer.py \
-  --rows 1,8 --widths 4096 --capacity 4096 \
+  --rows 1,8 --heads 32 --widths 4096 --capacity 4096 \
   --page-size 128 --page-stride 8704 --modes dense,candidates \
-  --candidate-capacity 512 --samples 3 --replays 5 --warmup 5 \
-  --stage-timings --output /tmp/mxfp4-indexer.json
+  --candidate-capacity 16384 --preparation autotune \
+  --samples 3 --replays 5 --warmup 5 --output /tmp/mxfp4-indexer.json
 ```
 
-The three arms are `native_staged`, `deepselect_staged`, and `fused`.
-Each timed graph includes query quantization and ordered top-512 output.
-Native staged selection retains the optimized logical-position sorter.
-Consumers use candidates published by an independent source query; source
-publication is outside their timed boundary. `--stage-timings` reports separate
-quantization, score, and selector diagnostics. These times exclude learned
-projections, cache writes, tensor-parallel communication, and model serving.
+Install the checkout's `b12x` extra in the preparation environment. MXFP4
+selection uses the fused CuTe implementation and requires no DeepSelect package.
+The benchmark has one arm, `fused`; `--arms fused` is accepted explicitly.
+`--preparation autotune` measures configurations; `--preparation heuristic`
+uses the heuristic configuration. `--fused-ctas-per-row` pins the CTA count
+through configuration resolution before capture. The JSON includes the selected
+configuration, preparation cache policy, per-case medians, and raw samples.
 
-Use `--rows` for physical query rows, including packed decode rows up to 128,
-and `--widths` for indexed keys, not uncompressed context tokens. `--capacity`
-declares the fixed indexed-key capacity. `--full-score-width` retains that
-capacity in staged score matrices when live widths are smaller. The production
-geometry helper is available through `--profile-form c2-dense --modes dense`
-(page 64, logical context twice the indexed-key count) or
+Timed graphs include query quantization, required state initialization, fused
+scoring and selection, and logical-position ordering. Candidate publication by
+an independent source query occurs outside the timed consumer graph. Timings
+exclude learned projections, cache writes, tensor-parallel collectives, and
+whole-model serving. They measure the declared component workload rather than
+end-to-end model latency.
+
+`--rows` specifies physical query rows; `--widths` specifies indexed keys, and
+`--capacity` reserves indexed-key capacity. `--full-score-width` keeps the dense
+scan extent at that capacity while visibility changes; it does not create a
+score matrix. `--profile-form c2-dense --modes dense` describes page-64 indexing
+with logical context twice the indexed-key count.
 `--profile-form c1-reindex --modes candidates --candidate-capacity 16384`
-(page 128). Supply `--model-path` to load a local V4.1 configuration. Plain
-page-128 top-512 and 512-entry consumer cases have no production profile label;
-the C1 source also requires hierarchical publication.
+describes the page-128 hierarchical consumer. `--model-path` reads a local model
+configuration. Plain page-128 top-512 and 512-entry consumers need no profile
+label. Consumer capacities supported by the benchmark are 512 and 16384.
 
-Representative decode rows are `1,2,4,7,8,14,16,28,32,64,128`. Useful independent
-length cases are 4096 and 32768 indexed keys, up to 524288 for C2 at a 1M logical
-context, and up to 1048576 for plain page-128 selection. Consumer capacities
-are 512 and 16384. Select cases explicitly instead of taking their full cross
-product. `--arms` selects comparison arms and `--fused-ctas-per-row` fixes fused
-geometry for experiments; omitting it uses the factory's initial heuristic.
+Warm graph replay is the default. `--cold-l2` requires `--replays 1` and evicts
+L2 before each measured replay. Compare matching row lists, capacities, seeds,
+and cache policies; repeat with independent seeds. `--checks` controls mutable
+replay checks covering full, tail, short, and zero visibility. Correctness checks
+use independent quantization and score references with exact BF16 boundaries,
+selected-score multisets, logical ordering, candidate association, poisoned
+scratch, frozen kernel resolution, and unchanged allocation/free counters.
 
-Samples alternate arm order. Warm graph replay is the default; `--cold-l2`
-requires `--replays 1` and evicts L2 before every measured replay. Repeat with
-independent `--seed` values for evaluation. Raw samples and configuration are
-written to JSON. `--checks` controls changing-input replay cases; its default
-four cases include full, tail, short, and zero visibility. Every arm checks
-exact MXFP4 packing, the selected score multiset, logical ordering and candidate
-mapping, inactive rows, poisoned scratch, frozen kernel resolution, and unchanged
-allocation/free counters. The independent score oracle rounds dot and weighted
-product stages to BF16, accumulates heads in increasing order in FP32, and rounds
-the published score to BF16. Equal-score cutoff ties may choose different IDs.
-
-Focused graph and compatibility checks are in
-`tests/experimental/b12x/attention/test_fused_mxfp4.py`. Component timing alone
-does not establish a production dispatch improvement.
+Production correctness and capture coverage lives in
+`tests/experimental/b12x/attention/test_dsa_indexer_mxfp4.py`,
+`test_dsa_indexer_mxfp4_boundaries.py`, and
+`tests/experimental/b12x/test_mxfp4_position_sort.py`. These exercise Plan/run,
+mutable captured visibility, hierarchical publication and consumption, unaligned
+storage, high physical page addresses, and candidate output offsets beyond
+signed 32-bit element indexing. Focused packed arithmetic and fused replay tests
+are in `tests/experimental/b12x/attention/test_fused_mxfp4.py` and
+`test_fused_mxfp4_head_sum.py`.

@@ -426,39 +426,25 @@ def test_dense_mla_compile_jobs_ignore_search_mode(monkeypatch):
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize(
-    "mode,heads,rows,expected",
-    (
-        ("prefill", 32, 63, 2),
-        ("prefill", 32, 64, 1),
-        ("prefill", 32, 96, 1),
-        ("prefill", 32, 4096, 1),
-        ("prefill", 16, 96, 2),
-        ("decode", 32, 96, 2),
-    ),
+    "mode,heads,rows", (("prefill", 32, 64), ("prefill", 16, 96), ("decode", 32, 96))
 )
-def test_indexer_prefill_score_domain_and_scalar_pin(
-    device, mode, heads, rows, expected
-):
+def test_indexer_fused_geometry_domain_and_pins(device, mode, heads, rows):
+    from b12x.attention.dsa_indexer._mxfp4_tuning import default_fused_config
+
     module, query_type, values = _declarations()[7]
     query = query_type(
         **(values | dict(mode=mode, num_q_heads=heads, max_q_rows=rows)),
         exhaustive=False,
     )
     candidates = module.TUNING.eligible_plan(query, device).candidates
-    assert len(candidates) == expected
-    if expected == 1:
-        assert candidates[0][1].mxfp4_score_kind == "score_tensorcore"
-    scalar = module.DsaIndexerConfig(backend="native", mxfp4_score_kind="score")
-    assert (
-        module.TUNING.configure(query, device=device, override=scalar).pinned == scalar
+    assert len(candidates) >= 2
+    pinned = module.DsaIndexerConfig(
+        backend="native", mxfp4=default_fused_config(query, device, ctas_per_row=1)
     )
-    exhaustive = replace(query, exhaustive=True)
-    assert len(module.TUNING.eligible_plan(exhaustive, device).candidates) == 2
-    assert module.TUNING.lower(exhaustive, device, scalar.to_dict()) == scalar
-    with pytest.raises(ValueError, match="does not use the FP8 fused merge"):
-        module.TUNING.configure(
-            exhaustive, device=device, override=replace(scalar, fused_merge="serial")
-        )
+    assert (
+        module.TUNING.configure(query, device=device, override=pinned).pinned == pinned
+    )
+    assert module.TUNING.lower(query, device, FrozenMapping(pinned.to_dict())) == pinned
 
 
 @pytest.mark.parametrize(

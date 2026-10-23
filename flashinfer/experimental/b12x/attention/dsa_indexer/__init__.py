@@ -24,6 +24,10 @@ FP8 bindings may omit ``active_width`` to use the page-table extent directly.
 Dynamic width caps are caller-owned device inputs; scratch holds no initialized
 width parameter that must survive reuse or package export.
 
+MXFP4 execution fuses packed scoring and top-512 selection through the same
+prepared lifecycle. Hierarchical sources also publish bounded block candidates;
+neither path materializes a context-sized score matrix.
+
 Pure-torch semantics live in ``reference.py`` and ``msa_reference.py``.
 """
 
@@ -47,8 +51,6 @@ META = OpMeta(
         "plan",
         "bind",
         "run",
-        "score",
-        "select",
         "quantize_q_mxfp4",
         "quantize_write_index_k_mxfp4",
         "scratch_specs",

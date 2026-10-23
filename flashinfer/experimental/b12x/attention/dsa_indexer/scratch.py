@@ -2400,14 +2400,34 @@ def plan_indexer_scratch(
     if fused_merge not in FUSED_MERGE_CHOICES:
         raise ValueError(f"unsupported fused_merge {fused_merge!r}")
     if caps.cache_format == "mxfp4":
-        from .mxfp4 import plan_mxfp4
+        from .api import Caps
+        from ._preparation import _query
+        from ._mxfp4_preparation import workspace_layout
+        from ._tuning import TUNING
+        from b12x.preparation import FrozenMapping
+        from b12x.preparation.device import detect_device
 
         if (
             caps.source_layout != INDEXER_SOURCE_LAYOUT_PAGED
             or caps.score_mode != "dsa"
         ):
             raise ValueError("MXFP4 requires the paged DSA source layout")
-        inner = plan_mxfp4(caps)
+        declaration = Caps(
+            device=caps.device,
+            num_q_heads=caps.num_q_heads,
+            max_q_rows=caps.max_q_rows,
+            max_page_table_width=caps.max_page_table_width,
+            topk=caps.topk,
+            mode=caps.mode,
+            page_size=caps.page_size,
+            cache_format="mxfp4",
+            max_candidates=caps.max_candidates,
+            candidate_topk_blocks=caps.candidate_topk_blocks,
+        )
+        query = _query(declaration, FrozenMapping())
+        device = detect_device(caps.device)
+        config = TUNING.default_config(query, device.identity)
+        inner = workspace_layout(declaration, query, config, device)
     elif caps.source_layout == INDEXER_SOURCE_LAYOUT_PAGED:
         assert caps.max_page_table_width is not None
         inner = plan_indexer_paged_scratch(

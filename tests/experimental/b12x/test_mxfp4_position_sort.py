@@ -1,4 +1,4 @@
-"""Selected-position sorting preserves values, padding, and partial blocks."""
+"""Fused selection and block expansion preserve storage and logical positions."""
 
 import gc
 import math
@@ -16,10 +16,10 @@ from b12x._lib.runtime_control import (
 )
 
 
-@pytest.mark.parametrize("topk,expand", [(512, False), (2048, True)])
 @pytest.mark.parametrize("rows", [1, 4, 128])
 @pytest.mark.parametrize("offset", [0, 1])
-def test_position_sort_mutable_graph(topk, expand, rows, offset):
+def test_block_expansion_mutable_graph(rows, offset):
+    topk, expand = 2048, True
     device = torch.device("cuda", 0)
 
     def empty(shape, dtype=torch.float32):
@@ -31,7 +31,7 @@ def test_position_sort_mutable_graph(topk, expand, rows, offset):
     values = empty((rows, topk)).zero_()
     lengths = empty((rows,), torch.int32).zero_()
     active = empty((1,), torch.int32).zero_()
-    width = topk * (8 if expand else 1)
+    width = topk * 8
     output = empty((rows, width), torch.int32)
     output_values = empty((rows, topk))
     counts = empty((rows,), torch.int32).fill_(-42)
@@ -82,27 +82,19 @@ def test_position_sort_mutable_graph(topk, expand, rows, offset):
             active.fill_(max(visible - 1, 0))
             extent = lengths.clamp_min(0).minimum(active.clamp_min(0))
             valid = (
-                (indices >= 0)
-                & (values > -torch.inf)
-                & (indices * (8 if expand else 1) < extent[:, None])
+                (indices >= 0) & (values > -torch.inf) & (indices * 8 < extent[:, None])
             )
             order = indices.masked_fill(~valid, torch.iinfo(torch.int32).max).argsort(
                 dim=1
             )
             sorted_indices = indices.gather(1, order)
             sorted_valid = valid.gather(1, order)
-            if expand:
-                tokens = sorted_indices.long()[:, :, None] * 8 + torch.arange(
-                    8, device=device
-                )
-                live = sorted_valid[:, :, None] & (tokens < extent[:, None, None])
-                expected = tokens.masked_fill(~live, -1).reshape(rows, width).int()
-                expected_counts = live.sum((1, 2)).int()
-            else:
-                expected = sorted_indices.masked_fill(~sorted_valid, -1)
-                expected_values = values.gather(1, order).masked_fill(
-                    ~sorted_valid, -torch.inf
-                )
+            tokens = sorted_indices.long()[:, :, None] * 8 + torch.arange(
+                8, device=device
+            )
+            live = sorted_valid[:, :, None] & (tokens < extent[:, None, None])
+            expected = tokens.masked_fill(~live, -1).reshape(rows, width).int()
+            expected_counts = live.sum((1, 2)).int()
             output.fill_(-42)
             output_values.fill_(torch.nan)
             before = torch.cuda.memory_stats()
@@ -118,91 +110,18 @@ def test_position_sort_mutable_graph(topk, expand, rows, offset):
             ):
                 assert before[key] == after[key]
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
-            if expand:
-                torch.testing.assert_close(counts, expected_counts, rtol=0, atol=0)
-            else:
-                torch.testing.assert_close(
-                    output_values, expected_values, rtol=0, atol=0
-                )
-                assert bool((counts == -42).all())
+            torch.testing.assert_close(counts, expected_counts, rtol=0, atol=0)
     graph.reset()
 
 
-@pytest.mark.parametrize("topk,expand", [(512, False), (2048, True)])
-def test_position_sort_rejects_frozen_factory_miss(topk, expand):
+def test_block_expansion_rejects_frozen_factory_miss():
+    topk, expand = 2048, True
     _compile.cache_clear()
     with kernel_resolution_guard("position sort cache miss"):
         with pytest.raises(
             KernelResolutionFrozenError, match="refusing triton.compile"
         ):
             _compile("sort", (topk, expand), 0)
-
-
-def test_position_sort_addresses_beyond_signed_int32():
-    topk = 512
-    boundary = 2**31 // topk
-    rows = boundary + 1
-    device = torch.device("cuda", 0)
-    torch.cuda.empty_cache()
-    if torch.cuda.mem_get_info(device)[0] < 36 << 30:
-        pytest.skip("large row-address regression requires 36 GiB free GPU memory")
-    indices = torch.empty((rows, topk), device=device, dtype=torch.int32)
-    indices.copy_(torch.arange(topk - 1, -1, -1, device=device, dtype=torch.int32))
-    values = torch.ones((rows, topk), device=device)
-    values[-1].fill_(7)
-    output = torch.empty_like(indices)
-    output_values = torch.empty_like(values)
-    lengths = torch.full((rows,), topk, device=device, dtype=torch.int32)
-    active = torch.tensor([topk], device=device, dtype=torch.int32)
-    counts = torch.full_like(lengths, -42)
-    launcher = _compile("sort", (topk, False), 0)
-
-    def run():
-        _launch(
-            "sort",
-            (topk, False),
-            (indices, values, output, output_values, lengths, active, counts),
-            (rows,),
-            launcher=launcher,
-        )
-
-    run()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    selected = torch.tensor([0, boundary - 1, boundary], device=device)
-    expected_positions = torch.arange(topk, device=device, dtype=torch.int32)[
-        None
-    ].expand(3, -1)
-    expected_values = torch.tensor([1, 1, 7], device=device, dtype=torch.float32)[
-        :, None
-    ].expand(-1, topk)
-    for visible in (topk, 7, 0):
-        active.fill_(visible)
-        before = torch.cuda.memory_stats()
-        graph.replay()
-        torch.cuda.synchronize()
-        after = torch.cuda.memory_stats()
-        for key in (
-            "allocation.all.allocated",
-            "allocation.all.freed",
-            "segment.all.allocated",
-            "segment.all.freed",
-        ):
-            assert before[key] == after[key]
-        valid = expected_positions < visible
-        torch.testing.assert_close(
-            output[selected], expected_positions.masked_fill(~valid, -1), rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            output_values[selected],
-            expected_values.masked_fill(~valid, -torch.inf),
-            rtol=0,
-            atol=0,
-        )
-        assert bool((counts[selected] == -42).all())
-    graph.reset()
 
 
 def test_planned_candidate_expansion_addresses_beyond_signed_int32():
@@ -250,32 +169,9 @@ def test_planned_candidate_expansion_addresses_beyond_signed_int32():
         candidate_output_lengths=counts,
     )
 
-    def run_sort(binding):
-        state, runtime = binding.plan, binding.runtime
-        scratch = runtime.scratch
-        _launch(
-            "sort",
-            (block_topk, True),
-            (
-                scratch["block_indices"],
-                scratch["block_values"],
-                runtime.candidate_output,
-                scratch["block_values"],
-                runtime.cache_lengths,
-                runtime.active_width,
-                runtime.candidate_output_lengths,
-            ),
-            (rows,),
-            launcher=state._launchers[("sort", (block_topk, True))],
-        )
-
     def prime(state):
         binding = state.bind(**args)
-        binding.runtime.scratch["block_indices"].copy_(
-            torch.arange(block_topk - 1, -1, -1, device=device, dtype=torch.int32)
-        )
-        binding.runtime.scratch["block_values"].fill_(1)
-        return PreparedCall(run=lambda: run_sort(binding), owners=(binding, args))
+        return PreparedCall(run=lambda: state.run(binding), owners=(binding, args))
 
     with PreparationSession(
         device=device, autotune=False, compile_workers=0
@@ -287,10 +183,10 @@ def test_planned_candidate_expansion_addresses_beyond_signed_int32():
                 ),
             )
         )
-        binding = api.bind(declaration, **args).runtime
+        binding = api.bind(declaration, **args)
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
-            run_sort(binding)
+            api.run(binding)
         session.freeze()
         selected = torch.tensor([0, boundary - 1, boundary], device=device)
         positions = torch.arange(block_topk * 8, device=device, dtype=torch.int32)[
@@ -320,15 +216,26 @@ def test_planned_candidate_expansion_addresses_beyond_signed_int32():
         graph.reset()
 
 
-@pytest.mark.parametrize("width", [512, 513])
+@pytest.mark.parametrize("width", [512, 513, 4096, 16384])
 @pytest.mark.parametrize("candidates", [False, True])
-def test_planned_selection_preserves_unaligned_scratch(width, candidates):
+@pytest.mark.parametrize(
+    "scratch_offset,external_offset", [(0, 0), (4, 0), (16, 0), (0, 1)]
+)
+def test_planned_selection_preserves_unaligned_storage(
+    width, candidates, scratch_offset, external_offset
+):
     from b12x.attention import dsa_indexer as api
     from b12x.preparation import PreparationSession, PreparedCall
 
-    scratch_offset = 4
     rows, page_size = 4, 64
     device = torch.device("cuda", 0)
+
+    def external(value):
+        storage = torch.empty(
+            value.numel() + external_offset, dtype=value.dtype, device=device
+        )
+        return storage[external_offset:].view_as(value).copy_(value)
+
     history = width * (2 if candidates else 1)
     pages = (history + 511) // 512 * (512 // page_size)
     declaration = api.plan(
@@ -379,6 +286,25 @@ def test_planned_selection_preserves_unaligned_scratch(width, candidates):
         candidate_lengths=counts if candidates else None,
     )
 
+    for name in (
+        "q_mxfp4",
+        "q_scales",
+        "query_weights",
+        "page_table",
+        "cache_lengths",
+        "active_width",
+        "output_indices",
+        "output_scores",
+        "candidate_indices",
+        "candidate_lengths",
+    ):
+        if args[name] is not None:
+            args[name] = external(args[name])
+    lengths, active = args["cache_lengths"], args["active_width"]
+    output, values = args["output_indices"], args["output_scores"]
+    if candidates:
+        logical, counts = args["candidate_indices"], args["candidate_lengths"]
+
     def prime(state):
         binding = state.bind(**args)
         return PreparedCall(run=lambda: state.run(binding), owners=(binding, args))
@@ -390,19 +316,35 @@ def test_planned_selection_preserves_unaligned_scratch(width, candidates):
             (declaration.request(name="bf16-selection", prepare_call=prime),)
         )
         binding = api.bind(declaration, **args)
-        scores = binding.runtime.runtime.scratch["scores"]
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
-            api.select(binding)
+            api.run(binding)
         session.freeze()
         _compile.cache_clear()
         evict_unretained(())
         gc.collect()
-        with kernel_resolution_guard("prepared BF16 selector"):
-            api.select(binding)
+        with kernel_resolution_guard("prepared fused MXFP4 indexer"):
+            api.run(binding)
         for seed in (481, 6191):
             torch.manual_seed(seed)
-            for visible in (history, 513, 127, 0, history - 1):
+            codes = torch.randint(0, 16, (history,), dtype=torch.uint8, device=device)
+            positions = torch.arange(history, device=device)
+            physical, token = positions // page_size, positions % page_size
+            args["index_k_cache"][
+                physical[:, None], token[:, None] * 64 + torch.arange(64, device=device)
+            ] = (codes | (codes << 4))[:, None]
+            args["index_k_cache"][
+                physical[:, None],
+                page_size * 64 + token[:, None] * 4 + torch.arange(4, device=device),
+            ] = 127
+            levels = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device)
+            keys = levels[(codes & 7).long()] * torch.where((codes & 8) != 0, -1, 1)
+            args["query_weights"].copy_(
+                torch.tensor([[1], [-1], [0.5], [-0.5]], device=device)
+            )
+            for step, visible in enumerate((history, 513, 127, 0, history - 1)):
+                query = 1 if step % 2 == 0 else -1
+                args["q_mxfp4"].fill_(0x22 if query == 1 else 0xAA)
                 lengths.fill_(visible)
                 lengths[0] = 0
                 active.fill_(visible)
@@ -415,15 +357,15 @@ def test_planned_selection_preserves_unaligned_scratch(width, candidates):
                     logical.mul_(2)
                     logical[:, ::17] = -1
                 args["scratch"].fill_(0xA5)
-                source = torch.randn((rows, width), device=device, dtype=torch.bfloat16)
-                source[:, ::3] = 1
+                dot = (keys * query * 128).bfloat16().float().clamp_min(0)
+                full_scores = (dot[None] * args["query_weights"]).bfloat16()
+                source = full_scores.gather(1, logical.clamp_min(0).long())
                 live = (
                     (logical >= 0) & (logical < lengths[:, None]) & (logical < active)
                 )
                 if candidates:
                     live &= torch.arange(width, device=device)[None] < counts[:, None]
                 source.masked_fill_(~live, -torch.inf)
-                scores.copy_(source)
                 output.fill_(-42)
                 values.fill_(torch.nan)
                 before = torch.cuda.memory_stats()

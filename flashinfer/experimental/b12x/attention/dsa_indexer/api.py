@@ -14,7 +14,8 @@ from . import META
 from ._impl import clear_indexer_caches as clear_caches
 from ._preparation import invocation_from_descriptors, invocation_from_tensors, plan
 from .paged import PAGED_INDEX_PAGE_SIZE
-from .mxfp4 import MXFP4_INDEX_PAGE_BYTES, MXFP4PreparedState, index_mxfp4_page_bytes
+from .mxfp4 import MXFP4_INDEX_PAGE_BYTES, index_mxfp4_page_bytes
+from ._mxfp4_preparation import MXFP4PreparedState
 from .msa import MSACaps, plan_msa, run_msa
 
 INDEX_HEAD_DIM = 128
@@ -91,6 +92,8 @@ class Caps:
             if self.max_candidates or self.candidate_topk_blocks:
                 raise ValueError("FP8 indexer does not support MXFP4 candidate routes")
             return
+        if self.route not in ("auto", "paged_fused"):
+            raise ValueError("MXFP4 route must be auto or paged_fused")
         index_mxfp4_page_bytes(self.page_size)
         if self.output_index_space != "logical" or self.topk != 512:
             raise ValueError("MXFP4 requires logical topk=512 output")
@@ -291,38 +294,6 @@ def run(binding: Binding) -> torch.Tensor:
     return binding.output_indices
 
 
-def score(binding: Binding) -> torch.Tensor:
-    """Score an MXFP4 binding; TP callers reduce this BF16 matrix before select."""
-    from .mxfp4 import score_mxfp4
-
-    if not isinstance(binding, Binding):
-        raise TypeError("binding must be dsa_indexer.Binding")
-    state = require_prepared(
-        binding.plan,
-        "attention.dsa_indexer",
-        (binding.q_mxfp4 if binding.q_mxfp4 is not None else binding.q_fp8).device,
-    )
-    if not isinstance(state, MXFP4PreparedState):
-        raise TypeError("score is only the staged MXFP4 DSA API")
-    return score_mxfp4(binding.runtime, launchers=state._launchers)
-
-
-def select(binding: Binding) -> torch.Tensor:
-    """Select logical top-k indices after MXFP4 score reduction."""
-    from .mxfp4 import select_mxfp4
-
-    if not isinstance(binding, Binding):
-        raise TypeError("binding must be dsa_indexer.Binding")
-    state = require_prepared(
-        binding.plan,
-        "attention.dsa_indexer",
-        (binding.q_mxfp4 if binding.q_mxfp4 is not None else binding.q_fp8).device,
-    )
-    if not isinstance(state, MXFP4PreparedState):
-        raise TypeError("select is only the staged MXFP4 DSA API")
-    return select_mxfp4(binding.runtime, launchers=state._launchers)
-
-
 def is_supported(device=None) -> bool:
     return default_is_supported(device, requires=META.requires)
 
@@ -337,8 +308,6 @@ __all__ = [
     "plan",
     "bind",
     "run",
-    "score",
-    "select",
     "scratch_specs",
     "invocation_from_descriptors",
     "invocation_from_tensors",

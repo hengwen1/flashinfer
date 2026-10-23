@@ -7,7 +7,7 @@ created only after a session chose and admitted the immutable configuration.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from types import MappingProxyType
 
 import torch
@@ -20,7 +20,11 @@ from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from b12x.preparation.types import require_prepared
 
 from ._tuning import DsaIndexerConfig, DsaIndexerQuery, TUNING
-from .mxfp4 import MXFP4PreparedState, materialize_mxfp4
+from ._mxfp4_preparation import (
+    MXFP4PreparedState,
+    compile_fused_mxfp4,
+    workspace_layout,
+)
 from .paged import index_topk_fp8
 from .tiled_topk import run_row_topk
 from .scratch import (
@@ -28,21 +32,6 @@ from .scratch import (
     INDEXER_SOURCE_LAYOUT_PAGED,
     plan_indexer_scratch,
 )
-
-
-@dataclass(frozen=True)
-class _Mxfp4Programs:
-    launchers: Mapping
-
-    @property
-    def __b12x_dependencies__(self):
-        return tuple(self.launchers.values())
-
-    @property
-    def __b12x_programs__(self):
-        from b12x._lib.compile_plan import program_keys
-
-        return program_keys(self.__b12x_dependencies__)
 
 
 class _DsaIndexerState:
@@ -101,6 +90,20 @@ _OPERANDS = (
 )
 
 
+_MXFP4_OPERANDS = tuple(name for name in _OPERANDS if name != "q_fp8") + (
+    "q_mxfp4",
+    "q_scales",
+    "candidate_indices",
+    "candidate_lengths",
+    "candidate_output",
+    "candidate_output_lengths",
+)
+
+
+def _operand_names(caps):
+    return _MXFP4_OPERANDS if caps.cache_format == "mxfp4" else _OPERANDS
+
+
 def _alignment(tensor):
     pointer = int(tensor.data_ptr())
     return min(16, pointer & -pointer) if pointer else 16
@@ -118,7 +121,7 @@ def invocation_from_descriptors(
     if not hasattr(caps, "num_q_heads"):
         raise TypeError("invocation metadata requires dsa_indexer.Caps")
     normalized = {}
-    for name in _OPERANDS:
+    for name in _operand_names(caps):
         descriptor = operands.get(name)
         if descriptor is None:
             normalized[name] = None
@@ -159,7 +162,7 @@ def invocation_from_tensors(caps, **tensors) -> FrozenMapping:
                 "dtype": str(value.dtype).removeprefix("torch."),
                 "alignment": _alignment(value),
             }
-            for name in _OPERANDS
+            for name in _operand_names(caps)
         },
     )
 
@@ -225,23 +228,7 @@ def compile_indexer(query_payload, config_payload, ordinal):
         raise ValueError("DSA public preparation requires paged source metadata")
     device = torch.device("cuda", ordinal)
     if query.cache_format == "mxfp4":
-        from types import SimpleNamespace
-
-        caps = SimpleNamespace(
-            device=device,
-            num_q_heads=query.num_q_heads,
-            max_q_rows=query.max_q_rows,
-            max_page_table_width=query.max_page_table_width,
-            topk=query.top_k,
-            mode=query.mode,
-            page_size=query.page_size,
-            max_candidates=query.max_candidates,
-            candidate_topk_blocks=query.candidate_topk_blocks,
-        )
-        state = materialize_mxfp4(
-            caps, device_index=ordinal, score_kind=config.mxfp4_score_kind
-        )
-        return _Mxfp4Programs(state._launchers)
+        return compile_fused_mxfp4(query_payload, config_payload, ordinal)
 
     descriptors = query.operands
     gathered: dict[object, object] = {}
@@ -360,6 +347,16 @@ def compile_indexer(query_payload, config_payload, ordinal):
 
 
 def _query(caps, invocation):
+    if caps.cache_format == "mxfp4" and invocation.get("route", caps.route) not in (
+        "auto",
+        "paged_fused",
+    ):
+        raise ValueError("MXFP4 route must be auto or paged_fused")
+    if (
+        caps.cache_format == "mxfp4"
+        and invocation.get("page_size", caps.page_size) != caps.page_size
+    ):
+        raise ValueError("MXFP4 invocation page_size must match Caps.page_size")
     operands = invocation.get("operands", FrozenMapping())
     if not isinstance(operands, FrozenMapping):
         raise ValueError("DSA invocation operands must be immutable metadata")
@@ -442,21 +439,9 @@ def plan(
 
     def memory(config, device):
         if query.cache_format == "mxfp4":
-            from types import SimpleNamespace
-            from .mxfp4 import plan_mxfp4
-
-            mx_caps = SimpleNamespace(
-                device=caps.device,
-                num_q_heads=query.num_q_heads,
-                max_q_rows=query.max_q_rows,
-                max_page_table_width=query.max_page_table_width,
-                topk=query.top_k,
-                mode=query.mode,
-                page_size=query.page_size,
-                max_candidates=query.max_candidates,
-                candidate_topk_blocks=query.candidate_topk_blocks,
+            return MemoryRequirements(
+                scratch=workspace_layout(caps, query, config, device).scratch_specs()
             )
-            return MemoryRequirements(scratch=plan_mxfp4(mx_caps).scratch_specs())
         layout = plan_indexer_scratch(
             _scratch_caps(query, device=caps.device, config=config),
             fused_merge=config.fused_merge,
@@ -473,27 +458,7 @@ def plan(
         )
         load_programs(programs)
         if query.cache_format == "mxfp4":
-            from types import SimpleNamespace
-            from .mxfp4 import plan_mxfp4
-
-            mx_caps = SimpleNamespace(
-                device=caps.device,
-                num_q_heads=query.num_q_heads,
-                max_q_rows=query.max_q_rows,
-                max_page_table_width=query.max_page_table_width,
-                topk=query.top_k,
-                mode=query.mode,
-                page_size=query.page_size,
-                max_candidates=query.max_candidates,
-                candidate_topk_blocks=query.candidate_topk_blocks,
-            )
-            layout = plan_mxfp4(mx_caps, score_kind=selection.config.mxfp4_score_kind)
-            selector = programs.launchers.get(
-                ("deepselect", (bool(query.max_candidates),))
-            )
-            if selector is not None:
-                selector.validate_device(device.ordinal)
-            return MXFP4PreparedState(layout, programs.launchers)
+            return MXFP4PreparedState(caps, query, selection.config, device, programs)
         layout = plan_indexer_scratch(
             _scratch_caps(query, device=caps.device, config=selection.config),
             fused_merge=selection.config.fused_merge,

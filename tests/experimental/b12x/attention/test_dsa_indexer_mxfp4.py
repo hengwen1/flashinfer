@@ -129,7 +129,7 @@ def test_prepared_quantizers_preserve_adversarial_e2m1_and_writer_layout() -> No
         assert plan.component_id == "attention.dsa_indexer"
 
 
-def test_prepared_score_reduces_bf16_before_selecting_logical_indices() -> None:
+def test_prepared_run_preserves_bf16_scores_and_logical_indices() -> None:
     torch.manual_seed(555)
     device = torch.device("cuda")
     q = torch.randn((2, 4, 128), dtype=torch.bfloat16, device=device)
@@ -163,10 +163,15 @@ def test_prepared_score_reduces_bf16_before_selecting_logical_indices() -> None:
             output_indices=output,
             output_scores=values,
         )
-        scores = dsa_indexer.score(binding)
-        peer = torch.randn_like(scores).bfloat16()
-        scores.add_(peer)
-        dsa_indexer.select(binding)
+        _, _, dq = _oracle_quant(q)
+        _, _, dk = _oracle_quant(keys)
+        dots = torch.einsum("rhd,kd->rhk", dq.double(), dk.double()).bfloat16()
+        products = (dots.relu() * weights[..., None]).float()
+        totals = torch.zeros((2, 128), dtype=torch.float32, device=device)
+        for head in range(caps.num_q_heads):
+            totals += products[:, head]
+        scores = totals.bfloat16()
+        dsa_indexer.run(binding)
         for row, length in enumerate(lengths.tolist()):
             expected = (
                 scores[row, :length]
@@ -177,6 +182,10 @@ def test_prepared_score_reduces_bf16_before_selecting_logical_indices() -> None:
             ).int()
             torch.testing.assert_close(output[row, : expected.numel()], expected)
             assert output[row, expected.numel() :].eq(-1).all()
+            torch.testing.assert_close(
+                values[row, :length], scores[row, :length].float(), rtol=0, atol=0
+            )
+            assert values[row, length:].isneginf().all()
 
 
 def test_prepared_writer_requires_int64_physical_slot_mapping() -> None:

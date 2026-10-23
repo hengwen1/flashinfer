@@ -13,6 +13,14 @@ from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 
 
+__b12x_source_dependencies__ = (
+    "b12x.sequence.gdn_prefill._impl",
+    "b12x.sequence.gdn_prefill._tuning",
+    "b12x.sequence.kda_prefill._impl",
+    "b12x.sequence.kda_prefill._tuning",
+)
+
+
 _PARAMETER_FIELDS = frozenset(("a_log_dtype", "dt_bias_dtype", "state_indices_dtype"))
 
 

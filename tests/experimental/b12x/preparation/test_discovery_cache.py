@@ -32,6 +32,20 @@ def candidates(width=128):
     return [(payload, payload, (job,))]
 
 
+def test_delta_prefill_factory_sources_include_both_recipe_implementations():
+    root = Path(_discovery.__file__).resolve().parents[1]
+    dependencies = SourceDependencies(root)
+    module = "b12x.sequence._shared.delta_prefill.preparation"
+    sources = dict(dependencies.closure(module, dependencies.module_path(module)))
+    assert {
+        "b12x.sequence.gdn_prefill._impl",
+        "b12x.sequence.gdn_prefill._tuning",
+        "b12x.sequence.kda_prefill._impl",
+        "b12x.sequence.kda_prefill._tuning",
+    } <= sources.keys()
+    assert _discovery._factory_sources((module + ":compile_prefill",)) is not None
+
+
 def test_key_tracks_semantic_inputs_and_capabilities_not_placement(monkeypatch):
     monkeypatch.setattr(_discovery, "_compiler_context", lambda cc: ("toolchain", cc))
     monkeypatch.setattr(_discovery, "_factory_sources", lambda factories: "source")

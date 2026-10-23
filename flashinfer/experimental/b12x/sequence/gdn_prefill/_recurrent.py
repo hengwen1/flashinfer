@@ -374,7 +374,7 @@ def compile_binding(binding):
         Float32(1),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "sequence.gdn_prefill.recurrent_fp32", 1, key
+            "sequence.gdn_prefill.recurrent_fp32", 1, key[:-1]
         ),
     )
 

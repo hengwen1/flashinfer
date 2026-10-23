@@ -2463,7 +2463,7 @@ def _compile_recurrence(
         Int32(0),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "sequence.delta_prefill.recurrence", 2, key
+            "sequence.delta_prefill.recurrence", 2, key[:1] + key[2:]
         ),
     )
 
@@ -2565,7 +2565,7 @@ def _compile_prologue(
         Int32(1),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "sequence.delta_prefill.prologue", 4, key
+            "sequence.delta_prefill.prologue", 4, key[:1] + key[2:]
         ),
     )
 
@@ -2653,7 +2653,7 @@ def _compile_prepare(
         Int32(0),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "sequence.delta_prefill.prepare", 2, key
+            "sequence.delta_prefill.prepare", 2, key[:1] + key[2:]
         ),
     )
 

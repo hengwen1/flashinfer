@@ -25,8 +25,9 @@ import multiprocessing
 from dataclasses import replace
 
 from b12x._lib import compile_pool
+ORDINAL = {ordinal}
 compile_pool._initialize_worker(
-    0, (12, 0), "synthetic-uuid", "synthetic SM120", 148, 232448, 232448,
+    ORDINAL, (12, 0), "synthetic-uuid", "synthetic SM120", 148, 232448, 232448,
     multiprocessing.get_context("spawn").Array("q", (0, 0)),
 )
 from b12x._lib.compile_pool import CompileJob, describe_compilation
@@ -40,6 +41,7 @@ if COMPONENT == "gdn_prefill":
         key_heads=8, value_heads=24, head_dim=128, model_dtype="bfloat16", state_dtype="float32",
         qk_l2norm=True, checkpoint_export=True, max_tokens=1024, max_seqs=4, max_state_slots=7,
         null_state_index=0, dt_bias_dtype="bfloat16",
+        intermediate_dtype={intermediate_dtype!r},
     )
 else:
     from b12x.sequence.kda_prefill._tuning import TUNING, KdaPrefillQuery as Query
@@ -53,7 +55,9 @@ configs = {{
     "v32_k2_s2": replace(default, v_split=32, k_split=2, stages=2),
     "w8_s2": replace(default, window_tiles=8, stages=2),
 }}
-if COMPONENT == "gdn_prefill":
+if COMPONENT == "gdn_prefill" and query.intermediate_dtype == "float32":
+    configs = {{"default": default}}
+elif COMPONENT == "gdn_prefill":
     segments = (query.max_tokens + 255) // 256 + query.max_seqs
     configs["chunk_parallel"] = replace(
         default, algorithm="chunk_parallel", segment_tokens=256, stages=2,
@@ -65,7 +69,7 @@ def programs(declared, config):
     TUNING.validate_config(declared, config, IDENTITY)
     job = CompileJob.create(
         "b12x.sequence._shared.delta_prefill.preparation:compile_prefill",
-        COMPONENT, declared.to_dict(), TUNING.encode_config(config), 0,
+        COMPONENT, declared.to_dict(), TUNING.encode_config(config), ORDINAL,
     )
     return sorted([p.dialect, p.name, p.key] for p in describe_compilation(job).programs)
 
@@ -80,9 +84,19 @@ print(json.dumps(report))
 """
 
 
-def _plan_programs(component: str) -> dict:
+def _plan_programs(
+    component: str, ordinal: int = 0, intermediate_dtype: str = "bfloat16"
+) -> dict:
     proc = subprocess.run(
-        [sys.executable, "-c", PROBE.format(component=component)],
+        [
+            sys.executable,
+            "-c",
+            PROBE.format(
+                component=component,
+                ordinal=ordinal,
+                intermediate_dtype=intermediate_dtype,
+            ),
+        ],
         capture_output=True,
         text=True,
         timeout=900,
@@ -91,6 +105,23 @@ def _plan_programs(component: str) -> dict:
         f"probe failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
     return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize(
+    "component,intermediate_dtype",
+    [
+        ("gdn_prefill", "bfloat16"),
+        ("kda_prefill", "bfloat16"),
+        ("gdn_prefill", "float32"),
+    ],
+)
+def test_program_keys_ignore_device_ordinals(component, intermediate_dtype):
+    first = _plan_programs(component, 0, intermediate_dtype)
+    second = _plan_programs(component, 1, intermediate_dtype)
+    assert first and all(
+        programs for by_slots in first.values() for programs in by_slots.values()
+    )
+    assert first == second
 
 
 @pytest.mark.parametrize("component", ("gdn_prefill", "kda_prefill"))

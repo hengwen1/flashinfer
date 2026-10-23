@@ -18,7 +18,9 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
-from cutlass import Float32, Int32, Int64, Uint32
+from cutlass import Float32, Int32, Int64, Uint32, Uint64
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import llvm
 
 from b12x._lib.compiler import (
     KernelCompileSpec,
@@ -80,6 +82,7 @@ from b12x._lib.intrinsics.atomics import (
     red_add_global_release_i32,
 )
 from b12x._lib.intrinsics.math import fmax_f32
+from b12x._lib.intrinsics.packed import f32_to_raw_bits
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_cg_v4_u32,
@@ -90,6 +93,9 @@ from b12x._lib.intrinsics.memory import (
     ld_shared_v4_u32,
     st_shared_u8,
     st_shared_v4_u32,
+    st_global_v4_u32,
+    st_global_v2_u32,
+    u32_as_f32,
 )
 from b12x._lib.intrinsics.sync import (
     ld_global_acquire_i32,
@@ -346,7 +352,7 @@ _FUSED_STATE_OUTPUT = _FUSED_STATE_ARRIVAL + 2
 _FUSED_STATE_TIES = _FUSED_STATE_ARRIVAL + 3
 _FUSED_STATE_CLEANUP = _FUSED_STATE_ARRIVAL + 4
 _COOP_STATE_WORDS = _FUSED_STATE_ARRIVAL + 8
-assert (_FUSED_STATE_OUTPUT % 2 == 0) and (_COOP_STATE_WORDS % 2 == 0)
+assert (_FUSED_STATE_OUTPUT % 2 == 0) and (_COOP_STATE_WORDS % 4 == 0)
 assert _FUSED_WIDE_RADIX == 4 * _RADIX_THREADS
 
 
@@ -406,22 +412,26 @@ def _coop_publish_wide(
     hist_off: cutlass.Constexpr[int],
     hist_addr: Int32,
     tx: Int32,
+    threads: cutlass.Constexpr[int] = 1024,
 ):
-    """Add this CTA's 4096-bin local histogram (thread ``t`` owns bins
-    ``4t .. 4t+3``) into the group's global buffer and clear it."""
-    c0, c1, c2, c3 = ld_shared_v4_u32(hist_addr + tx * Int32(16))
-    base = _fused_state_ptr(merge_state, group_id, Int32(hist_off) + tx * Int32(4))
-    if c0 != Uint32(0):
-        red_add_global_i32(base, Int32(c0))
-    if c1 != Uint32(0):
-        red_add_global_i32(base + Int64(4), Int32(c1))
-    if c2 != Uint32(0):
-        red_add_global_i32(base + Int64(8), Int32(c2))
-    if c3 != Uint32(0):
-        red_add_global_i32(base + Int64(12), Int32(c3))
-    st_shared_v4_u32(
-        hist_addr + tx * Int32(16), Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-    )
+    """Publish and clear the local histogram in four-bin vectors."""
+    for hist_pass in cutlass.range_constexpr(1024 // threads):
+        hist_tx = tx + Int32(hist_pass * threads)
+        c0, c1, c2, c3 = ld_shared_v4_u32(hist_addr + hist_tx * Int32(16))
+        base = _fused_state_ptr(
+            merge_state, group_id, Int32(hist_off) + hist_tx * Int32(4)
+        )
+        if c0 != Uint32(0):
+            red_add_global_i32(base, Int32(c0))
+        if c1 != Uint32(0):
+            red_add_global_i32(base + Int64(4), Int32(c1))
+        if c2 != Uint32(0):
+            red_add_global_i32(base + Int64(8), Int32(c2))
+        if c3 != Uint32(0):
+            red_add_global_i32(base + Int64(12), Int32(c3))
+        st_shared_v4_u32(
+            hist_addr + hist_tx * Int32(16), Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+        )
 
 
 @cute.jit
@@ -446,6 +456,7 @@ def _coop_wide_round(
     warp_idx: Int32,
     s_coop_scalars: cute.Tensor,
     read_total: cutlass.Constexpr[bool],
+    threads: cutlass.Constexpr[int] = 1024,
 ) -> Int32:
     """One 12-bit cooperative radix round; returns the next barrier phase.
 
@@ -464,9 +475,11 @@ def _coop_wide_round(
             digit = Int32((key >> Uint32(digit_shift)) & Uint32(0xFFF))
             _smem_red_add(wide_hist_addr, digit, Int32(1))
             _smem_red_add(coarse_hist_addr, digit >> Int32(4), Int32(1))
-        i += Int32(_RADIX_THREADS)
+        i += Int32(threads)
     cute.arch.sync_threads()
-    _coop_publish_wide(merge_state, group_id, fine_off, wide_hist_addr, tx)
+    _coop_publish_wide(
+        merge_state, group_id, fine_off, wide_hist_addr, tx, threads=threads
+    )
     if tx < Int32(_RADIX):
         c = Int32(s_hist0[tx])
         if c > Int32(0):
@@ -508,8 +521,11 @@ def _coop_narrow_round(
     lane: Int32,
     warp_idx: Int32,
     s_coop_scalars: cute.Tensor,
+    digit_shift: cutlass.Constexpr[int] = 0,
+    read_total: cutlass.Constexpr[bool] = False,
+    threads: cutlass.Constexpr[int] = 1024,
 ) -> Int32:
-    """The final 8-bit cooperative radix round over the low key byte.
+    """One byte-wide cooperative radix round over the selected key byte.
 
     Same contract as :func:`_coop_wide_round` with a 256-bin histogram only.
     """
@@ -520,8 +536,12 @@ def _coop_narrow_round(
     while i < carry_count:
         key = _convert_to_uint32(Float32(s_c0_values[i]))
         if (key & key_mask) == key_prefix:
-            _smem_red_add(coarse_hist_addr, Int32(key & Uint32(0xFF)), Int32(1))
-        i += Int32(_RADIX_THREADS)
+            _smem_red_add(
+                coarse_hist_addr,
+                Int32((key >> Uint32(digit_shift)) & Uint32(0xFF)),
+                Int32(1),
+            )
+        i += Int32(threads)
     cute.arch.sync_threads()
     if tx < Int32(_RADIX):
         c = Int32(s_hist0[tx])
@@ -533,7 +553,13 @@ def _coop_narrow_round(
     phase = _fused_group_barrier(merge_state, group_id, barrier_phase, ctas_pg, tx)
     if warp_idx == Int32(0):
         _coop_scan_round(
-            merge_state, group_id, coarse_off, remaining_k, lane, s_coop_scalars, False
+            merge_state,
+            group_id,
+            coarse_off,
+            remaining_k,
+            lane,
+            s_coop_scalars,
+            read_total,
         )
     cute.arch.sync_threads()
     return phase
@@ -1172,13 +1198,19 @@ def _fused_indexer_shared_storage_cls(
     topk: int,
     carry_cap: int,
     cands: int,
+    selection_groups: int = 1,
+    score_batch_tiles: int = 1,
+    compact: bool = False,
+    preserve_histogram: bool = False,
 ):
     class SharedStorage:
         pass
 
-    def _u8_page():
+    def _u8_page(n_bytes=_PAGE_SIZE * _INDEX_HEAD_DIM, *, histogram=False):
+        full_page = not compact or (histogram and preserve_histogram)
         return cute.struct.Align[
-            cute.struct.MemRange[cutlass.Uint8, _PAGE_SIZE * _INDEX_HEAD_DIM], 1024
+            cute.struct.MemRange[cutlass.Uint8, int(n_bytes) if full_page else 1],
+            1024 if full_page else 16,
         ]
 
     def _i32(n):
@@ -1191,34 +1223,42 @@ def _fused_indexer_shared_storage_cls(
         # --- scorer fields (mirror _paged_indexer_shared_storage_cls) ---
         "mbar_ptr_k": cute.struct.MemRange[cutlass.Int64, 1],
         "q_bytes": cute.struct.Align[
-            cute.struct.MemRange[cutlass.Uint8, int(padded_q_heads) * _INDEX_HEAD_DIM],
+            cute.struct.MemRange[
+                cutlass.Uint8, 1 if compact else int(padded_q_heads) * _INDEX_HEAD_DIM
+            ],
             16,
         ],
-        "weights": _f32(int(padded_q_heads)),
-        "k_page": _u8_page(),
-        "k_page_perm": _u8_page(),
-        "k_page3": _u8_page(),
-        "scales": _f32(4 * _PAGE_SIZE),
+        "weights": _f32(1 if compact else int(padded_q_heads)),
+        "k_page": _u8_page(histogram=True),
+        "k_page_perm": _u8_page(histogram=True),
+        "k_page3": _u8_page(4096)
+        if selection_groups == 4 and score_batch_tiles == 2
+        else _u8_page(),
+        "scales": _f32(1 if compact else 4 * _PAGE_SIZE),
         # Second per-page scale slot: the paged branch ping-pongs K between
         # k_page_perm (stage 0) and k_page (stage 1, otherwise unused there),
         # so the scale staging needs a matching second buffer.
-        "partial_logits": _f32(int(tokens_per_work) * int(num_q_head_tiles)),
-        "partial_logits2": _f32(int(tokens_per_work) * int(num_q_head_tiles)),
+        "partial_logits": _f32(
+            1 if compact else int(tokens_per_work) * int(num_q_head_tiles)
+        ),
+        "partial_logits2": _f32(
+            1 if compact else int(tokens_per_work) * int(num_q_head_tiles)
+        ),
         # --- radix scratch (mirror tiled_topk SharedStorage) ---
-        "hist0": _i32(384),
-        "hist1": _i32(384),
-        "out_idx": _i32(int(topk)),
-        "counter": _i32(1),
-        "thr_id": _i32(1),
+        "hist0": _i32(384 * selection_groups),
+        "hist1": _i32(384 * selection_groups),
+        "out_idx": _i32(int(topk) * selection_groups),
+        "counter": _i32(selection_groups),
+        "thr_id": _i32(selection_groups),
         "ni0": _i32(1),
         "ni1": _i32(1),
-        "last_rem": _i32(1),
+        "last_rem": _i32(selection_groups),
         # relay[0]=pack offset, relay[1]=arrival-old (last-CTA broadcast scalars)
-        "relay": _i32(2),
+        "relay": _i32(max(2, selection_groups)),
         # cooperative-merge SMEM: suffix-scan of the global histogram + per-CTA
         # scalars (prefix/remaining_k/pivot_bin/rem) + counters (gt-count/base).
         "coop_suffix": _i32(int(_RADIX)),
-        "coop_scalars": cute.struct.Align[cute.struct.MemRange[cutlass.Uint32, 4], 128],
+        "coop_scalars": cute.struct.Align[cute.struct.MemRange[cutlass.Uint32, 8], 128],
         "coop_counters": _i32(2),
         "cand0": _i32(cands),
         "cand1": _i32(cands),
@@ -1226,11 +1266,736 @@ def _fused_indexer_shared_storage_cls(
         "carry0_values": _f32(int(carry_cap)),
         "carry0_gindex": _i32(int(carry_cap)),
         # --- trim output (exactly topk) ---
-        "carry1_values": _f32(int(topk)),
-        "carry1_gindex": _i32(int(topk)),
+        "carry1_values": _f32(int(topk) * selection_groups),
+        "carry1_gindex": _i32(int(topk) * selection_groups),
     }
     SharedStorage.__annotations__ = annotations
     return cute.struct(SharedStorage)
+
+
+@dsl_user_op
+def _mxfp4_publish_cutoff(address: Int32, key: Uint32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [Int32(address).ir_value(loc=loc, ip=ip), Uint32(key).ir_value(loc=loc, ip=ip)],
+        "red.shared.max.u32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def _mxfp4_selection_barrier(threads: cutlass.Constexpr[int], barrier_id: Int32):
+    if cutlass.const_expr(threads == 1024):
+        cute.arch.sync_threads()
+    else:
+        cute.arch.barrier(barrier_id=barrier_id, number_of_threads=threads)
+
+
+@cute.jit
+def _mxfp4_private_radix_select(
+    vin_v: cute.Tensor,
+    vin_g: cute.Tensor,
+    vout_v: cute.Tensor,
+    vout_g: cute.Tensor,
+    n_total: Int32,
+    topk_static: Int32,
+    tx: Int32,
+    s_hist0: cute.Tensor,
+    s_hist1: cute.Tensor,
+    s_out: cute.Tensor,
+    h0: Int32,
+    ctr: Int32,
+    thr: Int32,
+    lr: Int32,
+    selection_threads: cutlass.Constexpr[int] = 1024,
+    barrier_id: Int32 = 0,
+    maintain_histogram: cutlass.Constexpr[bool] = False,
+    cached_histogram_valid: cutlass.Boolean = False,
+):
+    """Select exact top-k from BF16-rounded scores with two ordered-key bytes.
+
+    A valid hist1[128:384] cache counts vin_v[:n_total]. Maintained calls
+    replace it with counts for their top-k output.
+    """
+    prefix = Uint32(0)
+    prefix_mask = Uint32(0)
+    remaining = topk_static
+    if tx == Int32(0):
+        _smem_st(ctr, Int32(0), Int32(0))
+    _mxfp4_selection_barrier(selection_threads, barrier_id)
+    if cutlass.const_expr(maintain_histogram):
+        if cached_histogram_valid:
+            if tx < Int32(256):
+                s_hist0[tx] = Int32(s_hist1[Int32(128) + tx])
+            _mxfp4_selection_barrier(selection_threads, barrier_id)
+        else:
+            if tx < Int32(257):
+                s_hist0[tx] = Int32(0)
+            _mxfp4_selection_barrier(selection_threads, barrier_id)
+            i = Int32(tx)
+            while i < n_total:
+                key = _convert_to_uint32(Float32(vin_v[i])) >> Uint32(16)
+                if (key & prefix_mask) == prefix:
+                    digit = (key >> Uint32(8)) & Uint32(255)
+                    _smem_red_add(h0, Int32(digit), Int32(1))
+                i += Int32(selection_threads)
+            _mxfp4_selection_barrier(selection_threads, barrier_id)
+    else:
+        if tx < Int32(257):
+            s_hist0[tx] = Int32(0)
+        _mxfp4_selection_barrier(selection_threads, barrier_id)
+        i = Int32(tx)
+        while i < n_total:
+            key = _convert_to_uint32(Float32(vin_v[i])) >> Uint32(16)
+            if (key & prefix_mask) == prefix:
+                digit = (key >> Uint32(8)) & Uint32(255)
+                _smem_red_add(h0, Int32(digit), Int32(1))
+            i += Int32(selection_threads)
+        _mxfp4_selection_barrier(selection_threads, barrier_id)
+    value = Int32(0)
+    if tx < Int32(256):
+        value = Int32(s_hist0[tx])
+    for stage in cutlass.range_constexpr(5):
+        other = cute.arch.shuffle_sync_down(value, 1 << stage)
+        if tx % Int32(32) + Int32(1 << stage) < Int32(32):
+            value += other
+    if tx < Int32(256) and tx % Int32(32) == Int32(0):
+        s_hist1[tx // Int32(32)] = value
+    _mxfp4_selection_barrier(selection_threads, barrier_id)
+    if tx < Int32(256):
+        for w in cutlass.range_constexpr(8):
+            if Int32(w) > tx // Int32(32):
+                value += Int32(s_hist1[w])
+        s_hist0[tx] = value
+    _mxfp4_selection_barrier(selection_threads, barrier_id)
+    if tx < Int32(256):
+        suffix = Int32(s_hist0[tx])
+        suffix_next = Int32(0)
+        if tx + Int32(1) < Int32(256):
+            suffix_next = Int32(s_hist0[tx + Int32(1)])
+        if suffix >= remaining and suffix_next < remaining:
+            _smem_st(thr, Int32(0), tx)
+            _smem_st(lr, Int32(0), remaining - suffix_next)
+    _mxfp4_selection_barrier(selection_threads, barrier_id)
+    pivot = _smem_ld(thr, Int32(0))
+    remaining = _smem_ld(lr, Int32(0))
+    if cutlass.const_expr(maintain_histogram):
+        # BF16 scan prefixes use hist1[0:8]; its tail holds carried counts.
+        if tx < Int32(256):
+            retained = Int32(0)
+            if tx > pivot:
+                retained = Int32(s_hist0[tx])
+                if tx < Int32(255):
+                    retained -= Int32(s_hist0[tx + Int32(1)])
+            elif tx == pivot:
+                retained = remaining
+            s_hist1[Int32(128) + tx] = retained
+    i = Int32(tx)
+    while i < n_total:
+        key = _convert_to_uint32(Float32(vin_v[i])) >> Uint32(16)
+        if (key & prefix_mask) == prefix:
+            digit = Int32((key >> Uint32(8)) & Uint32(255))
+            if digit > pivot:
+                pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                if pos < topk_static:
+                    s_out[pos] = i
+
+        i += Int32(selection_threads)
+    _mxfp4_selection_barrier(selection_threads, barrier_id)
+    prefix |= Uint32(pivot) << Uint32(8)
+    prefix_mask |= Uint32(255) << Uint32(8)
+    if tx < Int32(257):
+        s_hist0[tx] = Int32(0)
+    _mxfp4_selection_barrier(selection_threads, barrier_id)
+    i = Int32(tx)
+    while i < n_total:
+        key = _convert_to_uint32(Float32(vin_v[i])) >> Uint32(16)
+        if (key & prefix_mask) == prefix:
+            digit = (key >> Uint32(0)) & Uint32(255)
+            _smem_red_add(h0, Int32(digit), Int32(1))
+        i += Int32(selection_threads)
+    _mxfp4_selection_barrier(selection_threads, barrier_id)
+    value = Int32(0)
+    if tx < Int32(256):
+        value = Int32(s_hist0[tx])
+    for stage in cutlass.range_constexpr(5):
+        other = cute.arch.shuffle_sync_down(value, 1 << stage)
+        if tx % Int32(32) + Int32(1 << stage) < Int32(32):
+            value += other
+    if tx < Int32(256) and tx % Int32(32) == Int32(0):
+        s_hist1[tx // Int32(32)] = value
+    _mxfp4_selection_barrier(selection_threads, barrier_id)
+    if tx < Int32(256):
+        for w in cutlass.range_constexpr(8):
+            if Int32(w) > tx // Int32(32):
+                value += Int32(s_hist1[w])
+        s_hist0[tx] = value
+    _mxfp4_selection_barrier(selection_threads, barrier_id)
+    if tx < Int32(256):
+        suffix = Int32(s_hist0[tx])
+        suffix_next = Int32(0)
+        if tx + Int32(1) < Int32(256):
+            suffix_next = Int32(s_hist0[tx + Int32(1)])
+        if suffix >= remaining and suffix_next < remaining:
+            _smem_st(thr, Int32(0), tx)
+            _smem_st(lr, Int32(0), remaining - suffix_next)
+    _mxfp4_selection_barrier(selection_threads, barrier_id)
+    pivot = _smem_ld(thr, Int32(0))
+    remaining = _smem_ld(lr, Int32(0))
+    i = Int32(tx)
+    while i < n_total:
+        key = _convert_to_uint32(Float32(vin_v[i])) >> Uint32(16)
+        if (key & prefix_mask) == prefix:
+            digit = Int32((key >> Uint32(0)) & Uint32(255))
+            if digit > pivot:
+                pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                if pos < topk_static:
+                    s_out[pos] = i
+            if digit == pivot:
+                old_rem = _smem_xadd(lr, Int32(0), Int32(-1))
+                if old_rem > Int32(0):
+                    s_out[topk_static - old_rem] = i
+        i += Int32(selection_threads)
+    _mxfp4_selection_barrier(selection_threads, barrier_id)
+    prefix |= Uint32(pivot) << Uint32(0)
+    prefix_mask |= Uint32(255) << Uint32(0)
+    i = Int32(tx)
+    while i < topk_static:
+        sel = Int32(s_out[i])
+        vout_v[i] = Float32(vin_v[sel])
+        vout_g[i] = Int32(vin_g[sel])
+        i += Int32(selection_threads)
+
+
+@cute.jit
+def _mxfp4_scan_global8(
+    base_addr: Int64, remaining_k: Int32, lane: Int32, scalars: cute.Tensor
+):
+    """Resolve a 256-bin global histogram with coherent L2 reads."""
+    base = base_addr + Int64(lane) * Int64(32)
+    h0, h1, h2, h3 = ld_global_cg_v4_u32(base)
+    h4, h5, h6, h7 = ld_global_cg_v4_u32(base + Int64(16))
+    s7 = Int32(h7)
+    s6 = s7 + Int32(h6)
+    s5 = s6 + Int32(h5)
+    s4 = s5 + Int32(h4)
+    s3 = s4 + Int32(h3)
+    s2 = s3 + Int32(h2)
+    s1 = s2 + Int32(h1)
+    s0 = s1 + Int32(h0)
+    above = s0
+    for d in (1, 2, 4, 8, 16):
+        other = cute.arch.shuffle_sync_down(above, offset=d)
+        if lane + Int32(d) < Int32(_WARP_THREADS):
+            above = above + other
+    above = above - s0
+    suffix = [
+        s0 + above,
+        s1 + above,
+        s2 + above,
+        s3 + above,
+        s4 + above,
+        s5 + above,
+        s6 + above,
+        s7 + above,
+        above,
+    ]
+    for j in cutlass.range_constexpr(8):
+        if (suffix[j] >= remaining_k) & (suffix[j + 1] < remaining_k):
+            scalars[0] = Uint32(lane * Int32(8) + Int32(j))
+            scalars[1] = Uint32(suffix[j + 1])
+            scalars[2] = Uint32(suffix[j] - suffix[j + 1])
+
+
+@cute.jit
+def _mxfp4_scan_packed_global8(
+    base_addr: Int64, remaining_k: Int32, lane: Int32, scalars: cute.Tensor
+):
+    """Resolve 256 logical bins packed into 128 global words."""
+    base = base_addr + Int64(lane) * Int64(16)
+    p0, p1, p2, p3 = ld_global_cg_v4_u32(base)
+    h0 = p0 & Uint32(65535)
+    h1 = p0 >> Uint32(16)
+    h2 = p1 & Uint32(65535)
+    h3 = p1 >> Uint32(16)
+    h4 = p2 & Uint32(65535)
+    h5 = p2 >> Uint32(16)
+    h6 = p3 & Uint32(65535)
+    h7 = p3 >> Uint32(16)
+    s7 = Int32(h7)
+    s6 = s7 + Int32(h6)
+    s5 = s6 + Int32(h5)
+    s4 = s5 + Int32(h4)
+    s3 = s4 + Int32(h3)
+    s2 = s3 + Int32(h2)
+    s1 = s2 + Int32(h1)
+    s0 = s1 + Int32(h0)
+    above = s0
+    for d in (1, 2, 4, 8, 16):
+        other = cute.arch.shuffle_sync_down(above, offset=d)
+        if lane + Int32(d) < Int32(_WARP_THREADS):
+            above = above + other
+    above = above - s0
+    suffix = [
+        s0 + above,
+        s1 + above,
+        s2 + above,
+        s3 + above,
+        s4 + above,
+        s5 + above,
+        s6 + above,
+        s7 + above,
+        above,
+    ]
+    for j in cutlass.range_constexpr(8):
+        if (suffix[j] >= remaining_k) & (suffix[j + 1] < remaining_k):
+            scalars[0] = Uint32(lane * Int32(8) + Int32(j))
+            scalars[1] = Uint32(suffix[j + 1])
+            scalars[2] = Uint32(suffix[j] - suffix[j + 1])
+
+
+@dsl_user_op
+def _mxfp4_mark_active(addr: Int64, bits: Uint32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(bits).ir_value(loc=loc, ip=ip)],
+        "red.global.or.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def _mxfp4_onepass_merge(
+    state: cute.Tensor,
+    group: Int32,
+    cta: Int32,
+    ctas: Int32,
+    tx: Int32,
+    lane: Int32,
+    warp: Int32,
+    carry_values: cute.Tensor,
+    carry_indices: cute.Tensor,
+    count: Int32,
+    out_values: cute.Tensor,
+    out_indices: cute.Tensor,
+    hist: cute.Tensor,
+    hist_addr: Int32,
+    scalars: cute.Tensor,
+    counters: cute.Tensor,
+    counter_addr: Int32,
+    fine_words: cutlass.Constexpr[int],
+    active_cap: cutlass.Constexpr[int],
+    count_bits: cutlass.Constexpr[int],
+    use_bitmap: cutlass.Constexpr[bool],
+    cleanup_work_addr: Int32,
+    thread_count: cutlass.Constexpr[int],
+):
+    # Bitmap compaction reuses 8 KiB of the dead K staging ring.
+    bitmap_words = fine_words // 32
+    state_words = fine_words + _RADIX + 8 + (bitmap_words if use_bitmap else active_cap)
+    fine = Int64(group) * Int64(state_words)
+    coarse = fine + Int64(fine_words)
+    meta = coarse + Int64(256)
+    active = meta + Int64(8)
+    i = Int32(tx)
+    key = Uint32(0)
+    slot = Int32(0)
+    previous = Int32(0)
+    fine_key = Uint32(0)
+    increment = Int32(0)
+    bitmap_word = Int32(0)
+    bitmap_bits = Uint32(0)
+    work_index = Int32(0)
+    total = Int32(0)
+    high = Uint32(0)
+    threshold = Uint32(0)
+    key_mask = Uint32(0)
+    greater = Int32(0)
+    pos = Int32(0)
+    packed = Int64(0)
+    old = Int64(0)
+    if tx < Int32(256):
+        hist[tx] = Int32(0)
+    cute.arch.sync_threads()
+    while i < count:
+        key = _convert_to_uint32(Float32(carry_values[i])) >> Uint32(16)
+        if cutlass.const_expr(count_bits == 16):
+            fine_key = key >> Uint32(1)
+            increment = Int32(1) << Int32((key & Uint32(1)) * Uint32(16))
+        else:
+            fine_key = key
+            increment = Int32(1)
+        previous = atomic_add_global_i32(
+            get_ptr_as_int64(state, fine + Int64(fine_key)), increment
+        )
+        if previous == Int32(0):
+            if cutlass.const_expr(use_bitmap):
+                _mxfp4_mark_active(
+                    get_ptr_as_int64(state, active + Int64(fine_key >> Uint32(5))),
+                    Uint32(1) << (fine_key & Uint32(31)),
+                )
+            else:
+                slot = atomic_add_global_i32(get_ptr_as_int64(state, meta), Int32(1))
+                state[active + Int64(slot)] = Int32(fine_key)
+        _smem_red_add(hist_addr, Int32(key >> Uint32(8)), Int32(1))
+        i += Int32(thread_count)
+    cute.arch.sync_threads()
+    if tx < Int32(256):
+        if Int32(hist[tx]) != Int32(0):
+            red_add_global_i32(
+                get_ptr_as_int64(state, coarse + Int64(tx)), Int32(hist[tx])
+            )
+    if tx == Int32(0):
+        red_add_global_i32(get_ptr_as_int64(state, meta + Int64(2)), count)
+    cute.arch.sync_threads()
+    if tx == Int32(0):
+        red_add_global_release_i32(get_ptr_as_int64(state, meta + Int64(1)), Int32(1))
+        spin_wait_global_ge_i32(get_ptr_as_int64(state, meta + Int64(1)), ctas)
+        scalars[3] = Uint32(
+            ld_global_acquire_i32(get_ptr_as_int64(state, meta + Int64(2)))
+        )
+    cute.arch.sync_threads()
+    total = Int32(scalars[3])
+    if total <= Int32(512):
+        if tx == Int32(0):
+            old = atomic_add_global_u64(
+                get_ptr_as_int64(state, meta + Int64(4)), Int64(count)
+            )
+            scalars[4] = Uint32(old)
+        cute.arch.sync_threads()
+        i = Int32(tx)
+        while i < count:
+            pos = Int32(scalars[4]) + i
+            out_values[group, pos] = Float32(carry_values[i])
+            out_indices[group, pos] = Int32(carry_indices[i])
+            i += Int32(thread_count)
+        if cta == Int32(0):
+            i = total + Int32(tx)
+            while i < Int32(512):
+                out_values[group, i] = Float32(float("-inf"))
+                out_indices[group, i] = Int32(-1)
+                i += Int32(thread_count)
+    else:
+        if warp == Int32(0):
+            _mxfp4_scan_global8(
+                get_ptr_as_int64(state, coarse), Int32(512), lane, scalars
+            )
+        cute.arch.sync_threads()
+        high = Uint32(scalars[0])
+        greater = Int32(scalars[1])
+        threshold = high << Uint32(8)
+        key_mask = Uint32(0xFF00)
+        if Int32(scalars[2]) != Int32(512) - greater:
+            if warp == Int32(0):
+                if cutlass.const_expr(count_bits == 16):
+                    _mxfp4_scan_packed_global8(
+                        get_ptr_as_int64(state, fine + Int64(high << Uint32(7))),
+                        Int32(512) - greater,
+                        lane,
+                        scalars,
+                    )
+                else:
+                    _mxfp4_scan_global8(
+                        get_ptr_as_int64(state, fine + Int64(high << Uint32(8))),
+                        Int32(512) - greater,
+                        lane,
+                        scalars,
+                    )
+            cute.arch.sync_threads()
+            threshold = threshold | Uint32(scalars[0])
+            greater = greater + Int32(scalars[1])
+            key_mask = Uint32(0xFFFF)
+        if tx < Int32(2):
+            counters[tx] = Int32(0)
+        cute.arch.sync_threads()
+        i = Int32(tx)
+        while i < count:
+            key = (
+                _convert_to_uint32(Float32(carry_values[i])) >> Uint32(16)
+            ) & key_mask
+            if key > threshold:
+                _smem_red_add(counter_addr, Int32(0), Int32(1))
+            elif key == threshold:
+                _smem_red_add(counter_addr, Int32(1), Int32(1))
+            i += Int32(thread_count)
+        cute.arch.sync_threads()
+        if tx == Int32(0):
+            packed = Int64(Int32(counters[0])) | (
+                Int64(Int32(counters[1])) << Int64(32)
+            )
+            old = atomic_add_global_u64(
+                get_ptr_as_int64(state, meta + Int64(4)), packed
+            )
+            scalars[4] = Uint32(old)
+            scalars[5] = Uint32(old >> Int64(32))
+            counters[0] = Int32(0)
+            counters[1] = Int32(0)
+        cute.arch.sync_threads()
+        i = Int32(tx)
+        while i < count:
+            key = (
+                _convert_to_uint32(Float32(carry_values[i])) >> Uint32(16)
+            ) & key_mask
+            pos = Int32(-1)
+            if key > threshold:
+                pos = Int32(scalars[4]) + _smem_xadd(counter_addr, Int32(0), Int32(1))
+            elif key == threshold:
+                pos = (
+                    greater
+                    + Int32(scalars[5])
+                    + _smem_xadd(counter_addr, Int32(1), Int32(1))
+                )
+            if (pos >= Int32(0)) & (pos < Int32(512)):
+                out_values[group, pos] = Float32(carry_values[i])
+                out_indices[group, pos] = Int32(carry_indices[i])
+            i += Int32(thread_count)
+    cute.arch.sync_threads()
+    if tx == Int32(0):
+        threadfence()
+        scalars[7] = Uint32(
+            atomic_add_global_i32(get_ptr_as_int64(state, meta + Int64(6)), Int32(1))
+        )
+    cute.arch.sync_threads()
+    if Int32(scalars[7]) == ctas - Int32(1):
+        threadfence()
+        if cutlass.const_expr(use_bitmap):
+            cute.arch.cp_async_wait_group(0)
+            if tx == Int32(0):
+                counters[0] = Int32(0)
+            cute.arch.sync_threads()
+            i = Int32(tx)
+            while i < Int32(bitmap_words):
+                bitmap_bits = Uint32(
+                    ld_global_acquire_i32(get_ptr_as_int64(state, active + Int64(i)))
+                )
+                if bitmap_bits != Uint32(0):
+                    slot = _smem_xadd(counter_addr, Int32(0), Int32(1))
+                    _smem_st(cleanup_work_addr, slot, i)
+                    _smem_st(
+                        cleanup_work_addr,
+                        slot + Int32(bitmap_words),
+                        Int32(bitmap_bits),
+                    )
+                i += Int32(thread_count)
+            cute.arch.sync_threads()
+            work_index = warp
+            while work_index < Int32(counters[0]):
+                bitmap_word = _smem_ld(cleanup_work_addr, work_index)
+                bitmap_bits = Uint32(
+                    _smem_ld(cleanup_work_addr, work_index + Int32(bitmap_words))
+                )
+                if (bitmap_bits & (Uint32(1) << Uint32(lane))) != Uint32(0):
+                    state[fine + Int64(bitmap_word) * Int64(32) + Int64(lane)] = Int32(
+                        0
+                    )
+                if lane == Int32(0):
+                    state[active + Int64(bitmap_word)] = Int32(0)
+                work_index += Int32(thread_count // 32)
+        else:
+            if tx == Int32(0):
+                scalars[6] = Uint32(
+                    ld_global_acquire_i32(get_ptr_as_int64(state, meta))
+                )
+            cute.arch.sync_threads()
+            i = Int32(tx)
+            while i < Int32(scalars[6]):
+                fine_key = Uint32(
+                    ld_global_acquire_i32(get_ptr_as_int64(state, active + Int64(i)))
+                )
+                state[fine + Int64(fine_key)] = Int32(0)
+                state[active + Int64(i)] = Int32(0)
+                i += Int32(thread_count)
+        if tx < Int32(256):
+            state[coarse + Int64(tx)] = Int32(0)
+        cute.arch.sync_threads()
+        if tx < Int32(8):
+            state[meta + Int64(tx)] = Int32(0)
+
+    return Int32(scalars[7]) == ctas - Int32(1)
+
+
+@cute.jit
+def _mxfp4_radix_select(
+    vin_v: cute.Tensor,
+    vin_g: cute.Tensor,
+    vout_v: cute.Tensor,
+    vout_g: cute.Tensor,
+    n_total: Int32,
+    topk_static: Int32,
+    tx: Int32,
+    s_hist0: cute.Tensor,
+    s_hist1: cute.Tensor,
+    s_out: cute.Tensor,
+    h0: Int32,
+    ctr: Int32,
+    thr: Int32,
+    lr: Int32,
+    max_items: cutlass.Constexpr[int] = 2048,
+    indices_only: cutlass.Constexpr[bool] = False,
+    priority_id: Int32 | None = None,
+    threads: cutlass.Constexpr[int] = 1024,
+):
+    """Select exact top-k from BF16-rounded scores with two ordered-key bytes."""
+    keys = cute.make_rmem_tensor(((max_items + threads - 1) // threads,), Uint32)
+    keys.fill(0)
+    for slot in cutlass.range_constexpr((max_items + threads - 1) // threads):
+        idx = tx + Int32(slot * threads)
+        if idx < n_total:
+            keys[slot] = _convert_to_uint32(Float32(vin_v[idx])) >> Uint32(16)
+            if cutlass.const_expr(priority_id is not None):
+                if Int32(vin_g[idx]) == priority_id:
+                    keys[slot] = Uint32(65535)
+    prefix = Uint32(0)
+    prefix_mask = Uint32(0)
+    remaining = topk_static
+    if tx == Int32(0):
+        _smem_st(ctr, Int32(0), Int32(0))
+    cute.arch.sync_threads()
+    if tx < Int32(257):
+        s_hist0[tx] = Int32(0)
+    cute.arch.sync_threads()
+    for slot in cutlass.range_constexpr((max_items + threads - 1) // threads):
+        i = tx + Int32(slot * threads)
+        if i < n_total:
+            key = Uint32(keys[slot])
+            if (key & prefix_mask) == prefix:
+                digit = (key >> Uint32(8)) & Uint32(255)
+                _smem_red_add(h0, Int32(digit), Int32(1))
+
+    cute.arch.sync_threads()
+    if tx < Int32(32):
+        base = h0 + tx * Int32(32)
+        c0, c1, c2, c3 = ld_shared_v4_u32(base)
+        c4, c5, c6, c7 = ld_shared_v4_u32(base + Int32(16))
+        s7 = Int32(c7)
+        s6 = s7 + Int32(c6)
+        s5 = s6 + Int32(c5)
+        s4 = s5 + Int32(c4)
+        s3 = s4 + Int32(c3)
+        s2 = s3 + Int32(c2)
+        s1 = s2 + Int32(c1)
+        s0 = s1 + Int32(c0)
+        above = s0
+        for distance in cutlass.range_constexpr(5):
+            other = cute.arch.shuffle_sync_down(above, 1 << distance)
+            if tx + Int32(1 << distance) < Int32(32):
+                above += other
+        above -= s0
+        suffix = [
+            s0 + above,
+            s1 + above,
+            s2 + above,
+            s3 + above,
+            s4 + above,
+            s5 + above,
+            s6 + above,
+            s7 + above,
+            above,
+        ]
+        for digit in cutlass.range_constexpr(8):
+            if (suffix[digit] >= remaining) & (suffix[digit + 1] < remaining):
+                _smem_st(thr, Int32(0), tx * Int32(8) + Int32(digit))
+                _smem_st(lr, Int32(0), remaining - suffix[digit + 1])
+    cute.arch.sync_threads()
+    pivot = _smem_ld(thr, Int32(0))
+    remaining = _smem_ld(lr, Int32(0))
+    for slot in cutlass.range_constexpr((max_items + threads - 1) // threads):
+        i = tx + Int32(slot * threads)
+        if i < n_total:
+            key = Uint32(keys[slot])
+            if (key & prefix_mask) == prefix:
+                digit = Int32((key >> Uint32(8)) & Uint32(255))
+                if digit > pivot:
+                    pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                    if pos < topk_static:
+                        s_out[pos] = i
+
+    cute.arch.sync_threads()
+    prefix |= Uint32(pivot) << Uint32(8)
+    prefix_mask |= Uint32(255) << Uint32(8)
+    if tx < Int32(257):
+        s_hist0[tx] = Int32(0)
+    cute.arch.sync_threads()
+    for slot in cutlass.range_constexpr((max_items + threads - 1) // threads):
+        i = tx + Int32(slot * threads)
+        if i < n_total:
+            key = Uint32(keys[slot])
+            if (key & prefix_mask) == prefix:
+                digit = (key >> Uint32(0)) & Uint32(255)
+                _smem_red_add(h0, Int32(digit), Int32(1))
+
+    cute.arch.sync_threads()
+    if tx < Int32(32):
+        base = h0 + tx * Int32(32)
+        c0, c1, c2, c3 = ld_shared_v4_u32(base)
+        c4, c5, c6, c7 = ld_shared_v4_u32(base + Int32(16))
+        s7 = Int32(c7)
+        s6 = s7 + Int32(c6)
+        s5 = s6 + Int32(c5)
+        s4 = s5 + Int32(c4)
+        s3 = s4 + Int32(c3)
+        s2 = s3 + Int32(c2)
+        s1 = s2 + Int32(c1)
+        s0 = s1 + Int32(c0)
+        above = s0
+        for distance in cutlass.range_constexpr(5):
+            other = cute.arch.shuffle_sync_down(above, 1 << distance)
+            if tx + Int32(1 << distance) < Int32(32):
+                above += other
+        above -= s0
+        suffix = [
+            s0 + above,
+            s1 + above,
+            s2 + above,
+            s3 + above,
+            s4 + above,
+            s5 + above,
+            s6 + above,
+            s7 + above,
+            above,
+        ]
+        for digit in cutlass.range_constexpr(8):
+            if (suffix[digit] >= remaining) & (suffix[digit + 1] < remaining):
+                _smem_st(thr, Int32(0), tx * Int32(8) + Int32(digit))
+                _smem_st(lr, Int32(0), remaining - suffix[digit + 1])
+    cute.arch.sync_threads()
+    pivot = _smem_ld(thr, Int32(0))
+    remaining = _smem_ld(lr, Int32(0))
+    for slot in cutlass.range_constexpr((max_items + threads - 1) // threads):
+        i = tx + Int32(slot * threads)
+        if i < n_total:
+            key = Uint32(keys[slot])
+            if (key & prefix_mask) == prefix:
+                digit = Int32((key >> Uint32(0)) & Uint32(255))
+                if digit > pivot:
+                    pos = _smem_xadd(ctr, Int32(0), Int32(1))
+                    if pos < topk_static:
+                        s_out[pos] = i
+                if digit == pivot:
+                    old_rem = _smem_xadd(lr, Int32(0), Int32(-1))
+                    if old_rem > Int32(0):
+                        s_out[topk_static - old_rem] = i
+
+    cute.arch.sync_threads()
+    prefix |= Uint32(pivot) << Uint32(0)
+    prefix_mask |= Uint32(255) << Uint32(0)
+    if cutlass.const_expr(not indices_only):
+        i = Int32(tx)
+        while i < topk_static:
+            sel = Int32(s_out[i])
+            vout_v[i] = Float32(vin_v[sel])
+            vout_g[i] = Int32(vin_g[sel])
+            i += Int32(threads)
 
 
 @cute.jit
@@ -1254,11 +2019,12 @@ def _fused_radix_select(
     ni0: Int32,
     ni1: Int32,
     lr: Int32,
+    threads: cutlass.Constexpr[int] = 1024,
 ):
     """Exact radix top-k of vin[0:n_total] -> vout[0:topk_static] (single source).
 
     Assumes n_total > topk_static (callers only trim when over capacity). Reuses the
-    tiled_topk coarse-8-bit-histogram + byte-refine. All 1024 threads must call this.
+    tiled_topk coarse-8-bit-histogram + byte-refine. All CTA threads must call this.
     """
     topk = topk_static
     if tx < Int32(257):
@@ -1268,17 +2034,17 @@ def _fused_radix_select(
     # and unroll the full-length scan by _SCAN_UNROLL for memory-level parallelism,
     # mirroring tiled_topk's select (this is the rows=1 last-CTA merge hot loop).
     idx_base = Int32(tx)
-    full_scan_limit = n_total - Int32((_SCAN_UNROLL - 1) * _RADIX_THREADS)
+    full_scan_limit = n_total - Int32((_SCAN_UNROLL - 1) * threads)
     while idx_base < full_scan_limit:
         for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
-            sidx = idx_base + Int32(scan_u * _RADIX_THREADS)
+            sidx = idx_base + Int32(scan_u * threads)
             bin8 = _convert_to_uint8(Float32(vin_v[sidx]))
             _smem_red_add(h0, Int32(bin8), Int32(1))
-        idx_base += Int32(_RADIX_THREADS * _SCAN_UNROLL)
+        idx_base += Int32(threads * _SCAN_UNROLL)
     while idx_base < n_total:
         bin8 = _convert_to_uint8(Float32(vin_v[idx_base]))
         _smem_red_add(h0, Int32(bin8), Int32(1))
-        idx_base += Int32(_RADIX_THREADS)
+        idx_base += Int32(threads)
     cute.arch.sync_threads()
     for stage in cutlass.range_constexpr(8):
         j = Int32(1 << stage)
@@ -1316,7 +2082,7 @@ def _fused_radix_select(
             if Int32(bin8) > threshold_bin:
                 pos = _smem_xadd(ctr, Int32(0), Int32(1))
                 s_out[pos] = idx_base
-            idx_base += Int32(_RADIX_THREADS)
+            idx_base += Int32(threads)
 
     if topk != Int32(0):
         cute.arch.sync_threads()
@@ -1324,10 +2090,10 @@ def _fused_radix_select(
             s_hist0[tx] = Int32(0)
         cute.arch.sync_threads()
         idx_base = Int32(tx)
-        full_scan_limit = n_total - Int32((_SCAN_UNROLL - 1) * _RADIX_THREADS)
+        full_scan_limit = n_total - Int32((_SCAN_UNROLL - 1) * threads)
         while idx_base < full_scan_limit:
             for scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
-                sidx = idx_base + Int32(scan_u * _RADIX_THREADS)
+                sidx = idx_base + Int32(scan_u * threads)
                 raw_input = Float32(vin_v[sidx])
                 bin8 = _convert_to_uint8(raw_input)
                 if Int32(bin8) > threshold_bin:
@@ -1341,7 +2107,7 @@ def _fused_radix_select(
                             key32 = _convert_to_uint32(raw_input)
                             sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
                             _smem_red_add(h0, Int32(sub_bin), Int32(1))
-            idx_base += Int32(_RADIX_THREADS * _SCAN_UNROLL)
+            idx_base += Int32(threads * _SCAN_UNROLL)
         while idx_base < n_total:
             raw_input = Float32(vin_v[idx_base])
             bin8 = _convert_to_uint8(raw_input)
@@ -1356,14 +2122,14 @@ def _fused_radix_select(
                         key32 = _convert_to_uint32(raw_input)
                         sub_bin = (key32 >> Uint32(24)) & Uint32(0xFF)
                         _smem_red_add(h0, Int32(sub_bin), Int32(1))
-            idx_base += Int32(_RADIX_THREADS)
+            idx_base += Int32(threads)
         cute.arch.sync_threads()
         # ni0 now holds the FULL threshold-bin candidate count: the xadd ran for every
         # bin-matching key, even past `cands`. Capture it to detect refine overflow.
         bin_count = Int32(_smem_ld(ni0, Int32(0)))
 
         for round_idx in cutlass.range_constexpr(4):
-            if topk != Int32(-1):
+            if topk != Int32(-1) and bin_count <= Int32(cands):
                 r_idx_is_0 = (round_idx % 2) == 0
                 r_idx_next_is_0 = not r_idx_is_0
                 raw_num_input = (
@@ -1418,7 +2184,7 @@ def _fused_radix_select(
                         if Int32(bin) > sub_threshold:
                             pos = _smem_xadd(ctr, Int32(0), Int32(1))
                             s_out[pos] = c_idx
-                        i += Int32(_RADIX_THREADS)
+                        i += Int32(threads)
                     topk = Int32(-1)
 
                 if topk != Int32(-1):
@@ -1461,7 +2227,7 @@ def _fused_radix_select(
                                             key32 >> Uint32(24 - (round_idx + 1) * 8)
                                         ) & Uint32(0xFF)
                                         _smem_red_add(h0, Int32(sub_bin), Int32(1))
-                        i += Int32(_RADIX_THREADS)
+                        i += Int32(threads)
                     cute.arch.sync_threads()
 
     # ---- exact overflow fallback ----
@@ -1496,6 +2262,7 @@ def _fused_radix_select(
             block_k=1,
             is_tiled=False,
             is_first=True,
+            threads=threads,
         )
     cute.arch.sync_threads()
     i = Int32(tx)
@@ -1503,13 +2270,449 @@ def _fused_radix_select(
         sel = Int32(s_out[i])
         vout_v[i] = Float32(vin_v[sel])
         vout_g[i] = Int32(vin_g[sel])
-        i += Int32(_RADIX_THREADS)
+        i += Int32(threads)
+
+
+@cute.jit
+def _mxfp4_order_output_packed_pairs(
+    out_indices,
+    out_values,
+    group_id,
+    ids,
+    vals,
+    tx,
+    count,
+    shared_input: cutlass.Constexpr,
+    cleanup_state: cute.Tensor,
+    cleanup_words: cutlass.Constexpr,
+    threads: cutlass.Constexpr[int] = 1024,
+):
+    cute.arch.sync_threads()
+    if cutlass.const_expr(cleanup_words > 0):
+        if tx >= Int32(256):
+            word = (tx - Int32(256)) * Int32(4)
+            while word < Int32(cleanup_words):
+                st_global_v4_u32(
+                    get_ptr_as_int64(
+                        cleanup_state, _fused_state_offset(group_id, word)
+                    ),
+                    Uint32(0),
+                    Uint32(0),
+                    Uint32(0),
+                    Uint32(0),
+                )
+                word += Int32((threads - 256) * 4)
+    if tx < Int32(256):
+        keys = cute.make_rmem_tensor((2,), Uint32)
+        for item in cutlass.range_constexpr(2):
+            index = tx + Int32(item * 256)
+            key = Uint32(0xFFFFFFFF)
+            if index < count:
+                if cutlass.const_expr(shared_input):
+                    pos = Int32(ids[index])
+                    value = Float32(vals[index])
+                else:
+                    pos = Int32(out_indices[group_id, index])
+                    value = Float32(out_values[group_id, index])
+                if (pos >= Int32(0)) & (value > Float32(float("-inf"))):
+                    key = (Uint32(pos) << Uint32(16)) | (
+                        f32_to_raw_bits(value) >> Uint32(16)
+                    )
+            keys[item] = key
+        cute.arch.barrier(barrier_id=1, number_of_threads=256)
+        for level in cutlass.range_constexpr(1, 10):
+            for stage in cutlass.range_constexpr(level):
+                stride = 1 << (level - 1 - stage)
+                others = cute.make_rmem_tensor((2,), Uint32)
+                if cutlass.const_expr(stride == 256):
+                    others[0] = keys[1]
+                    others[1] = keys[0]
+                elif cutlass.const_expr(stride < 32):
+                    for item in cutlass.range_constexpr(2):
+                        others[item] = cute.arch.shuffle_sync_bfly(
+                            keys[item], offset=stride
+                        )
+                else:
+                    for item in cutlass.range_constexpr(2):
+                        ids[tx + Int32(item * 256)] = Int32(keys[item])
+                    cute.arch.barrier(barrier_id=1, number_of_threads=256)
+                    for item in cutlass.range_constexpr(2):
+                        others[item] = Uint32(
+                            ids[(tx ^ Int32(stride)) + Int32(item * 256)]
+                        )
+                    cute.arch.barrier(barrier_id=1, number_of_threads=256)
+                for item in cutlass.range_constexpr(2):
+                    index = tx + Int32(item * 256)
+                    ascending = (index & Int32(1 << level)) == Int32(0)
+                    lower = (index & Int32(stride)) == Int32(0)
+                    take_min = ascending == lower
+                    key = keys[item]
+                    other = others[item]
+                    if ((key > other) & take_min) | ((key < other) & (not take_min)):
+                        key = other
+                    keys[item] = key
+        for item in cutlass.range_constexpr(2):
+            index = tx + Int32(item * 256)
+            key = keys[item]
+            valid = key != Uint32(0xFFFFFFFF)
+            out_indices[group_id, index] = (
+                Int32(key >> Uint32(16)) if valid else Int32(-1)
+            )
+            out_values[group_id, index] = (
+                u32_as_f32(key << Uint32(16)) if valid else Float32(float("-inf"))
+            )
+
+
+@cute.jit
+def _mxfp4_order_output_packed_vectors(
+    out_indices,
+    out_values,
+    group_id,
+    ids,
+    vals,
+    tx,
+    count,
+    shared_input: cutlass.Constexpr,
+    cleanup_state: cute.Tensor,
+    cleanup_words: cutlass.Constexpr,
+    threads: cutlass.Constexpr[int] = 1024,
+):
+    cute.arch.sync_threads()
+    if cutlass.const_expr(cleanup_words > 0):
+        if tx >= Int32(256):
+            word = (tx - Int32(256)) * Int32(4)
+            while word < Int32(cleanup_words):
+                st_global_v4_u32(
+                    get_ptr_as_int64(
+                        cleanup_state, _fused_state_offset(group_id, word)
+                    ),
+                    Uint32(0),
+                    Uint32(0),
+                    Uint32(0),
+                    Uint32(0),
+                )
+                word += Int32((threads - 256) * 4)
+    if tx < Int32(256):
+        shared_pairs = cute.recast_tensor(ids, Uint64)
+        keys = cute.make_rmem_tensor((2,), Uint32)
+        for item in cutlass.range_constexpr(2):
+            index = tx * Int32(2) + Int32(item)
+            key = Uint32(0xFFFFFFFF)
+            if index < count:
+                if cutlass.const_expr(shared_input):
+                    pos = Int32(ids[index])
+                    value = Float32(vals[index])
+                else:
+                    pos = Int32(out_indices[group_id, index])
+                    value = Float32(out_values[group_id, index])
+                if (pos >= Int32(0)) & (value > Float32(float("-inf"))):
+                    key = (Uint32(pos) << Uint32(16)) | (
+                        f32_to_raw_bits(value) >> Uint32(16)
+                    )
+            keys[item] = key
+        cute.arch.barrier(barrier_id=1, number_of_threads=256)
+        for level in cutlass.range_constexpr(1, 10):
+            for stage in cutlass.range_constexpr(level):
+                stride = 1 << (level - 1 - stage)
+                others = cute.make_rmem_tensor((2,), Uint32)
+                if cutlass.const_expr(stride == 1):
+                    others[0] = keys[1]
+                    others[1] = keys[0]
+                elif cutlass.const_expr(stride < 64):
+                    for item in cutlass.range_constexpr(2):
+                        others[item] = cute.arch.shuffle_sync_bfly(
+                            keys[item], offset=stride // 2
+                        )
+                else:
+                    shared_pairs[tx] = Uint64(keys[0]) | (Uint64(keys[1]) << Uint64(32))
+                    cute.arch.barrier(barrier_id=1, number_of_threads=256)
+                    pair = Uint64(shared_pairs[tx ^ Int32(stride // 2)])
+                    others[0] = Uint32(pair)
+                    others[1] = Uint32(pair >> Uint64(32))
+                    cute.arch.barrier(barrier_id=1, number_of_threads=256)
+                for item in cutlass.range_constexpr(2):
+                    index = tx * Int32(2) + Int32(item)
+                    ascending = (index & Int32(1 << level)) == Int32(0)
+                    lower = (index & Int32(stride)) == Int32(0)
+                    take_min = ascending == lower
+                    key = keys[item]
+                    other = others[item]
+                    if ((key > other) & take_min) | ((key < other) & (not take_min)):
+                        key = other
+                    keys[item] = key
+        key0 = keys[0]
+        key1 = keys[1]
+        valid0 = key0 != Uint32(0xFFFFFFFF)
+        valid1 = key1 != Uint32(0xFFFFFFFF)
+        position0 = key0 >> Uint32(16) if valid0 else Uint32(0xFFFFFFFF)
+        position1 = key1 >> Uint32(16) if valid1 else Uint32(0xFFFFFFFF)
+        value0 = key0 << Uint32(16) if valid0 else Uint32(0xFF800000)
+        value1 = key1 << Uint32(16) if valid1 else Uint32(0xFF800000)
+        offset = Int64(group_id) * Int64(512) + Int64(tx) * Int64(2)
+        st_global_v2_u32(get_ptr_as_int64(out_indices, offset), position0, position1)
+        st_global_v2_u32(get_ptr_as_int64(out_values, offset), value0, value1)
+
+
+@cute.jit
+def _mxfp4_order_output(
+    out_indices,
+    out_values,
+    group_id,
+    ids,
+    vals,
+    tx,
+    count,
+    shared_input: cutlass.Constexpr,
+    cleanup_state: cute.Tensor,
+    cleanup_words: cutlass.Constexpr,
+    position_capacity: cutlass.Constexpr,
+    vector_output_pairs: cutlass.Constexpr,
+    threads: cutlass.Constexpr[int] = 1024,
+):
+    if cutlass.const_expr(position_capacity <= 65536):
+        if cutlass.const_expr(vector_output_pairs):
+            _mxfp4_order_output_packed_vectors(
+                out_indices,
+                out_values,
+                group_id,
+                ids,
+                vals,
+                tx,
+                count,
+                shared_input,
+                cleanup_state,
+                cleanup_words,
+                threads=threads,
+            )
+        else:
+            _mxfp4_order_output_packed_pairs(
+                out_indices,
+                out_values,
+                group_id,
+                ids,
+                vals,
+                tx,
+                count,
+                shared_input,
+                cleanup_state,
+                cleanup_words,
+                threads=threads,
+            )
+    else:
+        _mxfp4_order_output_full(
+            out_indices,
+            out_values,
+            group_id,
+            ids,
+            vals,
+            tx,
+            count,
+            shared_input,
+            cleanup_state,
+            cleanup_words,
+            threads=threads,
+        )
+
+
+@cute.jit
+def _mxfp4_order_output_full(
+    out_indices,
+    out_values,
+    group_id,
+    ids,
+    vals,
+    tx,
+    count,
+    shared_input: cutlass.Constexpr,
+    cleanup_state: cute.Tensor,
+    cleanup_words: cutlass.Constexpr,
+    threads: cutlass.Constexpr[int] = 1024,
+):
+    cute.arch.sync_threads()
+    if cutlass.const_expr(threads > 512):
+        if cutlass.const_expr(cleanup_words > 0):
+            if tx >= Int32(512):
+                word = (tx - Int32(512)) * Int32(4)
+                while word < Int32(cleanup_words):
+                    st_global_v4_u32(
+                        get_ptr_as_int64(
+                            cleanup_state, _fused_state_offset(group_id, word)
+                        ),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                    )
+                    word += Int32((threads - 512) * 4)
+    if tx < Int32(512):
+        pos = Int32(2147483647)
+        value = Float32(float("-inf"))
+        if tx < count:
+            if cutlass.const_expr(shared_input):
+                raw = Int32(ids[tx])
+                value = Float32(vals[tx])
+            else:
+                raw = Int32(out_indices[group_id, tx])
+                value = Float32(out_values[group_id, tx])
+            if (raw >= Int32(0)) & (value > Float32(float("-inf"))):
+                pos = raw
+        cute.arch.barrier(barrier_id=1, number_of_threads=512)
+        for level in cutlass.range_constexpr(1, 10):
+            for stage in cutlass.range_constexpr(level):
+                stride = 1 << (level - 1 - stage)
+                other_pos = Int32(2147483647)
+                other_value = Float32(float("-inf"))
+                if cutlass.const_expr(stride < 32):
+                    other_pos = cute.arch.shuffle_sync_bfly(pos, offset=stride)
+                    other_value = cute.arch.shuffle_sync_bfly(value, offset=stride)
+                else:
+                    if tx < Int32(512):
+                        ids[tx] = pos
+                        vals[tx] = value
+                    cute.arch.barrier(barrier_id=1, number_of_threads=512)
+                    if tx < Int32(512):
+                        other_pos = Int32(ids[tx ^ Int32(stride)])
+                        other_value = Float32(vals[tx ^ Int32(stride)])
+                    cute.arch.barrier(barrier_id=1, number_of_threads=512)
+                ascending = (tx & Int32(1 << level)) == Int32(0)
+                lower = (tx & Int32(stride)) == Int32(0)
+                take_min = ascending == lower
+                if ((pos > other_pos) & take_min) | (
+                    (pos < other_pos) & (not take_min)
+                ):
+                    pos = other_pos
+                    value = other_value
+        if tx < Int32(512):
+            valid = pos != Int32(2147483647)
+            out_indices[group_id, tx] = pos if valid else Int32(-1)
+            out_values[group_id, tx] = value if valid else Float32(float("-inf"))
+    if cutlass.const_expr(threads == 512 and cleanup_words > 0):
+        cute.arch.sync_threads()
+        word = tx * Int32(4)
+        while word < Int32(cleanup_words):
+            st_global_v4_u32(
+                get_ptr_as_int64(cleanup_state, _fused_state_offset(group_id, word)),
+                Uint32(0),
+                Uint32(0),
+                Uint32(0),
+                Uint32(0),
+            )
+            word += Int32(threads * 4)
+
+
+def _check_mxfp4_cooperative_residency(
+    kernel, launcher, *, num_rows: int, num_sms: int
+) -> int:
+    """Validate the resolved current-device launcher before warmup or capture."""
+    from b12x._lib.compile_plan import DeferredCuTeKernel
+    from b12x.preparation.types import CandidateResourceIneligibleError
+
+    if not kernel.mxfp4 or num_rows < 1 or num_sms < 1:
+        raise ValueError("MXFP4 residency requires positive row and SM counts")
+    if isinstance(launcher, DeferredCuTeKernel):
+        raise RuntimeError("MXFP4 residency requires a resolved executable")
+    executable = getattr(launcher, "_executable", None)
+    if executable is None or not executable.kernel_info:
+        raise RuntimeError("MXFP4 compiled kernel metadata is unavailable")
+    shared_bytes = kernel._get_shared_storage_cls().__sizeof__()
+    launch_threads = kernel.radix_threads
+    if kernel.mxfp4_small_output:
+        launch_threads = 512 if kernel.score_width == kernel.topk else 1024
+        shared_bytes = 512 * 8
+    library = cuda.CUlibrary(int(executable.library))
+    capacity = None
+    for name in executable.kernel_info:
+        status, compiled_kernel = cuda.cuLibraryGetKernel(library, name.encode())
+        if status != cuda.CUresult.CUDA_SUCCESS:
+            raise RuntimeError("cannot resolve MXFP4 kernel resources")
+        status, function = cuda.cuKernelGetFunction(compiled_kernel)
+        if status != cuda.CUresult.CUDA_SUCCESS:
+            raise RuntimeError("cannot query MXFP4 kernel resources")
+        status, resident = cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            function, launch_threads, shared_bytes
+        )
+        if status != cuda.CUresult.CUDA_SUCCESS:
+            raise RuntimeError("cannot query MXFP4 kernel occupancy")
+        capacity = resident if capacity is None else min(capacity, resident)
+    if capacity < 1:
+        raise CandidateResourceIneligibleError(
+            "MXFP4 kernel has no resident CUDA blocks"
+        )
+    cooperative = (
+        kernel.merge_in_kernel and kernel.max_seq_capacity > kernel.merge_threshold
+    )
+    if cooperative:
+        budget = min(capacity, kernel.coop_resident_blocks)
+        if num_rows * kernel.ctas_per_group > num_sms * budget:
+            raise CandidateResourceIneligibleError(
+                "cooperative MXFP4 grid exceeds compiled kernel residency"
+            )
+    return capacity
+
+
+@cute.jit
+def _mxfp4_order_small_output(
+    out_indices,
+    out_values,
+    group_id,
+    ids,
+    vals,
+    tx,
+    count,
+    register_input: tuple | None = None,
+):
+    if cutlass.const_expr(register_input is None):
+        cute.arch.sync_threads()
+    if tx < Int32(512):
+        pos = Int32(2147483647)
+        value = Float32(float("-inf"))
+        raw = Int32(-1)
+        if cutlass.const_expr(register_input is None):
+            if tx < count:
+                raw = Int32(ids[tx])
+                value = Float32(vals[tx])
+        else:
+            raw = Int32(register_input[0])
+            value = Float32(register_input[1])
+        if (raw >= Int32(0)) & (value > Float32(float("-inf"))):
+            pos = raw
+        if cutlass.const_expr(register_input is None):
+            cute.arch.barrier(barrier_id=1, number_of_threads=512)
+        for level in cutlass.range_constexpr(1, 10):
+            for stage in cutlass.range_constexpr(level):
+                stride = 1 << (level - 1 - stage)
+                other_pos = Int32(2147483647)
+                other_value = Float32(float("-inf"))
+                if cutlass.const_expr(stride < 32):
+                    other_pos = cute.arch.shuffle_sync_bfly(pos, offset=stride)
+                    other_value = cute.arch.shuffle_sync_bfly(value, offset=stride)
+                else:
+                    if tx < Int32(512):
+                        ids[tx] = pos
+                        vals[tx] = value
+                    cute.arch.barrier(barrier_id=1, number_of_threads=512)
+                    if tx < Int32(512):
+                        other_pos = Int32(ids[tx ^ Int32(stride)])
+                        other_value = Float32(vals[tx ^ Int32(stride)])
+                    cute.arch.barrier(barrier_id=1, number_of_threads=512)
+                ascending = (tx & Int32(1 << level)) == Int32(0)
+                lower = (tx & Int32(stride)) == Int32(0)
+                take_min = ascending == lower
+                if ((pos > other_pos) & take_min) | (
+                    (pos < other_pos) & (not take_min)
+                ):
+                    pos = other_pos
+                    value = other_value
+        if tx < Int32(512):
+            valid = pos != Int32(2147483647)
+            out_indices[group_id, tx] = pos if valid else Int32(-1)
+            out_values[group_id, tx] = value if valid else Float32(float("-inf"))
 
 
 class DSAFusedIndexerKernel:
     """Fused DSA indexer: score a query row's K slice and select its top-k.
 
-    One 1024-thread CTA per (row, slice). ``ctas_per_group`` CTAs split a
+    One CTA per (row, slice). ``ctas_per_group`` CTAs split a
     row's pages; each scores its slice and the group merges across CTAs.
 
     Score phase (paged): 64-token pages stream through a 3-stage cp.async
@@ -1522,12 +2725,14 @@ class DSAFusedIndexerKernel:
     back to ``topk`` when it would overflow, so the trim runs once per
     batch of pages rather than per page.
 
-    Merge phase (``ctas_per_group > 1``): a group whose live length exceeds
-    ``merge_threshold`` selects the final top-k cooperatively with three
-    grid-barrier radix rounds (12, 12, and 8 key bits) over the CTAs'
-    carries; otherwise every CTA packs its carry into a global slab and the
-    last CTA to arrive radix-selects the row. Both arms self-reset their
-    group state for the next launch or graph replay.
+    Merge phase (``ctas_per_group > 1``): groups above ``merge_threshold``
+    select cooperatively; smaller groups pack their carries into a global slab
+    for last-CTA selection. FP8 uses 12/12/8-bit cooperative refinement; MXFP4
+    defaults to two 8-bit rounds. Explicit MXFP4 16-bit refinement publishes a
+    full BF16 histogram in one barrier, with full-word or bounded halfword
+    counts and list or bitmap cleanup. Its prepared layout applies to every
+    live length. Statically serial MXFP4 groups may use two-counter state.
+    Every merge arm resets its state before the next launch or graph replay.
     """
 
     def __init__(
@@ -1546,10 +2751,41 @@ class DSAFusedIndexerKernel:
         vectorized_q_load: bool = False,
         q_row_stride_bytes: int = 0,
         mxfp4: bool = False,
+        mxfp4_small_output: bool = False,
+        mxfp4_warp_weights: bool = False,
+        mxfp4_aligned_q: bool = False,
         candidates: bool = False,
         page_size: int = 64,
         score_width: int = 0,
+        ordered_output: bool = False,
+        output_position_capacity: int = 1 << 31,
+        state_reset_pdl: bool = False,
+        vector_output_pairs: bool = False,
+        tile_schedule: str = "contiguous",
+        grid_layout: str = "flat",
+        mxfp4_query_offset_mode: int | None = None,
+        mxfp4_unsigned_candidate_pages: bool | None = None,
+        mxfp4_merge_bits: int = 8,
+        mxfp4_histogram_count_bits: int = 16,
+        mxfp4_histogram_bitmap: bool = False,
+        mxfp4_serial_state_words: int = _COOP_STATE_WORDS,
+        mxfp4_partition_count: int = 1,
+        mxfp4_score_batch_tiles: int | None = None,
+        mxfp4_cutoff_strategy: str | None = None,
+        mxfp4_threads: int = 1024,
+        mxfp4_score_passes: int = 1,
+        mxfp4_coop_residency: int = 1,
+        mxfp4_compact_shared: bool = False,
     ):
+        self.constructor_config = tuple(
+            (name, value) for name, value in locals().items() if name != "self"
+        )
+        if tile_schedule not in ("contiguous", "cyclic"):
+            raise ValueError("tile_schedule must be contiguous or cyclic")
+        if grid_layout not in ("flat", "row_major", "slice_major"):
+            raise ValueError("grid_layout must be flat, row_major, or slice_major")
+        self.tile_schedule = tile_schedule
+        self.grid_layout = grid_layout
         self.num_heads_static = int(num_heads_static)
         self.topk = int(topk)
         self.kv_layout = int(kv_layout)
@@ -1559,10 +2795,56 @@ class DSAFusedIndexerKernel:
         self.vectorized_q_load = bool(vectorized_q_load)
         self.q_row_stride_bytes = int(q_row_stride_bytes)
         self.mxfp4 = bool(mxfp4)
+        self.mxfp4_small_output = bool(mxfp4_small_output)
+        if self.mxfp4_small_output and (
+            not self.mxfp4 or int(score_width) > self.topk or self.ctas_per_group != 1
+        ):
+            raise ValueError(
+                "small MXFP4 output requires one CTA and capacity at most topk"
+            )
+        self.mxfp4_warp_weights = bool(mxfp4 and mxfp4_warp_weights)
+        self.mxfp4_aligned_q = bool(mxfp4 and mxfp4_aligned_q)
+        self.radix_threads = int(mxfp4_threads) if self.mxfp4 else _RADIX_THREADS
+        self.mxfp4_score_passes = int(mxfp4_score_passes) if self.mxfp4 else 1
+        self.coop_resident_blocks = int(mxfp4_coop_residency) if self.mxfp4 else 1
+        self.mxfp4_compact_shared = self.mxfp4 and bool(mxfp4_compact_shared)
+        if self.mxfp4:
+            if self.radix_threads not in (512, 1024):
+                raise ValueError("MXFP4 block size must be 512 or 1024 threads")
+            if self.mxfp4_score_passes < 1:
+                raise ValueError("MXFP4 score passes must be positive")
+            if self.coop_resident_blocks not in (1, 2):
+                raise ValueError("MXFP4 residency must be one or two blocks")
+            if self.coop_resident_blocks == 2 and self.radix_threads != 512:
+                raise ValueError("two-block MXFP4 residency requires 512 threads")
+        self.mxfp4_chunk = self.radix_threads // 2
+        self.mxfp4_score_group = self.mxfp4_chunk * self.mxfp4_score_passes
         self.candidates = bool(candidates)
         self.page_size = int(page_size)
         self.score_width = int(score_width)
+        self.ordered_output = bool(ordered_output)
+        self.output_position_capacity = int(output_position_capacity)
+        self.state_reset_pdl = bool(state_reset_pdl)
+        self.vector_output_pairs = bool(vector_output_pairs)
+        self.mxfp4_merge_bits = int(mxfp4_merge_bits)
+        self.mxfp4_histogram_count_bits = int(mxfp4_histogram_count_bits)
+        self.mxfp4_histogram_bitmap = bool(mxfp4_histogram_bitmap)
+        self.mxfp4_serial_state_words = int(mxfp4_serial_state_words)
+        self.mxfp4_query_offset_mode = 0
+        self.mxfp4_unsigned_candidate_pages = False
         if self.mxfp4:
+            self.mxfp4_query_offset_mode = (
+                (1 if self.candidates and self.score_width > self.topk else 0)
+                if mxfp4_query_offset_mode is None
+                else int(mxfp4_query_offset_mode)
+            )
+            if self.mxfp4_query_offset_mode not in (0, 1, 2):
+                raise ValueError("MXFP4 query offset mode must be 0, 1, or 2")
+            self.mxfp4_unsigned_candidate_pages = (
+                False
+                if mxfp4_unsigned_candidate_pages is None
+                else bool(mxfp4_unsigned_candidate_pages)
+            )
             from .mxfp4 import _TensorCorePagedScore
 
             if (
@@ -1605,7 +2887,7 @@ class DSAFusedIndexerKernel:
         # 4-warp / page_splits-deep sequential loop. token_groups covers the page
         # (8 tokens/group => 8 groups) bounded by warps available after head-tiling.
         # heads=16 (tiles=1): 8 warps; heads=32 (tiles=2): 16; heads=64 (tiles=4): 32.
-        total_warps = _RADIX_THREADS // _WARP_THREADS
+        total_warps = self.radix_threads // _WARP_THREADS
         self.token_groups = min(
             _PAGE_SIZE // _PAGED_TOKENS_PER_GROUP,  # 8 => one pass over the page
             total_warps // self.num_q_head_tiles,  # warps free after head-tiling
@@ -1639,38 +2921,147 @@ class DSAFusedIndexerKernel:
             topk=self.topk,
         )
         if self.mxfp4:
-            batch_slack = 1024
+            batch_slack = 1536
         self.carry_cap = int(self.topk) + int(batch_slack)
-        # The trim radix runs over <= carry_cap elements, so its threshold-bin
-        # candidate set is bounded by carry_cap -> size cand0/cand1 to that.
-        self.cands = self.carry_cap
+        self.mxfp4_carry_slots = (
+            self.carry_cap + self.radix_threads - 1
+        ) // self.radix_threads
+        if self.mxfp4 and self.mxfp4_score_group > self.carry_cap - self.topk:
+            raise ValueError("MXFP4 score group exceeds carry append capacity")
+        # MXFP4 trims rescan the carry rather than buffer pivot candidates.
+        # Other encodings retain enough candidate slots for a full carry.
+        self.cands = 512 if self.mxfp4 else self.carry_cap
+        self.selection_groups = int(mxfp4_partition_count)
+        if self.selection_groups != 1 and self.tile_schedule != "contiguous":
+            raise ValueError("private MXFP4 carries require contiguous tile scheduling")
+        if self.selection_groups != 1 and self.mxfp4_compact_shared:
+            raise ValueError("private MXFP4 carries require their full shared layout")
+        if self.selection_groups != 1 and self.mxfp4_small_output:
+            raise ValueError("small MXFP4 output requires one carry partition")
+        if self.selection_groups != 1 and self.mxfp4_score_passes != 1:
+            raise ValueError("private MXFP4 carries use score batch tiles")
+        if self.selection_groups not in (1, 2, 4):
+            raise ValueError("MXFP4 partition count must be 1, 2, or 4")
+        if self.selection_groups != 1 and (
+            not self.mxfp4 or self.num_heads_static != 32 or self.radix_threads != 1024
+        ):
+            raise ValueError("private MXFP4 carries require 32 heads and 1024 threads")
+        self.mxfp4_score_batch_tiles = (
+            (1 if self.selection_groups == 1 else 2)
+            if mxfp4_score_batch_tiles is None
+            else int(mxfp4_score_batch_tiles)
+        )
+        if self.mxfp4_score_batch_tiles not in (1, 2) or (
+            self.selection_groups == 1 and self.mxfp4_score_batch_tiles != 1
+        ):
+            raise ValueError("paired score tiles require private MXFP4 carries")
+        max_cta_span = (
+            (self.score_width + _PAGE_SIZE * self.ctas_per_group - 1)
+            // (_PAGE_SIZE * self.ctas_per_group)
+        ) * _PAGE_SIZE
+        self.mxfp4_cutoff_strategy = mxfp4_cutoff_strategy
+        if self.mxfp4_cutoff_strategy is None:
+            self.mxfp4_cutoff_strategy = (
+                "shared_compact"
+                if self.selection_groups == 4 and max_cta_span >= 32768
+                else "local"
+            )
+        if self.mxfp4_cutoff_strategy not in ("local", "shared", "shared_compact") or (
+            self.selection_groups != 4 and self.mxfp4_cutoff_strategy != "local"
+        ):
+            raise ValueError("shared cutoff strategies require four MXFP4 partitions")
+        self.mxfp4_share_cutoff = self.mxfp4_cutoff_strategy != "local"
+        if self.selection_groups == 2:
+            self.carry_cap = 2 * (1024 if self.mxfp4_score_batch_tiles == 1 else 1536)
+            self.cands = 2048
+        elif self.selection_groups == 4:
+            self.carry_cap = 4 * (896 if self.mxfp4_score_batch_tiles == 1 else 1024)
+            self.cands = 1
+        if (
+            self.selection_groups != 1
+            and self._get_shared_storage_cls().size_in_bytes() > 101376
+        ):
+            raise ValueError(
+                "private MXFP4 carries exceed the SM120 shared-memory limit"
+            )
         # In-kernel cross-CTA merge (ctas_per_group > 1): each CTA atomically
         # packs its REAL local candidates into a per-group global slab of
         # capacity ctas_per_group * topk; the last-arriving CTA radix-selects the
         # final top-k over the packed reals (no host merge launch).
         self.merge_in_kernel = self.ctas_per_group > 1
-        # Cooperative grid-barrier merge (_fused_group_barrier) spins until every one of
-        # the group's ctas_per_group CTAs has arrived, so they must all be co-resident
-        # at once. This kernel launches one CTA per SM (1024 threads + min_blocks_per_mp
-        # =1), so a group larger than the SM count can never be fully resident and the
-        # barrier deadlocks the device. When that happens, drop to the serial last-CTA
-        # arm, which packs to a global slab and exits (no barrier) and therefore
-        # tolerates arbitrary grid oversubscription. num_sms <= 0 means "unknown" and
-        # applies no guard (the ctas=1 FLAT path and direct constructions).
+        # Cooperative groups need a proven resident grid. Preparation checks
+        # the resolved launcher's occupancy before using this budget.
         self.num_sms = int(num_sms)
-        self.coop_co_resident = self.num_sms <= 0 or self.ctas_per_group <= self.num_sms
+        self.coop_co_resident = (
+            self.num_sms <= 0
+            or self.ctas_per_group <= self.num_sms * self.coop_resident_blocks
+        )
         self.coop_merge_possible = (
             self.merge_in_kernel
             and self.max_seq_capacity > self.merge_threshold
             and self.coop_co_resident
         )
         self.pack_cap = self.ctas_per_group * int(self.topk)
-        # Both cross-CTA merge arms are compiled and chosen at runtime per group by
-        # seq_len vs merge_threshold (see the merge dispatch). Both index the
-        # per-group _COOP_STATE_WORDS state block, and the last-CTA arm also needs
-        # the global pack slab, so size state at _COOP_STATE_WORDS whenever the
-        # in-kernel merge is active.
-        self.state_words_per_group = _COOP_STATE_WORDS if self.merge_in_kernel else 2
+        # Compact counters require a statically serial group. One-pass histograms
+        # use their own arena for every live length, including empty groups.
+        if self.mxfp4:
+            if self.mxfp4_merge_bits not in (8, 16):
+                raise ValueError("MXFP4 cooperative radix width must be 8 or 16")
+            if self.mxfp4_serial_state_words not in (2, _COOP_STATE_WORDS):
+                raise ValueError(
+                    "MXFP4 serial state requires 2 or 8968 words per group"
+                )
+            if self.coop_merge_possible and self.mxfp4_merge_bits == 16:
+                if self.mxfp4_histogram_count_bits not in (16, 32):
+                    raise ValueError("BF16 histogram counts must use 16 or 32 bits")
+                if (
+                    self.mxfp4_histogram_bitmap
+                    and self.mxfp4_histogram_count_bits != 16
+                ):
+                    raise ValueError(
+                        "bitmap cleanup is defined for packed 16-bit counts"
+                    )
+                if self.mxfp4_histogram_count_bits == 16 and self.pack_cap > 8192:
+                    raise ValueError(
+                        "packed BF16 histograms require at most 8192 published candidates"
+                    )
+                if self.pack_cap >= 2**31:
+                    raise ValueError("BF16 histogram candidate totals must fit int32")
+        self.mxfp4_histogram_fine_words = (
+            65536 if self.mxfp4_histogram_count_bits == 32 else 32768
+        )
+        self.mxfp4_histogram_active_cap = min(
+            self.mxfp4_histogram_fine_words, self.pack_cap
+        )
+        self.mxfp4_histogram_state_words = (
+            self.mxfp4_histogram_fine_words
+            + _RADIX
+            + 8
+            + (
+                self.mxfp4_histogram_fine_words // 32
+                if self.mxfp4_histogram_bitmap
+                else self.mxfp4_histogram_active_cap
+            )
+        )
+        self.state_words_per_group = (
+            2
+            if not self.merge_in_kernel
+            else self.mxfp4_serial_state_words
+            if self.mxfp4 and not self.coop_merge_possible
+            else self.mxfp4_histogram_state_words
+            if self.mxfp4 and self.mxfp4_merge_bits == 16
+            else _COOP_STATE_WORDS
+        )
+
+    def merge_scratch_elements(self, num_groups: int) -> tuple[int, int]:
+        """Return pack-slab and int32-state element counts for caller-owned storage."""
+        if int(num_groups) <= 0:
+            raise ValueError("merge groups must be positive")
+        if not self.merge_in_kernel:
+            return 1, 2
+        return int(num_groups) * self.pack_cap, int(
+            num_groups
+        ) * self.state_words_per_group
 
     def _get_shared_storage_cls(self):
         return _fused_indexer_shared_storage_cls(
@@ -1680,6 +3071,10 @@ class DSAFusedIndexerKernel:
             self.topk,
             self.carry_cap,
             self.cands,
+            self.selection_groups,
+            self.mxfp4_score_batch_tiles,
+            compact=self.mxfp4_compact_shared,
+            preserve_histogram=self.mxfp4_compact_shared and self.coop_merge_possible,
         )
 
     @cute.jit
@@ -1701,29 +3096,246 @@ class DSAFusedIndexerKernel:
         stream: cuda.CUstream,
         mxfp4_operands: tuple = (),
     ):
-        self.kernel(
-            q_bytes,
-            weights,
-            k_quant_bytes,
-            k_scales,
-            real_page_table,
-            seqlens_per_query,
-            k_start,
-            k_end,
+        if cutlass.const_expr(self.mxfp4_small_output):
+            if cutlass.const_expr(self.score_width == self.topk):
+                self.register_all_keys_kernel(
+                    q_bytes,
+                    weights,
+                    k_quant_bytes,
+                    real_page_table,
+                    seqlens_per_query,
+                    out_indices,
+                    out_values,
+                    merge_state,
+                    mxfp4_operands,
+                ).launch(
+                    grid=(q_bytes.shape[0], 1, 1), block=(512, 1, 1), stream=stream
+                )
+            else:
+                self.ordered_all_keys_kernel(
+                    q_bytes,
+                    weights,
+                    k_quant_bytes,
+                    real_page_table,
+                    seqlens_per_query,
+                    out_indices,
+                    out_values,
+                    merge_state,
+                    mxfp4_operands,
+                ).launch(
+                    grid=(q_bytes.shape[0], 1, 1), block=(1024, 1, 1), stream=stream
+                )
+        else:
+            grid = (q_bytes.shape[0] * self.ctas_per_group, 1, 1)
+            if cutlass.const_expr(self.mxfp4 and self.grid_layout == "row_major"):
+                grid = (self.ctas_per_group, q_bytes.shape[0], 1)
+            elif cutlass.const_expr(self.mxfp4 and self.grid_layout == "slice_major"):
+                grid = (q_bytes.shape[0], self.ctas_per_group, 1)
+            self.kernel(
+                q_bytes,
+                weights,
+                k_quant_bytes,
+                k_scales,
+                real_page_table,
+                seqlens_per_query,
+                k_start,
+                k_end,
+                out_indices,
+                out_values,
+                pack_values,
+                pack_indices,
+                merge_state,
+                mxfp4_operands,
+            ).launch(
+                grid=grid,
+                block=[self.radix_threads, 1, 1],
+                # The 1024-thread radix CTA is architecturally limited to one
+                # resident block on SM120 (1536 threads/SM).  The cooperative
+                # planner also caps the default launch to one machine-wide wave.
+                min_blocks_per_mp=self.coop_resident_blocks,
+                stream=stream,
+                use_pdl=self.state_reset_pdl,
+            )
+
+    @cute.kernel
+    def ordered_all_keys_kernel(
+        self,
+        q_bytes: cute.Tensor,
+        weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
+        real_page_table: cute.Tensor,
+        seqlens_per_query: cute.Tensor,
+        out_indices: cute.Tensor,
+        out_values: cute.Tensor,
+        merge_state: cute.Tensor,
+        mxfp4_operands: tuple,
+    ):
+        """Score and order keys within a single prepared top-k CTA."""
+        tx, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        if (row == Int32(0)) & (tx == Int32(0)):
+            merge_state[Int64(0)] = Int32(0)
+            merge_state[Int64(1)] = Int32(0)
+        smem = cutlass.utils.SmemAllocator()
+        ids = smem.allocate_tensor(Int32, cute.make_layout((512,)), byte_alignment=16)
+        vals = smem.allocate_tensor(
+            Float32, cute.make_layout((512,)), byte_alignment=16
+        )
+        page_row_stride = Int64(real_page_table.stride[0])
+        if real_page_table.shape[0] == Int32(1):
+            page_row_stride = Int64(0)
+        q_flat = cute.make_tensor(
+            q_bytes.iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        qs_flat = cute.make_tensor(
+            mxfp4_operands[0].iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        weights_flat = cute.make_tensor(
+            weights.iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        pool_flat = cute.make_tensor(
+            k_quant_bytes.iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        pages_flat = cute.make_tensor(
+            real_page_table.iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        candidates_flat = cute.make_tensor(
+            mxfp4_operands[2].iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        if tx < Int32(512):
+            ids[tx] = Int32(-1)
+            vals[tx] = Float32(-float("inf"))
+        cute.arch.sync_threads()
+        tile_start = Int32(0)
+        while tile_start < Int32(self.topk):
+            if tile_start < Int32(mxfp4_operands[4]):
+                self.mxfp4_scorer._score_tile_fused(
+                    q_flat,
+                    qs_flat,
+                    weights_flat,
+                    pool_flat,
+                    pages_flat,
+                    seqlens_per_query,
+                    mxfp4_operands[1],
+                    candidates_flat,
+                    mxfp4_operands[3],
+                    vals,
+                    Int32(q_bytes.shape[0]),
+                    Int32(mxfp4_operands[4]),
+                    Int32(real_page_table.shape[1]),
+                    page_row_stride,
+                    Int64(k_quant_bytes.stride[0]),
+                    Int64(k_quant_bytes.shape[0]),
+                    tile_start,
+                    row_index=Int32(row),
+                    logical_indices=ids,
+                    local_output=True,
+                    output_base=tile_start,
+                    output_width=self.topk,
+                    aligned_q=self.mxfp4_aligned_q,
+                )
+            elif tx < Int32(512):
+                column = Int64(tile_start) + Int64(tx)
+                ids[column] = Int32(-1)
+                vals[column] = Float32(-float("inf"))
+            tile_start += Int32(512)
+
+        _mxfp4_order_small_output(
+            out_indices, out_values, Int32(row), ids, vals, Int32(tx), Int32(512)
+        )
+
+    @cute.kernel
+    def register_all_keys_kernel(
+        self,
+        q_bytes: cute.Tensor,
+        weights: cute.Tensor,
+        k_quant_bytes: cute.Tensor,
+        real_page_table: cute.Tensor,
+        seqlens_per_query: cute.Tensor,
+        out_indices: cute.Tensor,
+        out_values: cute.Tensor,
+        merge_state: cute.Tensor,
+        mxfp4_operands: tuple,
+    ):
+        """Feed warp-remapped score registers directly into logical ordering."""
+        tx, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        if (row == Int32(0)) & (tx == Int32(0)):
+            merge_state[Int64(0)] = Int32(0)
+            merge_state[Int64(1)] = Int32(0)
+        smem = cutlass.utils.SmemAllocator()
+        ids = smem.allocate_tensor(Int32, cute.make_layout((512,)), byte_alignment=16)
+        vals = smem.allocate_tensor(
+            Float32, cute.make_layout((512,)), byte_alignment=16
+        )
+        page_row_stride = Int64(real_page_table.stride[0])
+        if real_page_table.shape[0] == Int32(1):
+            page_row_stride = Int64(0)
+        q_flat = cute.make_tensor(
+            q_bytes.iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        qs_flat = cute.make_tensor(
+            mxfp4_operands[0].iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        weights_flat = cute.make_tensor(
+            weights.iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        pool_flat = cute.make_tensor(
+            k_quant_bytes.iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        pages_flat = cute.make_tensor(
+            real_page_table.iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        candidates_flat = cute.make_tensor(
+            mxfp4_operands[2].iterator, cute.make_layout((Int64(1) << Int64(40),))
+        )
+        a0, a1, b0, b1, ag0, ag1, bg0, bg1 = (
+            self.mxfp4_scorer._score_tiles_direct_register(
+                q_flat,
+                qs_flat,
+                weights_flat,
+                pool_flat,
+                pages_flat,
+                seqlens_per_query,
+                mxfp4_operands[1],
+                candidates_flat,
+                mxfp4_operands[3],
+                Int32(mxfp4_operands[4]),
+                Int32(real_page_table.shape[1]),
+                page_row_stride,
+                Int64(k_quant_bytes.stride[0]),
+                Int64(k_quant_bytes.shape[0]),
+                Int32(0),
+                Int32(row),
+                aligned_q=self.mxfp4_aligned_q,
+            )
+        )
+        lane = Int32(tx) % Int32(32)
+        source_lane = (lane % Int32(8)) * Int32(4)
+        a0 = cute.arch.shuffle_sync(a0, source_lane)
+        a1 = cute.arch.shuffle_sync(a1, source_lane)
+        ag0 = cute.arch.shuffle_sync(ag0, source_lane)
+        ag1 = cute.arch.shuffle_sync(ag1, source_lane)
+        b0 = cute.arch.shuffle_sync(b0, source_lane)
+        b1 = cute.arch.shuffle_sync(b1, source_lane)
+        bg0 = cute.arch.shuffle_sync(bg0, source_lane)
+        bg1 = cute.arch.shuffle_sync(bg1, source_lane)
+        first_part = lane % Int32(16) < Int32(8)
+        a_value = a0 if first_part else a1
+        b_value = b0 if first_part else b1
+        a_index = ag0 if first_part else ag1
+        b_index = bg0 if first_part else bg1
+        value = a_value if lane < Int32(16) else b_value
+        logical_id = a_index if lane < Int32(16) else b_index
+        _mxfp4_order_small_output(
             out_indices,
             out_values,
-            pack_values,
-            pack_indices,
-            merge_state,
-            mxfp4_operands,
-        ).launch(
-            grid=(q_bytes.shape[0] * self.ctas_per_group, 1, 1),
-            block=[_RADIX_THREADS, 1, 1],
-            # The 1024-thread radix CTA is architecturally limited to one
-            # resident block on SM120 (1536 threads/SM).  The cooperative
-            # planner also caps the default launch to one machine-wide wave.
-            min_blocks_per_mp=1,
-            stream=stream,
+            Int32(row),
+            ids,
+            vals,
+            Int32(tx),
+            Int32(512),
+            register_input=(logical_id, value),
         )
 
     @cute.kernel
@@ -1745,14 +3357,21 @@ class DSAFusedIndexerKernel:
         mxfp4_operands: tuple = (),
     ):
         tx, _, _ = cute.arch.thread_idx()
-        bid, _, _ = cute.arch.block_idx()
+        bid, bid_y, _ = cute.arch.block_idx()
         bid = Int32(bid)
         # Relay: ctas_per_group CTAs cooperate on one row (group). Each owns a
         # page-slice and emits a LOCAL top-k into candidate[cta_in_group, group, :];
         # the host merges the per-CTA partials. ctas_per_group==1 => single-CTA.
         ctas_pg = Int32(self.ctas_per_group)
-        group_id = bid // ctas_pg
-        cta_in_group = bid - group_id * ctas_pg
+        if cutlass.const_expr(self.mxfp4 and self.grid_layout == "slice_major"):
+            group_id = bid
+            cta_in_group = Int32(bid_y)
+        elif cutlass.const_expr(self.mxfp4 and self.grid_layout == "row_major"):
+            group_id = Int32(bid_y)
+            cta_in_group = bid
+        else:
+            group_id = bid // ctas_pg
+            cta_in_group = bid - group_id * ctas_pg
         q_idx = group_id
         lane = tx % Int32(_WARP_THREADS)
         warp_idx = tx // Int32(_WARP_THREADS)
@@ -1800,22 +3419,30 @@ class DSAFusedIndexerKernel:
             cute.make_layout((self.carry_cap,), stride=(1,))
         )
         s_c1_values = storage.carry1_values.get_tensor(
-            cute.make_layout((self.topk,), stride=(1,))
+            cute.make_layout((self.topk * self.selection_groups,), stride=(1,))
         )
         s_c1_gindex = storage.carry1_gindex.get_tensor(
-            cute.make_layout((self.topk,), stride=(1,))
+            cute.make_layout((self.topk * self.selection_groups,), stride=(1,))
         )
-        s_hist0 = storage.hist0.get_tensor(cute.make_layout((384,), stride=(1,)))
-        s_hist1 = storage.hist1.get_tensor(cute.make_layout((384,), stride=(1,)))
-        s_out = storage.out_idx.get_tensor(cute.make_layout((self.topk,), stride=(1,)))
+        s_hist0 = storage.hist0.get_tensor(
+            cute.make_layout((384 * self.selection_groups,), stride=(1,))
+        )
+        s_hist1 = storage.hist1.get_tensor(
+            cute.make_layout((384 * self.selection_groups,), stride=(1,))
+        )
+        s_out = storage.out_idx.get_tensor(
+            cute.make_layout((self.topk * self.selection_groups,), stride=(1,))
+        )
         s_cand0 = storage.cand0.get_tensor(cute.make_layout((self.cands,), stride=(1,)))
         s_cand1 = storage.cand1.get_tensor(cute.make_layout((self.cands,), stride=(1,)))
-        s_relay = storage.relay.get_tensor(cute.make_layout((2,), stride=(1,)))
+        s_relay = storage.relay.get_tensor(
+            cute.make_layout((max(2, self.selection_groups),), stride=(1,))
+        )
         s_coop_suffix = storage.coop_suffix.get_tensor(
             cute.make_layout((_RADIX,), stride=(1,))
         )
         s_coop_scalars = storage.coop_scalars.get_tensor(
-            cute.make_layout((4,), stride=(1,))
+            cute.make_layout((8,), stride=(1,))
         )
         s_coop_counters = storage.coop_counters.get_tensor(
             cute.make_layout((2,), stride=(1,))
@@ -1866,10 +3493,11 @@ class DSAFusedIndexerKernel:
                         Int32(_INDEX_HEAD_DIM // 16),
                     ),
                 )
-        w_val = Float32(0.0)
-        if tx < Int32(self.padded_q_heads):
-            if tx < num_heads:
-                w_val = Float32(weights[q_idx, tx])
+        if cutlass.const_expr(not self.mxfp4_compact_shared):
+            w_val = Float32(0.0)
+            if tx < Int32(self.padded_q_heads):
+                if tx < num_heads:
+                    w_val = Float32(weights[q_idx, tx])
 
         # PAGED: valid k = [0, seqlen) via page table. CONTIGUOUS_MLA: contiguous k =
         # [k_start, k_end) with abs_start = k_start (no page table).
@@ -1879,16 +3507,18 @@ class DSAFusedIndexerKernel:
         else:
             abs_start = Int32(k_start[q_idx])
             seq_len = Int32(k_end[q_idx]) - abs_start
+        mxfp4_score_width = Int32(0)
         if cutlass.const_expr(self.mxfp4):
+            mxfp4_score_width = Int32(mxfp4_operands[4])
             seq_len = cutlass.min(seq_len, mxfp4_operands[1][0])
             if cutlass.const_expr(self.candidates):
-                seq_len = cutlass.min(Int32(self.score_width), mxfp4_operands[3][q_idx])
+                seq_len = cutlass.min(mxfp4_score_width, mxfp4_operands[3][q_idx])
                 if seqlens_per_query[q_idx] <= Int32(0) or mxfp4_operands[1][
                     0
                 ] <= Int32(0):
                     seq_len = Int32(0)
             else:
-                seq_len = cutlass.min(seq_len, Int32(self.score_width))
+                seq_len = cutlass.min(seq_len, mxfp4_score_width)
         if seq_len < Int32(0):
             seq_len = Int32(0)
         total_pages = (seq_len + Int32(_PAGE_SIZE - 1)) // Int32(_PAGE_SIZE)
@@ -1932,7 +3562,7 @@ class DSAFusedIndexerKernel:
                     tx,
                     k_quant_page_stride=int(self.k_quant_page_stride),
                     k_scales_row_stride=int(self.k_scales_row_stride),
-                    issue_threads=_RADIX_THREADS,
+                    issue_threads=self.radix_threads,
                 )
             cute.arch.cp_async_commit_group()
 
@@ -1973,16 +3603,27 @@ class DSAFusedIndexerKernel:
                 if head_idx < num_heads:
                     q_byte = q_bytes[q_idx, head_idx, col_idx]
                 st_shared_u8(dst_addr, q_byte)
-                q_linear += Int32(_RADIX_THREADS)
-        if tx < Int32(self.padded_q_heads):
-            s_w[tx] = w_val
-        cute.arch.sync_threads()
+                q_linear += Int32(self.radix_threads)
+        if cutlass.const_expr(not self.mxfp4_compact_shared):
+            if tx < Int32(self.padded_q_heads):
+                s_w[tx] = w_val
+            cute.arch.sync_threads()
 
         head_tile_slot = warp_idx % Int32(self.num_q_head_tiles)
         token_group = warp_idx // Int32(self.num_q_head_tiles)
 
-        if cutlass.const_expr(self.mxfp4):
+        if cutlass.const_expr(self.mxfp4 and self.selection_groups == 4):
+            if cutlass.const_expr(self.mxfp4_share_cutoff):
+                if tx == Int32(0):
+                    _smem_st(ni0, Int32(0), Int32(0))
+                cute.arch.sync_threads()
+            filter_key = Uint32(0)
+            partition = tx // Int32(256)
+            partition_thread = tx % Int32(256)
+            partition_warp = partition_thread // Int32(32)
+            partition_barrier = partition + Int32(1)
             carry_count = Int32(0)
+            cutoff = Float32(-float("inf"))
             span_first = Int32(
                 cutlass.min(Int64(page_start) * Int64(_PAGE_SIZE), Int64(seq_len))
             )
@@ -1999,6 +3640,13 @@ class DSAFusedIndexerKernel:
             weights_flat = cute.make_tensor(
                 weights.iterator, cute.make_layout((Int64(1) << Int64(40),))
             )
+            if cutlass.const_expr(self.mxfp4_warp_weights):
+                weight_pairs = self.mxfp4_scorer._load_weight_pairs(weights, q_idx)
+            else:
+                weight_pairs = None
+            mxfp4_page_row_stride = Int64(real_page_table.stride[0])
+            if real_page_table.shape[0] == Int32(1):
+                mxfp4_page_row_stride = Int64(0)
             pool_flat = cute.make_tensor(
                 k_quant_bytes.iterator, cute.make_layout((Int64(1) << Int64(40),))
             )
@@ -2008,93 +3656,814 @@ class DSAFusedIndexerKernel:
             candidates_flat = cute.make_tensor(
                 mxfp4_operands[2].iterator, cute.make_layout((Int64(1) << Int64(40),))
             )
+            p_values = cute.make_tensor(
+                s_c0_values.iterator + partition * Int32(self.carry_cap // 4),
+                cute.make_layout((self.carry_cap // 4,), stride=(1,)),
+            )
+            p_indices = cute.make_tensor(
+                s_c0_gindex.iterator + partition * Int32(self.carry_cap // 4),
+                cute.make_layout((self.carry_cap // 4,), stride=(1,)),
+            )
+            p_selected_values = cute.make_tensor(
+                s_c1_values.iterator + partition * Int32(512),
+                cute.make_layout((512,), stride=(1,)),
+            )
+            p_selected_indices = cute.make_tensor(
+                s_c1_gindex.iterator + partition * Int32(512),
+                cute.make_layout((512,), stride=(1,)),
+            )
+            p_hist0 = cute.make_tensor(
+                s_hist0.iterator + partition * Int32(384),
+                cute.make_layout((384,), stride=(1,)),
+            )
+            p_hist1 = cute.make_tensor(
+                s_hist1.iterator + partition * Int32(384),
+                cute.make_layout((384,), stride=(1,)),
+            )
+            p_out = cute.make_tensor(
+                s_out.iterator + partition * Int32(512),
+                cute.make_layout((512,), stride=(1,)),
+            )
+            p_hist_address = h0 + partition * Int32(1536)
+            p_counter = ctr + partition * Int32(4)
+            p_threshold = thr + partition * Int32(4)
+            p_remaining = lr + partition * Int32(4)
+            p_cached_hist_address = (
+                shared_ptr_to_u32(storage.hist1.data_ptr())
+                + partition * Int32(1536)
+                + Int32(512)
+            )
             while tile_start < span_end:
-                count = cutlass.min(Int32(512), span_end - tile_start)
-                if carry_count + Int32(512) > Int32(self.carry_cap):
-                    cute.arch.sync_threads()
-                    _fused_radix_select(
-                        s_c0_values,
-                        s_c0_gindex,
-                        s_c1_values,
-                        s_c1_gindex,
+                count = cutlass.min(
+                    Int32(128),
+                    cutlass.max(
+                        span_end - tile_start - partition * Int32(128), Int32(0)
+                    ),
+                )
+                if cutlass.const_expr(self.mxfp4_score_batch_tiles == 2):
+                    count += cutlass.min(
+                        Int32(128),
+                        cutlass.max(
+                            span_end - tile_start - Int32(512) - partition * Int32(128),
+                            Int32(0),
+                        ),
+                    )
+                if carry_count + Int32(128 * self.mxfp4_score_batch_tiles) > Int32(
+                    self.carry_cap // 4
+                ):
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=256
+                    )
+                    _mxfp4_private_radix_select(
+                        p_values,
+                        p_indices,
+                        p_selected_values,
+                        p_selected_indices,
                         carry_count,
                         topk_static,
-                        self.cands,
-                        tx,
-                        s_hist0,
-                        s_hist1,
-                        s_out,
-                        s_cand0,
-                        s_cand1,
-                        h0,
-                        ctr,
-                        thr,
-                        ni0,
-                        ni1,
-                        lr,
+                        partition_thread,
+                        p_hist0,
+                        p_hist1,
+                        p_out,
+                        p_hist_address,
+                        p_counter,
+                        p_threshold,
+                        p_remaining,
+                        selection_threads=256,
+                        barrier_id=partition_barrier,
+                        maintain_histogram=True,
+                        cached_histogram_valid=(cutoff != Float32(-float("inf"))),
                     )
-                    cute.arch.sync_threads()
-                    i = Int32(tx)
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=256
+                    )
+                    i = Int32(partition_thread)
                     while i < topk_static:
-                        s_c0_values[i] = Float32(s_c1_values[i])
-                        s_c0_gindex[i] = Int32(s_c1_gindex[i])
-                        i += Int32(_RADIX_THREADS)
-                    cute.arch.sync_threads()
+                        p_values[i] = Float32(p_selected_values[i])
+                        p_indices[i] = Int32(p_selected_indices[i])
+                        i += Int32(256)
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=256
+                    )
                     carry_count = topk_static
-                self.mxfp4_scorer._score_tile(
-                    q_flat,
-                    qs_flat,
-                    weights_flat,
-                    pool_flat,
-                    pages_flat,
-                    seqlens_per_query,
-                    mxfp4_operands[1],
-                    candidates_flat,
-                    mxfp4_operands[3],
-                    s_c0_values,
-                    Int32(q_bytes.shape[0]),
-                    Int32(self.score_width),
-                    Int32(real_page_table.shape[1]),
-                    Int64(real_page_table.stride[0]),
-                    Int64(self.k_quant_page_stride),
-                    Int64(k_quant_bytes.shape[0]),
-                    tile_start,
-                    row_index=q_idx,
-                    local_output=True,
-                    output_base=carry_count,
-                    logical_indices=s_c0_gindex,
-                )
-                carry_count += count
-                tile_start += count
-            cute.arch.sync_threads()
+                    value = Float32(float("inf"))
+                    i = Int32(partition_thread)
+                    while i < topk_static:
+                        value = cutlass.min(value, Float32(p_values[i]))
+                        i += Int32(256)
+                    for delta in (16, 8, 4, 2, 1):
+                        value = cutlass.min(
+                            value, cute.arch.shuffle_sync_bfly(value, offset=delta)
+                        )
+                    if lane == Int32(0):
+                        s_scale[partition * Int32(16) + partition_warp] = value
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=256
+                    )
+                    if partition_warp == Int32(0):
+                        value = Float32(float("inf"))
+                        if lane < Int32(8):
+                            value = Float32(s_scale[partition * Int32(16) + lane])
+                        for delta in (16, 8, 4, 2, 1):
+                            value = cutlass.min(
+                                value, cute.arch.shuffle_sync_bfly(value, offset=delta)
+                            )
+                        if lane == Int32(0):
+                            s_scale[partition * Int32(16) + Int32(8)] = value
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=256
+                    )
+                    cutoff = Float32(s_scale[partition * Int32(16) + Int32(8)])
+                    if cutlass.const_expr(self.mxfp4_share_cutoff):
+                        if partition_thread == Int32(0):
+                            key = _convert_to_uint32(cutoff)
+                            if cutoff == Float32(0):
+                                key = Uint32(0x7FFFFFFF)
+                            _mxfp4_publish_cutoff(ni0, key)
+                            _smem_st(
+                                p_threshold,
+                                Int32(0),
+                                _smem_xadd(ni0, Int32(0), Int32(0)),
+                            )
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=256
+                    )
+                    if cutlass.const_expr(self.mxfp4_share_cutoff):
+                        filter_key = Uint32(_smem_ld(p_threshold, Int32(0)))
+                        own_key = _convert_to_uint32(cutoff)
+                        if cutoff == Float32(0):
+                            own_key = Uint32(0x7FFFFFFF)
+                        if cutlass.const_expr(
+                            self.mxfp4_cutoff_strategy == "shared_compact"
+                        ):
+                            if filter_key > own_key:
+                                if partition_thread == Int32(0):
+                                    _smem_st(p_counter, Int32(0), Int32(0))
+                                cute.arch.barrier(
+                                    barrier_id=partition_barrier, number_of_threads=256
+                                )
+                                for retained_batch in cutlass.range_constexpr(2):
+                                    retained_index = partition_thread + Int32(
+                                        retained_batch * 256
+                                    )
+                                    retained_value = Float32(
+                                        p_selected_values[retained_index]
+                                    )
+                                    retained_logical = Int32(
+                                        p_selected_indices[retained_index]
+                                    )
+                                    retained_key = _convert_to_uint32(retained_value)
+                                    accept_retained = retained_key >= filter_key
+                                    mask = cute.arch.vote_ballot_sync(accept_retained)
+                                    rank = Int32(
+                                        cute.arch.popc(
+                                            mask
+                                            & ((Uint32(1) << Uint32(lane)) - Uint32(1))
+                                        )
+                                    )
+                                    size = Int32(cute.arch.popc(mask))
+                                    base = Int32(0)
+                                    if lane == Int32(0) and size > Int32(0):
+                                        base = _smem_xadd(p_counter, Int32(0), size)
+                                    base = cute.arch.shuffle_sync(base, Int32(0))
+                                    if accept_retained:
+                                        p_values[base + rank] = retained_value
+                                        p_indices[base + rank] = retained_logical
+                                    else:
+                                        _smem_red_add(
+                                            p_cached_hist_address,
+                                            Int32(retained_key >> Uint32(24)),
+                                            Int32(-1),
+                                        )
+                                cute.arch.barrier(
+                                    barrier_id=partition_barrier, number_of_threads=256
+                                )
+                                carry_count = _smem_ld(p_counter, Int32(0))
+                                cute.arch.barrier(
+                                    barrier_id=partition_barrier, number_of_threads=256
+                                )
+                for score_batch in cutlass.range_constexpr(
+                    self.mxfp4_score_batch_tiles
+                ):
+                    self.mxfp4_scorer._score_tile_fused(
+                        q_flat,
+                        qs_flat,
+                        weights_flat,
+                        pool_flat,
+                        pages_flat,
+                        seqlens_per_query,
+                        mxfp4_operands[1],
+                        candidates_flat,
+                        mxfp4_operands[3],
+                        s_c0_values,
+                        Int32(q_bytes.shape[0]),
+                        mxfp4_score_width,
+                        Int32(real_page_table.shape[1]),
+                        mxfp4_page_row_stride,
+                        Int64(k_quant_bytes.stride[0]),
+                        Int64(k_quant_bytes.shape[0]),
+                        tile_start + Int32(score_batch) * Int32(512),
+                        row_index=q_idx,
+                        local_output=True,
+                        output_base=partition * Int32(self.carry_cap // 4 - 128)
+                        + carry_count
+                        + Int32(score_batch) * Int32(128),
+                        logical_indices=s_c0_gindex,
+                        weight_pairs=weight_pairs,
+                        aligned_q=self.mxfp4_aligned_q,
+                        carry_query_offsets=self.mxfp4_query_offset_mode != 0,
+                        logical_query_index=self.mxfp4_query_offset_mode == 2,
+                        unsigned_candidate_pages=self.mxfp4_unsigned_candidate_pages,
+                    )
+                filter_live = cutoff != Float32(-float("inf"))
+                if cutlass.const_expr(self.mxfp4_share_cutoff):
+                    filter_live = filter_key > Uint32(0x007FFFFF)
+                if filter_live:
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=256
+                    )
+                    value = Float32(-float("inf"))
+                    logical = Int32(-1)
+                    accept = False
+                    if partition_thread < count:
+                        value = Float32(p_values[carry_count + partition_thread])
+                        logical = Int32(p_indices[carry_count + partition_thread])
+                        if cutlass.const_expr(self.mxfp4_share_cutoff):
+                            accept = _convert_to_uint32(value) >= filter_key
+                        else:
+                            accept = value >= cutoff
+                    if partition_thread == Int32(0):
+                        _smem_st(p_counter, Int32(0), Int32(0))
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=256
+                    )
+                    if accept:
+                        slot = _smem_xadd(p_counter, Int32(0), Int32(1))
+                        p_values[carry_count + slot] = value
+                        p_indices[carry_count + slot] = logical
+                        digit = Int32(_convert_to_uint32(value) >> Uint32(24))
+                        _smem_red_add(p_cached_hist_address, digit, Int32(1))
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=256
+                    )
+                    carry_count += _smem_ld(p_counter, Int32(0))
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=256
+                    )
+                else:
+                    carry_count += count
+                tile_start += Int32(512 * self.mxfp4_score_batch_tiles)
             if carry_count > topk_static:
-                _fused_radix_select(
+                cute.arch.barrier(barrier_id=partition_barrier, number_of_threads=256)
+                _mxfp4_private_radix_select(
+                    p_values,
+                    p_indices,
+                    p_selected_values,
+                    p_selected_indices,
+                    carry_count,
+                    topk_static,
+                    partition_thread,
+                    p_hist0,
+                    p_hist1,
+                    p_out,
+                    p_hist_address,
+                    p_counter,
+                    p_threshold,
+                    p_remaining,
+                    selection_threads=256,
+                    barrier_id=partition_barrier,
+                    maintain_histogram=True,
+                    cached_histogram_valid=(cutoff != Float32(-float("inf"))),
+                )
+                cute.arch.barrier(barrier_id=partition_barrier, number_of_threads=256)
+                i = Int32(partition_thread)
+                while i < topk_static:
+                    p_values[i] = Float32(p_selected_values[i])
+                    p_indices[i] = Int32(p_selected_indices[i])
+                    i += Int32(256)
+                cute.arch.barrier(barrier_id=partition_barrier, number_of_threads=256)
+                carry_count = topk_static
+            if partition_thread == Int32(0):
+                s_relay[partition] = carry_count
+            cute.arch.sync_threads()
+            # Local top-k carries contain an exact global top-k.
+            gathered_values = cute.make_rmem_tensor((2,), Float32)
+            gathered_indices = cute.make_rmem_tensor((2,), Int32)
+            gathered_targets = cute.make_rmem_tensor((2,), Int32)
+            gathered_targets.fill(-1)
+            for slot in cutlass.range_constexpr(2):
+                item = tx + Int32(slot * 1024)
+                source_partition = item // Int32(512)
+                local_index = item % Int32(512)
+                prefix = Int32(0)
+                source_count = Int32(0)
+                for group in cutlass.range_constexpr(4):
+                    value = Int32(s_relay[group])
+                    if Int32(group) < source_partition:
+                        prefix += value
+                    if Int32(group) == source_partition:
+                        source_count = value
+                if local_index < source_count:
+                    source = source_partition * Int32(self.carry_cap // 4) + local_index
+                    gathered_values[slot] = Float32(s_c0_values[source])
+                    gathered_indices[slot] = Int32(s_c0_gindex[source])
+                    gathered_targets[slot] = prefix + local_index
+            cute.arch.sync_threads()
+            for slot in cutlass.range_constexpr(2):
+                target = Int32(gathered_targets[slot])
+                if target >= Int32(0):
+                    s_c0_values[target] = gathered_values[slot]
+                    s_c0_gindex[target] = gathered_indices[slot]
+            cute.arch.sync_threads()
+            carry_count = Int32(0)
+            for group in cutlass.range_constexpr(4):
+                carry_count += Int32(s_relay[group])
+            if carry_count > topk_static:
+                _mxfp4_private_radix_select(
                     s_c0_values,
                     s_c0_gindex,
                     s_c1_values,
                     s_c1_gindex,
                     carry_count,
                     topk_static,
-                    self.cands,
                     tx,
                     s_hist0,
                     s_hist1,
                     s_out,
-                    s_cand0,
-                    s_cand1,
                     h0,
                     ctr,
                     thr,
-                    ni0,
-                    ni1,
                     lr,
+                )
+                cute.arch.sync_threads()
+                if tx < topk_static:
+                    s_c0_values[tx] = Float32(s_c1_values[tx])
+                    s_c0_gindex[tx] = Int32(s_c1_gindex[tx])
+                cute.arch.sync_threads()
+                carry_count = topk_static
+        elif cutlass.const_expr(self.mxfp4 and self.selection_groups == 2):
+            partition = tx // Int32(512)
+            partition_thread = tx % Int32(512)
+            partition_warp = partition_thread // Int32(32)
+            partition_barrier = partition + Int32(1)
+            carry_count = Int32(0)
+            cutoff = Float32(-float("inf"))
+            span_first = Int32(
+                cutlass.min(Int64(page_start) * Int64(_PAGE_SIZE), Int64(seq_len))
+            )
+            span_end = Int32(
+                cutlass.min(Int64(page_end) * Int64(_PAGE_SIZE), Int64(seq_len))
+            )
+            tile_start = span_first
+            q_flat = cute.make_tensor(
+                q_bytes.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            qs_flat = cute.make_tensor(
+                mxfp4_operands[0].iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            weights_flat = cute.make_tensor(
+                weights.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            if cutlass.const_expr(self.mxfp4_warp_weights):
+                weight_pairs = self.mxfp4_scorer._load_weight_pairs(weights, q_idx)
+            else:
+                weight_pairs = None
+            mxfp4_page_row_stride = Int64(real_page_table.stride[0])
+            if real_page_table.shape[0] == Int32(1):
+                mxfp4_page_row_stride = Int64(0)
+            pool_flat = cute.make_tensor(
+                k_quant_bytes.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            pages_flat = cute.make_tensor(
+                real_page_table.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            candidates_flat = cute.make_tensor(
+                mxfp4_operands[2].iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            p_values = cute.make_tensor(
+                s_c0_values.iterator + partition * Int32(self.carry_cap // 2),
+                cute.make_layout((self.carry_cap // 2,), stride=(1,)),
+            )
+            p_indices = cute.make_tensor(
+                s_c0_gindex.iterator + partition * Int32(self.carry_cap // 2),
+                cute.make_layout((self.carry_cap // 2,), stride=(1,)),
+            )
+            p_selected_values = cute.make_tensor(
+                s_c1_values.iterator + partition * Int32(512),
+                cute.make_layout((512,), stride=(1,)),
+            )
+            p_selected_indices = cute.make_tensor(
+                s_c1_gindex.iterator + partition * Int32(512),
+                cute.make_layout((512,), stride=(1,)),
+            )
+            p_hist0 = cute.make_tensor(
+                s_hist0.iterator + partition * Int32(384),
+                cute.make_layout((384,), stride=(1,)),
+            )
+            p_hist1 = cute.make_tensor(
+                s_hist1.iterator + partition * Int32(384),
+                cute.make_layout((384,), stride=(1,)),
+            )
+            p_out = cute.make_tensor(
+                s_out.iterator + partition * Int32(512),
+                cute.make_layout((512,), stride=(1,)),
+            )
+            p_hist_address = h0 + partition * Int32(1536)
+            p_counter = ctr + partition * Int32(4)
+            p_threshold = thr + partition * Int32(4)
+            p_remaining = lr + partition * Int32(4)
+            while tile_start < span_end:
+                count = cutlass.min(
+                    Int32(256),
+                    cutlass.max(
+                        span_end - tile_start - partition * Int32(256), Int32(0)
+                    ),
+                )
+                if cutlass.const_expr(self.mxfp4_score_batch_tiles == 2):
+                    count += cutlass.min(
+                        Int32(256),
+                        cutlass.max(
+                            span_end - tile_start - Int32(512) - partition * Int32(256),
+                            Int32(0),
+                        ),
+                    )
+                if carry_count + Int32(256 * self.mxfp4_score_batch_tiles) > Int32(
+                    self.carry_cap // 2
+                ):
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=512
+                    )
+                    if partition_thread < Int32(256):
+                        _mxfp4_private_radix_select(
+                            p_values,
+                            p_indices,
+                            p_selected_values,
+                            p_selected_indices,
+                            carry_count,
+                            topk_static,
+                            partition_thread,
+                            p_hist0,
+                            p_hist1,
+                            p_out,
+                            p_hist_address,
+                            p_counter,
+                            p_threshold,
+                            p_remaining,
+                            selection_threads=256,
+                            barrier_id=partition + Int32(3),
+                        )
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=512
+                    )
+                    p_values[partition_thread] = Float32(
+                        p_selected_values[partition_thread]
+                    )
+                    p_indices[partition_thread] = Int32(
+                        p_selected_indices[partition_thread]
+                    )
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=512
+                    )
+                    carry_count = topk_static
+                    value = Float32(p_values[partition_thread])
+                    for delta in (16, 8, 4, 2, 1):
+                        value = cutlass.min(
+                            value, cute.arch.shuffle_sync_bfly(value, offset=delta)
+                        )
+                    if lane == Int32(0):
+                        s_scale[partition * Int32(32) + partition_warp] = value
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=512
+                    )
+                    if partition_warp == Int32(0):
+                        value = Float32(float("inf"))
+                        if lane < Int32(16):
+                            value = Float32(s_scale[partition * Int32(32) + lane])
+                        for delta in (16, 8, 4, 2, 1):
+                            value = cutlass.min(
+                                value, cute.arch.shuffle_sync_bfly(value, offset=delta)
+                            )
+                        if lane == Int32(0):
+                            s_scale[partition * Int32(32) + Int32(16)] = value
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=512
+                    )
+                    cutoff = Float32(s_scale[partition * Int32(32) + Int32(16)])
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=512
+                    )
+                for score_batch in cutlass.range(self.mxfp4_score_batch_tiles):
+                    self.mxfp4_scorer._score_tile_fused(
+                        q_flat,
+                        qs_flat,
+                        weights_flat,
+                        pool_flat,
+                        pages_flat,
+                        seqlens_per_query,
+                        mxfp4_operands[1],
+                        candidates_flat,
+                        mxfp4_operands[3],
+                        s_c0_values,
+                        Int32(q_bytes.shape[0]),
+                        mxfp4_score_width,
+                        Int32(real_page_table.shape[1]),
+                        mxfp4_page_row_stride,
+                        Int64(k_quant_bytes.stride[0]),
+                        Int64(k_quant_bytes.shape[0]),
+                        tile_start + Int32(score_batch) * Int32(512),
+                        row_index=q_idx,
+                        local_output=True,
+                        output_base=partition * Int32(self.carry_cap // 2 - 256)
+                        + carry_count
+                        + Int32(score_batch) * Int32(256),
+                        logical_indices=s_c0_gindex,
+                        weight_pairs=weight_pairs,
+                        aligned_q=self.mxfp4_aligned_q,
+                        carry_query_offsets=self.mxfp4_query_offset_mode != 0,
+                        logical_query_index=self.mxfp4_query_offset_mode == 2,
+                        unsigned_candidate_pages=self.mxfp4_unsigned_candidate_pages,
+                    )
+                if cutoff != Float32(-float("inf")):
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=512
+                    )
+                    value = Float32(-float("inf"))
+                    logical = Int32(-1)
+                    accept = False
+                    if partition_thread < count:
+                        value = Float32(p_values[carry_count + partition_thread])
+                        logical = Int32(p_indices[carry_count + partition_thread])
+                        accept = value >= cutoff
+                    if partition_thread == Int32(0):
+                        _smem_st(p_counter, Int32(0), Int32(0))
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=512
+                    )
+                    if accept:
+                        slot = _smem_xadd(p_counter, Int32(0), Int32(1))
+                        p_values[carry_count + slot] = value
+                        p_indices[carry_count + slot] = logical
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=512
+                    )
+                    carry_count += _smem_ld(p_counter, Int32(0))
+                    cute.arch.barrier(
+                        barrier_id=partition_barrier, number_of_threads=512
+                    )
+                else:
+                    carry_count += count
+                tile_start += Int32(512 * self.mxfp4_score_batch_tiles)
+            if carry_count > topk_static:
+                cute.arch.barrier(barrier_id=partition_barrier, number_of_threads=512)
+                if partition_thread < Int32(256):
+                    _mxfp4_private_radix_select(
+                        p_values,
+                        p_indices,
+                        p_selected_values,
+                        p_selected_indices,
+                        carry_count,
+                        topk_static,
+                        partition_thread,
+                        p_hist0,
+                        p_hist1,
+                        p_out,
+                        p_hist_address,
+                        p_counter,
+                        p_threshold,
+                        p_remaining,
+                        selection_threads=256,
+                        barrier_id=partition + Int32(3),
+                    )
+                cute.arch.barrier(barrier_id=partition_barrier, number_of_threads=512)
+                p_values[partition_thread] = Float32(
+                    p_selected_values[partition_thread]
+                )
+                p_indices[partition_thread] = Int32(
+                    p_selected_indices[partition_thread]
+                )
+                cute.arch.barrier(barrier_id=partition_barrier, number_of_threads=512)
+                carry_count = topk_static
+            if partition_thread == Int32(0):
+                s_relay[partition] = carry_count
+            cute.arch.sync_threads()
+            # Local top-k carries contain an exact global top-k.
+            left_count = Int32(s_relay[0])
+            right_count = Int32(s_relay[1])
+            if tx < right_count:
+                s_c0_values[left_count + tx] = Float32(
+                    s_c0_values[Int32(self.carry_cap // 2) + tx]
+                )
+                s_c0_gindex[left_count + tx] = Int32(
+                    s_c0_gindex[Int32(self.carry_cap // 2) + tx]
+                )
+            cute.arch.sync_threads()
+            carry_count = left_count + right_count
+            if carry_count > topk_static:
+                _mxfp4_private_radix_select(
+                    s_c0_values,
+                    s_c0_gindex,
+                    s_c1_values,
+                    s_c1_gindex,
+                    carry_count,
+                    topk_static,
+                    tx,
+                    s_hist0,
+                    s_hist1,
+                    s_out,
+                    h0,
+                    ctr,
+                    thr,
+                    lr,
+                )
+                cute.arch.sync_threads()
+                if tx < topk_static:
+                    s_c0_values[tx] = Float32(s_c1_values[tx])
+                    s_c0_gindex[tx] = Int32(s_c1_gindex[tx])
+                cute.arch.sync_threads()
+                carry_count = topk_static
+        elif cutlass.const_expr(self.mxfp4):
+            carry_count = Int32(0)
+            cutoff = Float32(-float("inf"))
+            span_first = Int32(
+                cutlass.min(Int64(page_start) * Int64(_PAGE_SIZE), Int64(seq_len))
+            )
+            span_end = Int32(
+                cutlass.min(Int64(page_end) * Int64(_PAGE_SIZE), Int64(seq_len))
+            )
+            tile_start = span_first
+            if cutlass.const_expr(self.tile_schedule == "cyclic"):
+                span_end = seq_len
+                tile_start = Int32(
+                    cutlass.min(
+                        Int64(cta_in_group) * Int64(self.mxfp4_score_group),
+                        Int64(seq_len),
+                    )
+                )
+            q_flat = cute.make_tensor(
+                q_bytes.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            qs_flat = cute.make_tensor(
+                mxfp4_operands[0].iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            weights_flat = cute.make_tensor(
+                weights.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            if cutlass.const_expr(self.mxfp4_warp_weights):
+                weight_pairs = self.mxfp4_scorer._load_weight_pairs(weights, q_idx)
+            else:
+                weight_pairs = None
+            pool_flat = cute.make_tensor(
+                k_quant_bytes.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            pages_flat = cute.make_tensor(
+                real_page_table.iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            candidates_flat = cute.make_tensor(
+                mxfp4_operands[2].iterator, cute.make_layout((Int64(1) << Int64(40),))
+            )
+            mxfp4_page_row_stride = Int64(real_page_table.stride[0])
+            if real_page_table.shape[0] == Int32(1):
+                mxfp4_page_row_stride = Int64(0)
+            while tile_start < span_end:
+                count = cutlass.min(
+                    Int32(self.mxfp4_score_group), span_end - tile_start
+                )
+                if carry_count + Int32(self.mxfp4_score_group) > Int32(
+                    self.carry_cap
+                ) and cutoff > Float32(-float("inf")):
+                    values = cute.make_rmem_tensor((self.mxfp4_carry_slots,), Float32)
+                    indices = cute.make_rmem_tensor((self.mxfp4_carry_slots,), Int32)
+                    cute.arch.sync_threads()
+                    for slot in cutlass.range_constexpr(self.mxfp4_carry_slots):
+                        idx = tx + Int32(slot * self.radix_threads)
+                        values[slot] = Float32(-float("inf"))
+                        indices[slot] = Int32(-1)
+                        if idx < carry_count:
+                            values[slot] = Float32(s_c0_values[idx])
+                            indices[slot] = Int32(s_c0_gindex[idx])
+                    if tx == Int32(0):
+                        _smem_st(ni0, Int32(0), Int32(0))
+                    cute.arch.sync_threads()
+                    for slot in cutlass.range_constexpr(self.mxfp4_carry_slots):
+                        idx = tx + Int32(slot * self.radix_threads)
+                        if idx < carry_count and values[slot] >= cutoff:
+                            pos = _smem_xadd(ni0, Int32(0), Int32(1))
+                            s_c0_values[pos] = values[slot]
+                            s_c0_gindex[pos] = indices[slot]
+                    cute.arch.sync_threads()
+                    carry_count = _smem_ld(ni0, Int32(0))
+                if carry_count + Int32(self.mxfp4_score_group) > Int32(self.carry_cap):
+                    cute.arch.sync_threads()
+                    _mxfp4_radix_select(
+                        s_c0_values,
+                        s_c0_gindex,
+                        s_c1_values,
+                        s_c1_gindex,
+                        carry_count,
+                        topk_static,
+                        tx,
+                        s_hist0,
+                        s_hist1,
+                        s_out,
+                        h0,
+                        ctr,
+                        thr,
+                        lr,
+                        threads=self.radix_threads,
+                    )
+                    cute.arch.sync_threads()
+                    i = Int32(tx)
+                    while i < topk_static:
+                        s_c0_values[i] = Float32(s_c1_values[i])
+                        s_c0_gindex[i] = Int32(s_c1_gindex[i])
+                        i += Int32(self.radix_threads)
+                    cute.arch.sync_threads()
+                    carry_count = topk_static
+                    value = Float32(float("inf"))
+                    if tx < topk_static:
+                        value = Float32(s_c0_values[tx])
+                    for shift in cutlass.range_constexpr(5):
+                        value = cutlass.min(
+                            value, cute.arch.shuffle_sync_bfly(value, offset=1 << shift)
+                        )
+                    if tx % Int32(32) == Int32(0):
+                        s_c1_values[tx // Int32(32)] = value
+                    cute.arch.sync_threads()
+                    value = Float32(float("inf"))
+                    if tx % Int32(32) < Int32(self.radix_threads // 32):
+                        value = Float32(s_c1_values[tx % Int32(32)])
+                    for shift in cutlass.range_constexpr(5):
+                        value = cutlass.min(
+                            value, cute.arch.shuffle_sync_bfly(value, offset=1 << shift)
+                        )
+                    cutoff = value
+                    cute.arch.sync_threads()
+                for score_pass in cutlass.range_constexpr(self.mxfp4_score_passes):
+                    self.mxfp4_scorer._score_tile_fused(
+                        q_flat,
+                        qs_flat,
+                        weights_flat,
+                        pool_flat,
+                        pages_flat,
+                        seqlens_per_query,
+                        mxfp4_operands[1],
+                        candidates_flat,
+                        mxfp4_operands[3],
+                        s_c0_values,
+                        Int32(q_bytes.shape[0]),
+                        mxfp4_score_width,
+                        Int32(real_page_table.shape[1]),
+                        mxfp4_page_row_stride,
+                        Int64(k_quant_bytes.stride[0]),
+                        Int64(k_quant_bytes.shape[0]),
+                        tile_start + Int32(score_pass * self.mxfp4_chunk),
+                        row_index=q_idx,
+                        local_output=True,
+                        output_base=carry_count + Int32(score_pass * self.mxfp4_chunk),
+                        logical_indices=s_c0_gindex,
+                        hardware_scale_select=self.candidates
+                        and self.score_width <= 512,
+                        weight_pairs=weight_pairs,
+                        aligned_q=self.mxfp4_aligned_q,
+                        carry_query_offsets=self.mxfp4_query_offset_mode != 0,
+                        logical_query_index=self.mxfp4_query_offset_mode == 2,
+                        unsigned_candidate_pages=self.mxfp4_unsigned_candidate_pages,
+                    )
+                carry_count += count
+                if cutlass.const_expr(self.tile_schedule == "cyclic"):
+                    tile_start += Int32(
+                        cutlass.min(
+                            Int64(self.ctas_per_group) * Int64(self.mxfp4_score_group),
+                            Int64(span_end) - Int64(tile_start),
+                        )
+                    )
+                else:
+                    tile_start += count
+            cute.arch.sync_threads()
+            if carry_count > topk_static:
+                _mxfp4_radix_select(
+                    s_c0_values,
+                    s_c0_gindex,
+                    s_c1_values,
+                    s_c1_gindex,
+                    carry_count,
+                    topk_static,
+                    tx,
+                    s_hist0,
+                    s_hist1,
+                    s_out,
+                    h0,
+                    ctr,
+                    thr,
+                    lr,
+                    threads=self.radix_threads,
                 )
                 cute.arch.sync_threads()
                 i = Int32(tx)
                 while i < topk_static:
                     s_c0_values[i] = Float32(s_c1_values[i])
                     s_c0_gindex[i] = Int32(s_c1_gindex[i])
-                    i += Int32(_RADIX_THREADS)
+                    i += Int32(self.radix_threads)
                 cute.arch.sync_threads()
                 carry_count = topk_static
         elif cutlass.const_expr(self.direct_k_score):
@@ -2139,13 +4508,14 @@ class DSAFusedIndexerKernel:
                         ni0,
                         ni1,
                         lr,
+                        threads=self.radix_threads,
                     )
                     cute.arch.sync_threads()
                     ti = Int32(tx)
                     while ti < topk_static:
                         s_c0_values[ti] = Float32(s_c1_values[ti])
                         s_c0_gindex[ti] = Int32(s_c1_gindex[ti])
-                        ti += Int32(_RADIX_THREADS)
+                        ti += Int32(self.radix_threads)
                     cute.arch.sync_threads()
                     carry_count = topk_static
                 my_rel = round_base + warp_idx * Int32(8)
@@ -2221,13 +4591,14 @@ class DSAFusedIndexerKernel:
                     ni0,
                     ni1,
                     lr,
+                    threads=self.radix_threads,
                 )
                 cute.arch.sync_threads()
                 ti = Int32(tx)
                 while ti < topk_static:
                     s_c0_values[ti] = Float32(s_c1_values[ti])
                     s_c0_gindex[ti] = Int32(s_c1_gindex[ti])
-                    ti += Int32(_RADIX_THREADS)
+                    ti += Int32(self.radix_threads)
                 cute.arch.sync_threads()
                 carry_count = topk_static
         else:
@@ -2300,7 +4671,7 @@ class DSAFusedIndexerKernel:
                             tx,
                             k_quant_page_stride=int(self.k_quant_page_stride),
                             k_scales_row_stride=int(self.k_scales_row_stride),
-                            issue_threads=_RADIX_THREADS,
+                            issue_threads=self.radix_threads,
                         )
                     cute.arch.cp_async_commit_group()
                     # Page p has landed once every group but the newest has
@@ -2363,7 +4734,7 @@ class DSAFusedIndexerKernel:
                             valid_slots,
                             s_k_page_stage,
                             tx,
-                            Int32(_RADIX_THREADS),
+                            Int32(self.radix_threads),
                         )
                         scale_idx = tx
                         while scale_idx < Int32(_PAGE_SIZE):
@@ -2373,13 +4744,13 @@ class DSAFusedIndexerKernel:
                                     k_scales[abs_start + page_base + scale_idx]
                                 )
                             s_scale[scale_idx] = sv
-                            scale_idx += Int32(_RADIX_THREADS)
+                            scale_idx += Int32(self.radix_threads)
                         cute.arch.sync_threads()
                         _repack_k_page_wide(
                             k_page_base_addr,
                             k_page_perm_base_addr,
                             tx,
-                            Int32(_RADIX_THREADS),
+                            Int32(self.radix_threads),
                         )
                         cute.arch.sync_threads()
 
@@ -2549,13 +4920,14 @@ class DSAFusedIndexerKernel:
                         ni0,
                         ni1,
                         lr,
+                        threads=self.radix_threads,
                     )
                     cute.arch.sync_threads()
                     i = Int32(tx)
                     while i < topk_static:
                         s_c0_values[i] = Float32(s_c1_values[i])
                         s_c0_gindex[i] = Int32(s_c1_gindex[i])
-                        i += Int32(_RADIX_THREADS)
+                        i += Int32(self.radix_threads)
                     cute.arch.sync_threads()
                     carry_count = topk_static
                 page_col += Int32(1)
@@ -2622,28 +4994,50 @@ class DSAFusedIndexerKernel:
                         ni0,
                         ni1,
                         lr,
+                        threads=self.radix_threads,
                     )
                     cute.arch.sync_threads()
                     i = Int32(tx)
                     while i < topk_static:
                         s_c0_values[i] = Float32(s_c1_values[i])
                         s_c0_gindex[i] = Int32(s_c1_gindex[i])
-                        i += Int32(_RADIX_THREADS)
+                        i += Int32(self.radix_threads)
                     cute.arch.sync_threads()
                     carry_count = topk_static
         if cutlass.const_expr(not self.merge_in_kernel):
-            # ---- single CTA per row: carry0 is already the final top-k ----
-            i = Int32(tx)
-            while i < topk_static:
-                is_valid = i < carry_count
-                out_values[group_id, i] = (
-                    Float32(s_c0_values[i]) if is_valid else Float32(float("-inf"))
+            if cutlass.const_expr(self.mxfp4 and self.ordered_output):
+                _mxfp4_order_output(
+                    out_indices,
+                    out_values,
+                    group_id,
+                    s_c0_gindex,
+                    s_c0_values,
+                    tx,
+                    carry_count,
+                    True,
+                    merge_state,
+                    0,
+                    self.output_position_capacity,
+                    self.vector_output_pairs,
+                    threads=self.radix_threads,
                 )
-                out_indices[group_id, i] = (
-                    Int32(s_c0_gindex[i]) if is_valid else Int32(-1)
-                )
-                i += Int32(_RADIX_THREADS)
+                if (group_id == Int32(0)) & (tx == Int32(0)):
+                    merge_state[Int64(0)] = Int32(0)
+                    merge_state[Int64(1)] = Int32(0)
+            else:
+                i = Int32(tx)
+                while i < topk_static:
+                    is_valid = i < carry_count
+                    out_values[group_id, i] = (
+                        Float32(s_c0_values[i]) if is_valid else Float32(float("-inf"))
+                    )
+                    out_indices[group_id, i] = (
+                        Int32(s_c0_gindex[i]) if is_valid else Int32(-1)
+                    )
+                    i += Int32(self.radix_threads)
         else:
+            if cutlass.const_expr(self.state_reset_pdl):
+                cute.arch.griddepcontrol_wait()
             # ---- in-kernel cross-CTA merge: runtime-selected strategy ----
             # All CTAs in a group share the row's live K length (seq_len, from
             # metadata), so they pick the SAME arm with no extra barrier:
@@ -2689,9 +5083,55 @@ class DSAFusedIndexerKernel:
             pos = Int32(0)
             c = Int32(0)
             coop_possible = Int32(1 if self.coop_merge_possible else 0)
-            if (seq_len > Int32(self.merge_threshold)) & (coop_possible != Int32(0)):
+            if cutlass.const_expr(
+                self.mxfp4 and self.mxfp4_merge_bits == 16 and self.coop_merge_possible
+            ):
+                last_departure = _mxfp4_onepass_merge(
+                    merge_state,
+                    group_id,
+                    cta_in_group,
+                    ctas_pg,
+                    tx,
+                    lane,
+                    warp_idx,
+                    s_c0_values,
+                    s_c0_gindex,
+                    carry_count,
+                    out_values,
+                    out_indices,
+                    s_hist0,
+                    coop_hist_addr,
+                    s_coop_scalars,
+                    s_coop_counters,
+                    coop_ctr_addr,
+                    self.mxfp4_histogram_fine_words,
+                    self.mxfp4_histogram_active_cap,
+                    self.mxfp4_histogram_count_bits,
+                    self.mxfp4_histogram_bitmap,
+                    k_page_base_addr,
+                    self.radix_threads,
+                )
+                if cutlass.const_expr(self.ordered_output):
+                    if last_departure:
+                        _mxfp4_order_output(
+                            out_indices,
+                            out_values,
+                            group_id,
+                            s_c0_gindex,
+                            s_c0_values,
+                            tx,
+                            Int32(512),
+                            False,
+                            merge_state,
+                            0,
+                            self.output_position_capacity,
+                            self.vector_output_pairs,
+                            threads=self.radix_threads,
+                        )
+            elif (seq_len > Int32(self.merge_threshold)) & (coop_possible != Int32(0)):
                 # ---- cooperative grid-barrier radix merge ----
-                # Round 0 histograms the top 12 key bits of every candidate,
+                # MXFP4 refines the high sixteen BF16 key bits in two byte rounds.
+                # FP8 round 0 histograms the top 12 key bits of every candidate,
                 # round 1 the next 12 bits of the candidates matching the
                 # round-0 pivot, and round 2 the low byte of those matching
                 # the round-1 pivot. Each round accumulates the group's
@@ -2715,38 +5155,65 @@ class DSAFusedIndexerKernel:
                     )
                 cute.arch.cp_async_wait_group(0)
                 wide_hist_addr = k_page_base_addr
-                st_shared_v4_u32(
-                    wide_hist_addr + tx * Int32(16),
-                    Uint32(0),
-                    Uint32(0),
-                    Uint32(0),
-                    Uint32(0),
-                )
+                for hist_pass in cutlass.range_constexpr(1024 // self.radix_threads):
+                    st_shared_v4_u32(
+                        wide_hist_addr
+                        + (tx + Int32(hist_pass * self.radix_threads)) * Int32(16),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                    )
                 if tx < Int32(_RADIX):
                     s_hist0[tx] = Int32(0)
                 cute.arch.sync_threads()
-                barrier_phase = _coop_wide_round(
-                    merge_state,
-                    group_id,
-                    _FUSED_COARSE0,
-                    _FUSED_FINE0,
-                    s_c0_values,
-                    carry_count,
-                    Uint32(0),
-                    Uint32(0),
-                    20,
-                    wide_hist_addr,
-                    coop_hist_addr,
-                    s_hist0,
-                    topk_static,
-                    barrier_phase,
-                    ctas_pg,
-                    tx,
-                    lane,
-                    warp_idx,
-                    s_coop_scalars,
-                    True,
-                )
+                if cutlass.const_expr(self.mxfp4):
+                    # BF16 scores are determined by the high sixteen ordered-key bits.
+                    barrier_phase = _coop_narrow_round(
+                        merge_state,
+                        group_id,
+                        _FUSED_COARSE0,
+                        s_c0_values,
+                        carry_count,
+                        Uint32(0),
+                        Uint32(0),
+                        coop_hist_addr,
+                        s_hist0,
+                        topk_static,
+                        barrier_phase,
+                        ctas_pg,
+                        tx,
+                        lane,
+                        warp_idx,
+                        s_coop_scalars,
+                        24,
+                        True,
+                        threads=self.radix_threads,
+                    )
+                else:
+                    barrier_phase = _coop_wide_round(
+                        merge_state,
+                        group_id,
+                        _FUSED_COARSE0,
+                        _FUSED_FINE0,
+                        s_c0_values,
+                        carry_count,
+                        Uint32(0),
+                        Uint32(0),
+                        20,
+                        wide_hist_addr,
+                        coop_hist_addr,
+                        s_hist0,
+                        topk_static,
+                        barrier_phase,
+                        ctas_pg,
+                        tx,
+                        lane,
+                        warp_idx,
+                        s_coop_scalars,
+                        True,
+                        threads=self.radix_threads,
+                    )
                 total = Int32(s_coop_scalars[3])
                 if total <= topk_static:
                     # Every candidate survives: pack at an atomic base; CTA 0 pads.
@@ -2763,52 +5230,84 @@ class DSAFusedIndexerKernel:
                     while i < carry_count:
                         out_values[group_id, base + i] = Float32(s_c0_values[i])
                         out_indices[group_id, base + i] = Int32(s_c0_gindex[i])
-                        i += Int32(_RADIX_THREADS)
+                        i += Int32(self.radix_threads)
                     if cta_in_group == Int32(0):
                         i = total + Int32(tx)
                         while i < topk_static:
                             out_values[group_id, i] = Float32(float("-inf"))
                             out_indices[group_id, i] = Int32(-1)
-                            i += Int32(_RADIX_THREADS)
+                            i += Int32(self.radix_threads)
                 else:
                     pivot_bin = Int32(s_coop_scalars[0])
                     count_gt = Int32(s_coop_scalars[1])
                     bin_count = Int32(s_coop_scalars[2])
-                    prefix = Uint32(pivot_bin) << Uint32(20)
-                    mask = Uint32(0xFFF00000)
+                    if cutlass.const_expr(self.mxfp4):
+                        prefix = Uint32(pivot_bin) << Uint32(24)
+                        mask = Uint32(0xFF000000)
+                    else:
+                        prefix = Uint32(pivot_bin) << Uint32(20)
+                        mask = Uint32(0xFFF00000)
                     winners = count_gt
                     remaining_k = topk_static - count_gt
                     done = Int32(0)
                     if bin_count == remaining_k:
                         done = Int32(1)
                     if done == Int32(0):
-                        barrier_phase = _coop_wide_round(
-                            merge_state,
-                            group_id,
-                            _FUSED_COARSE1,
-                            _FUSED_FINE1,
-                            s_c0_values,
-                            carry_count,
-                            mask,
-                            prefix,
-                            8,
-                            wide_hist_addr,
-                            coop_hist_addr,
-                            s_hist0,
-                            remaining_k,
-                            barrier_phase,
-                            ctas_pg,
-                            tx,
-                            lane,
-                            warp_idx,
-                            s_coop_scalars,
-                            False,
-                        )
+                        if cutlass.const_expr(self.mxfp4):
+                            barrier_phase = _coop_narrow_round(
+                                merge_state,
+                                group_id,
+                                _FUSED_COARSE1,
+                                s_c0_values,
+                                carry_count,
+                                mask,
+                                prefix,
+                                coop_hist_addr,
+                                s_hist0,
+                                remaining_k,
+                                barrier_phase,
+                                ctas_pg,
+                                tx,
+                                lane,
+                                warp_idx,
+                                s_coop_scalars,
+                                16,
+                                threads=self.radix_threads,
+                            )
+                        else:
+                            barrier_phase = _coop_wide_round(
+                                merge_state,
+                                group_id,
+                                _FUSED_COARSE1,
+                                _FUSED_FINE1,
+                                s_c0_values,
+                                carry_count,
+                                mask,
+                                prefix,
+                                8,
+                                wide_hist_addr,
+                                coop_hist_addr,
+                                s_hist0,
+                                remaining_k,
+                                barrier_phase,
+                                ctas_pg,
+                                tx,
+                                lane,
+                                warp_idx,
+                                s_coop_scalars,
+                                False,
+                                threads=self.radix_threads,
+                            )
                         pivot_bin = Int32(s_coop_scalars[0])
                         count_gt = Int32(s_coop_scalars[1])
                         bin_count = Int32(s_coop_scalars[2])
-                        prefix = prefix | (Uint32(pivot_bin) << Uint32(8))
-                        mask = Uint32(0xFFFFFF00)
+                        if cutlass.const_expr(self.mxfp4):
+                            prefix = prefix | (Uint32(pivot_bin) << Uint32(16))
+                            mask = Uint32(0xFFFF0000)
+                            done = Int32(1)
+                        else:
+                            prefix = prefix | (Uint32(pivot_bin) << Uint32(8))
+                            mask = Uint32(0xFFFFFF00)
                         winners = winners + count_gt
                         remaining_k = remaining_k - count_gt
                         if bin_count == remaining_k:
@@ -2831,6 +5330,7 @@ class DSAFusedIndexerKernel:
                             lane,
                             warp_idx,
                             s_coop_scalars,
+                            threads=self.radix_threads,
                         )
                         pivot_bin = Int32(s_coop_scalars[0])
                         count_gt = Int32(s_coop_scalars[1])
@@ -2854,7 +5354,7 @@ class DSAFusedIndexerKernel:
                         else:
                             if key == prefix:
                                 _smem_xadd(coop_ctr_addr, Int32(1), Int32(1))
-                        i += Int32(_RADIX_THREADS)
+                        i += Int32(self.radix_threads)
                     cute.arch.sync_threads()
                     if tx == Int32(0):
                         local_gt = Int32(s_coop_counters[0])
@@ -2895,7 +5395,7 @@ class DSAFusedIndexerKernel:
                                 if pos < topk_static:
                                     out_values[group_id, pos] = Float32(s_c0_values[i])
                                     out_indices[group_id, pos] = Int32(s_c0_gindex[i])
-                        i += Int32(_RADIX_THREADS)
+                        i += Int32(self.radix_threads)
                 # Departure: once its output is placed, every CTA publishes
                 # that it is done with the group state, and the last one
                 # zeroes the whole block (round histograms and counters) so
@@ -2914,10 +5414,28 @@ class DSAFusedIndexerKernel:
                     )
                 cute.arch.sync_threads()
                 if Int32(s_relay[0]) == (ctas_pg - Int32(1)):
-                    i = Int32(tx)
-                    while i < Int32(_COOP_STATE_WORDS):
-                        merge_state[_fused_state_offset(group_id, i)] = Int32(0)
-                        i += Int32(_RADIX_THREADS)
+                    if cutlass.const_expr(self.mxfp4 and self.ordered_output):
+                        threadfence()
+                        _mxfp4_order_output(
+                            out_indices,
+                            out_values,
+                            group_id,
+                            s_c0_gindex,
+                            s_c0_values,
+                            tx,
+                            Int32(512),
+                            False,
+                            merge_state,
+                            _COOP_STATE_WORDS,
+                            self.output_position_capacity,
+                            self.vector_output_pairs,
+                            threads=self.radix_threads,
+                        )
+                    else:
+                        i = Int32(tx)
+                        while i < Int32(_COOP_STATE_WORDS):
+                            merge_state[_fused_state_offset(group_id, i)] = Int32(0)
+                            i += Int32(self.radix_threads)
             else:
                 # ---- in-kernel cross-CTA merge (relay) ----
                 # Each CTA atomically packs its carry_count REAL candidates into the
@@ -2927,10 +5445,22 @@ class DSAFusedIndexerKernel:
                 #    woff/arrival live in this group's coop-state block (via
                 #    _FUSED_STATE_OUTPUT / _FUSED_STATE_ARRIVAL), so a group on
                 #    this arm never collides with a sibling group on the coop arm.
-                if tx == Int32(0):
-                    woff_ptr = _fused_state_ptr(
-                        merge_state, group_id, Int32(_FUSED_STATE_OUTPUT)
+                if cutlass.const_expr(
+                    self.mxfp4
+                    and not self.coop_merge_possible
+                    and self.mxfp4_serial_state_words == 2
+                ):
+                    output_offset = Int64(group_id) * Int64(2)
+                    arrival_offset = output_offset + Int64(1)
+                else:
+                    output_offset = _fused_state_offset(
+                        group_id, Int32(_FUSED_STATE_OUTPUT)
                     )
+                    arrival_offset = _fused_state_offset(
+                        group_id, Int32(_FUSED_STATE_ARRIVAL)
+                    )
+                if tx == Int32(0):
+                    woff_ptr = get_ptr_as_int64(merge_state, output_offset)
                     s_relay[0] = atomic_add_global_i32(woff_ptr, carry_count)
                 cute.arch.sync_threads()
                 off = Int32(s_relay[0])
@@ -2939,23 +5469,17 @@ class DSAFusedIndexerKernel:
                 while i < carry_count:
                     pack_values[slab_base + off + i] = Float32(s_c0_values[i])
                     pack_indices[slab_base + off + i] = Int32(s_c0_gindex[i])
-                    i += Int32(_RADIX_THREADS)
+                    i += Int32(self.radix_threads)
                 cute.arch.sync_threads()
                 # 3. release the writes, then bump arrival; old==ctas-1 => I am last
                 if tx == Int32(0):
                     threadfence()
-                    arr_ptr = _fused_state_ptr(
-                        merge_state, group_id, Int32(_FUSED_STATE_ARRIVAL)
-                    )
+                    arr_ptr = get_ptr_as_int64(merge_state, arrival_offset)
                     s_relay[1] = atomic_add_global_i32(arr_ptr, Int32(1))
                 cute.arch.sync_threads()
                 if Int32(s_relay[1]) == (ctas_pg - Int32(1)):
                     threadfence()  # acquire: observe every producer's packed writes
-                    total = Int32(
-                        merge_state[
-                            _fused_state_offset(group_id, Int32(_FUSED_STATE_OUTPUT))
-                        ]
-                    )
+                    total = Int32(merge_state[output_offset])
                     if total > topk_static:
                         _fused_radix_select(
                             pack_v_row,
@@ -2977,13 +5501,14 @@ class DSAFusedIndexerKernel:
                             ni0,
                             ni1,
                             lr,
+                            threads=self.radix_threads,
                         )
                         cute.arch.sync_threads()
                         i = Int32(tx)
                         while i < topk_static:
                             out_values[group_id, i] = Float32(s_c1_values[i])
                             out_indices[group_id, i] = Int32(s_c1_gindex[i])
-                            i += Int32(_RADIX_THREADS)
+                            i += Int32(self.radix_threads)
                     else:
                         i = Int32(tx)
                         while i < topk_static:
@@ -2993,16 +5518,32 @@ class DSAFusedIndexerKernel:
                             else:
                                 out_values[group_id, i] = Float32(float("-inf"))
                                 out_indices[group_id, i] = Int32(-1)
-                            i += Int32(_RADIX_THREADS)
+                            i += Int32(self.radix_threads)
+                    if cutlass.const_expr(self.mxfp4 and self.ordered_output):
+                        cute.arch.sync_threads()
+                        _mxfp4_order_output(
+                            out_indices,
+                            out_values,
+                            group_id,
+                            s_c0_gindex,
+                            s_c0_values,
+                            tx,
+                            Int32(512),
+                            False,
+                            merge_state,
+                            0
+                            if self.mxfp4_serial_state_words == 2
+                            and not self.coop_merge_possible
+                            else _COOP_STATE_WORDS,
+                            self.output_position_capacity,
+                            self.vector_output_pairs,
+                            threads=self.radix_threads,
+                        )
                     # reset the group's counters so the next launch / graph replay starts clean
                     cute.arch.sync_threads()
                     if tx == Int32(0):
-                        merge_state[
-                            _fused_state_offset(group_id, Int32(_FUSED_STATE_OUTPUT))
-                        ] = Int32(0)
-                        merge_state[
-                            _fused_state_offset(group_id, Int32(_FUSED_STATE_ARRIVAL))
-                        ] = Int32(0)
+                        merge_state[output_offset] = Int32(0)
+                        merge_state[arrival_offset] = Int32(0)
 
 
 @lru_cache(maxsize=64)

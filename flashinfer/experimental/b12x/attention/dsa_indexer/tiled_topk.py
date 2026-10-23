@@ -339,6 +339,7 @@ def _exact_overflow_fallback(
     block_k: cutlass.Constexpr[int],
     is_tiled: cutlass.Constexpr[bool],
     is_first: cutlass.Constexpr[bool],
+    threads: cutlass.Constexpr[int] = 1024,
 ):
     """Exact overflow fallback shared by the tiled and fused radix kernels.
 
@@ -349,7 +350,7 @@ def _exact_overflow_fallback(
     candidate buffer, so no overflow. Same convention as the buffered arm
     (``_convert_to_uint32`` monotone key, byte=(key>>shift)&0xFF). Slower
     (re-scans n_total per round on one CTA) but only taken on the rare clustered
-    case; it overwrites s_out[0:topk_static]. All 1024 threads must call this.
+    case; it overwrites s_out[0:topk_static]. All CTA threads must call this.
     Scalars: ni0=prefix, thr=remaining_k, ni1=bucket, lr=next remaining_k,
     ctr=output counter.
     """
@@ -391,7 +392,7 @@ def _exact_overflow_fallback(
                     _smem_red_add(
                         h0, Int32((ex_key >> ex_shift) & Uint32(0xFF)), Int32(1)
                     )
-            idx_base += Int32(_THREADS_PER_CTA)
+            idx_base += Int32(threads)
         cute.arch.sync_threads()
         for ex_stage in cutlass.range_constexpr(8):
             ex_j = Int32(1 << ex_stage)
@@ -452,7 +453,7 @@ def _exact_overflow_fallback(
             ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
             if ex_pos < topk_static:
                 s_out[ex_pos] = idx_base
-        idx_base += Int32(_THREADS_PER_CTA)
+        idx_base += Int32(threads)
     cute.arch.sync_threads()
     idx_base = Int32(tx)
     while idx_base < n_total:
@@ -477,7 +478,7 @@ def _exact_overflow_fallback(
             ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
             if ex_pos < topk_static:
                 s_out[ex_pos] = idx_base
-        idx_base += Int32(_THREADS_PER_CTA)
+        idx_base += Int32(threads)
     cute.arch.sync_threads()
 
 

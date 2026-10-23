@@ -197,6 +197,8 @@ class _OneshotLaunch(_PackedMath):
             "tp2_remote_push",
             "tp2_remote_push_stream",
             "tp2_remote_push_simple",
+            "tp4_push_sentinel",
+            "tp4_push_rsag",
         ):
             raise ValueError(f"invalid plain oneshot transport {transport!r}")
         if transport.startswith("tp2_remote_push") and (
@@ -209,6 +211,13 @@ class _OneshotLaunch(_PackedMath):
                 "TP2 remote push requires a graph-owned staged FP16 or BF16 "
                 "input on two ranks"
             )
+        if transport in ("tp4_push_sentinel", "tp4_push_rsag") and (
+            world_size != 4
+            or not stage_input
+            or not device_slot_selection
+            or dtype_name != "bfloat16"
+        ):
+            raise ValueError("TP4 sentinel push requires graph-owned staged BF16 input")
         self._world_size = int(world_size)
         self._rank = int(rank)
         self._stage_input = bool(stage_input)
@@ -379,6 +388,227 @@ class _OneshotLaunch(_PackedMath):
                         self_signal + Int64(_GRAPH_ARRIVED_OFFSET),
                         Uint32(gdim),
                     )
+        elif cutlass.const_expr(self._transport == "tp4_push_sentinel"):
+            slot_table = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
+            local_base = Int64(slot_table[self._rank]) + plain_region_packs * Int64(16)
+            publish_index = index
+            while publish_index < size_packs:
+                words = ld_global_v4_u32(input_base + Int64(publish_index) * Int64(16))
+                publish = cute.make_rmem_tensor((4,), Uint32)
+                for word in cutlass.range_constexpr(4):
+                    value = words[word]
+                    low_zero = (value & Uint32(0xFFFF)) == Uint32(0)
+                    high_zero = (value & Uint32(0xFFFF0000)) == Uint32(0)
+                    publish[word] = (
+                        value
+                        | (Uint32(low_zero) << Uint32(15))
+                        | (Uint32(high_zero) << Uint32(31))
+                    )
+                for target in cutlass.range_constexpr(4):
+                    address = (
+                        Int64(slot_table[target])
+                        + plain_region_packs * Int64(16)
+                        + (
+                            Int64(self._rank) * plain_capacity_packs
+                            + Int64(publish_index)
+                        )
+                        * Int64(16)
+                    )
+                    st_relaxed_sys_global_v4_u32(
+                        address, publish[0], publish[1], publish[2], publish[3]
+                    )
+                publish_index += stride
+            while index < size_packs:
+                incoming = cute.make_rmem_tensor((4, 4), Uint32)
+                waiting = cutlass.Boolean(True)
+                while waiting:
+                    waiting = cutlass.Boolean(False)
+                    for peer in cutlass.range_constexpr(4):
+                        address = local_base + (
+                            Int64(peer) * plain_capacity_packs + Int64(index)
+                        ) * Int64(16)
+                        words = ld_relaxed_sys_global_v4_u32(address)
+                        for word in cutlass.range_constexpr(4):
+                            incoming[peer, word] = words[word]
+                            waiting = (
+                                waiting
+                                | ((words[word] & Uint32(0xFFFF)) == Uint32(0))
+                                | ((words[word] & Uint32(0xFFFF0000)) == Uint32(0))
+                            )
+                accumulator = cute.make_rmem_tensor((8,), Float32)
+                for peer_index in cutlass.range_constexpr(4):
+                    peer = (self._rank + peer_index) % 4
+                    self._accumulate_words(
+                        accumulator,
+                        incoming[peer, 0],
+                        incoming[peer, 1],
+                        incoming[peer, 2],
+                        incoming[peer, 3],
+                        peer_index == 0,
+                    )
+                self._store_accumulator(
+                    output_base + Int64(index) * Int64(16), accumulator
+                )
+                for peer in cutlass.range_constexpr(4):
+                    address = local_base + (
+                        Int64(peer) * plain_capacity_packs + Int64(index)
+                    ) * Int64(16)
+                    st_relaxed_sys_global_v4_u32(
+                        address, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                    )
+                index += stride
+        elif cutlass.const_expr(self._transport == "tp4_push_rsag"):
+            slot_table = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
+            local_base = Int64(slot_table[self._rank]) + plain_region_packs * Int64(16)
+            part = size_packs // Int32(self._world_size)
+            publish_index = index
+            while publish_index < size_packs:
+                owner = Int32(self._world_size - 1)
+                if part > Int32(0):
+                    owner = cutlass.min(
+                        publish_index // part, Int32(self._world_size - 1)
+                    )
+                words = ld_global_v4_u32(input_base + Int64(publish_index) * Int64(16))
+                publish = cute.make_rmem_tensor((4,), Uint32)
+                for word in cutlass.range_constexpr(4):
+                    value = words[word]
+                    publish[word] = (
+                        value
+                        | (Uint32((value & Uint32(0xFFFF)) == Uint32(0)) << Uint32(15))
+                        | (
+                            Uint32((value & Uint32(0xFFFF0000)) == Uint32(0))
+                            << Uint32(31)
+                        )
+                    )
+                address = (
+                    Int64(slot_table[owner])
+                    + plain_region_packs * Int64(16)
+                    + (Int64(self._rank) * plain_capacity_packs + Int64(publish_index))
+                    * Int64(16)
+                )
+                st_relaxed_sys_global_v4_u32(
+                    address, publish[0], publish[1], publish[2], publish[3]
+                )
+                publish_index += stride
+
+            reduce_index = index
+            while reduce_index < size_packs:
+                owner = Int32(self._world_size - 1)
+                if part > Int32(0):
+                    owner = cutlass.min(
+                        reduce_index // part, Int32(self._world_size - 1)
+                    )
+                if owner == Int32(self._rank):
+                    incoming = cute.make_rmem_tensor((self._world_size, 4), Uint32)
+                    waiting = cutlass.Boolean(True)
+                    while waiting:
+                        waiting = cutlass.Boolean(False)
+                        for peer in cutlass.range_constexpr(self._world_size):
+                            address = local_base + (
+                                Int64(peer) * plain_capacity_packs + Int64(reduce_index)
+                            ) * Int64(16)
+                            words = ld_relaxed_sys_global_v4_u32(address)
+                            for word in cutlass.range_constexpr(4):
+                                incoming[peer, word] = words[word]
+                                waiting = (
+                                    waiting
+                                    | ((words[word] & Uint32(0xFFFF)) == Uint32(0))
+                                    | ((words[word] & Uint32(0xFFFF0000)) == Uint32(0))
+                                )
+                    accumulator = cute.make_rmem_tensor((8,), Float32)
+                    for peer_index in cutlass.range_constexpr(self._world_size):
+                        peer = (self._rank + peer_index) % self._world_size
+                        self._accumulate_words(
+                            accumulator,
+                            incoming[peer, 0],
+                            incoming[peer, 1],
+                            incoming[peer, 2],
+                            incoming[peer, 3],
+                            peer_index == 0,
+                        )
+                    result = cute.make_rmem_tensor((4,), Uint32)
+                    publish = cute.make_rmem_tensor((4,), Uint32)
+                    for word in cutlass.range_constexpr(4):
+                        value = pack_f32x2_to_bf16x2(
+                            accumulator[word * 2], accumulator[word * 2 + 1]
+                        )
+                        result[word] = value
+                        publish[word] = (
+                            value
+                            | (
+                                Uint32((value & Uint32(0xFFFF)) == Uint32(0))
+                                << Uint32(15)
+                            )
+                            | (
+                                Uint32((value & Uint32(0xFFFF0000)) == Uint32(0))
+                                << Uint32(31)
+                            )
+                        )
+                    st_global_v4_u32(
+                        output_base + Int64(reduce_index) * Int64(16),
+                        result[0],
+                        result[1],
+                        result[2],
+                        result[3],
+                    )
+                    for peer in cutlass.range_constexpr(self._world_size):
+                        address = local_base + (
+                            Int64(peer) * plain_capacity_packs + Int64(reduce_index)
+                        ) * Int64(16)
+                        st_relaxed_sys_global_v4_u32(
+                            address, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        )
+                        if cutlass.const_expr(peer != self._rank):
+                            destination = (
+                                Int64(slot_table[peer])
+                                + plain_region_packs * Int64(16)
+                                + (
+                                    Int64(self._rank) * plain_capacity_packs
+                                    + Int64(reduce_index)
+                                )
+                                * Int64(16)
+                            )
+                            st_relaxed_sys_global_v4_u32(
+                                destination,
+                                publish[0],
+                                publish[1],
+                                publish[2],
+                                publish[3],
+                            )
+                reduce_index += stride
+
+            # Publish and output use identical pack ownership, including aliased input.
+            while index < size_packs:
+                owner = Int32(self._world_size - 1)
+                if part > Int32(0):
+                    owner = cutlass.min(index // part, Int32(self._world_size - 1))
+                if owner != Int32(self._rank):
+                    address = local_base + (
+                        Int64(owner) * plain_capacity_packs + Int64(index)
+                    ) * Int64(16)
+                    gathered = cute.make_rmem_tensor((4,), Uint32)
+                    waiting = cutlass.Boolean(True)
+                    while waiting:
+                        words = ld_relaxed_sys_global_v4_u32(address)
+                        waiting = cutlass.Boolean(False)
+                        for word in cutlass.range_constexpr(4):
+                            gathered[word] = words[word]
+                            waiting = (
+                                waiting
+                                | ((words[word] & Uint32(0xFFFF)) == Uint32(0))
+                                | ((words[word] & Uint32(0xFFFF0000)) == Uint32(0))
+                            )
+                    st_global_v4_u32(
+                        output_base + Int64(index) * Int64(16),
+                        gathered[0],
+                        gathered[1],
+                        gathered[2],
+                        gathered[3],
+                    )
+                    st_relaxed_sys_global_v4_u32(
+                        address, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                    )
+                index += stride
         elif cutlass.const_expr(self._transport.startswith("tp2_remote_push")):
             peer_rank = self._rank ^ 1
             local_scratch_base = plain_local_slot0

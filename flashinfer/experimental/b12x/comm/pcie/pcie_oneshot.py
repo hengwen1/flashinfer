@@ -180,12 +180,15 @@ def _uses_sharded_eager_storage(
 def _eager_storage_shards(
     world_size: int,
     transport_policy: Optional[tuple[bool, bool, bool, bool, bool]] = None,
+    *,
+    sentinel: bool = False,
 ) -> int:
     """Return fixed-size shards required by each eager staging slot.
 
     Topology transports reserve one source shard per rank. TP2 plain
-    peer-push also reserves one isolated incoming shard so its unpublished
-    markers cannot alias payloads retained by fused or pull collectives.
+    peer-push reserves isolated incoming records; TP4 plain push reserves one
+    incoming shard per source. Their readiness markers cannot alias payloads
+    retained by fused or pull collectives.
     """
 
     policy = (
@@ -197,7 +200,23 @@ def _eager_storage_shards(
     # PCIe transactions as the payload instead of a separate peer atomic.
     # Eager channels use only the first incoming shard.
     plain_tp2_incoming = 2 if world_size == 2 and policy[2] else 0
-    return base_shards + plain_tp2_incoming
+    plain_tp4_incoming = 4 if world_size == 4 and policy[3] and sentinel else 0
+    return base_shards + plain_tp2_incoming + plain_tp4_incoming
+
+
+def _tp4_sentinel_supported(*, device, exchange_group, world_size):
+    if world_size != 4:
+        return False
+    capability = _run_collective_preallocation_setup(
+        owner="PCIe sentinel capability",
+        exchange_group=exchange_group,
+        setup=lambda: (
+            *torch.cuda.get_device_capability(device),
+            torch.cuda.get_device_properties(device).multi_processor_count,
+        ),
+    )
+    capabilities = _broadcast_gather_object(capability, exchange_group)
+    return all(tuple(value) == (12, 0, 188) for value in capabilities)
 
 
 def _transport_policy_contract() -> tuple[bool, bool, bool, bool, bool]:
@@ -399,6 +418,7 @@ class _OwnedSharedBuffer:
     local_ptr: int
     peer_ptrs: tuple[int, ...]
     remote_ptrs: tuple[int, ...]
+    nbytes: int = 0
 
 
 @dataclass
@@ -1593,6 +1613,17 @@ class _CuTeOneshotBackend:
             }[mode]
             return transport, threads, blocks
         threads, blocks = cls._launch_geometry(inp.numel() * inp.element_size() // 16)
+        nbytes = inp.numel() * inp.element_size()
+        if (
+            graph_channel
+            and state.world_size == 4
+            and state.plain_remote_push_region_packs > 0
+            and state.eager_tables is not None
+            and state.eager_buffer_bytes is not None
+            and inp.dtype == torch.bfloat16
+            and 0 < nbytes <= min(state.eager_buffer_bytes, 640 * 1024)
+        ):
+            return "tp4_push_sentinel", 256, 16
         return "pull", threads, blocks
 
     @classmethod
@@ -2271,6 +2302,12 @@ class PCIeOneshotAllReduce:
                 exchange_group=self.exchange_group,
             )
 
+            self._sentinel_supported = _tp4_sentinel_supported(
+                device=self.device,
+                exchange_group=self.exchange_group,
+                world_size=self.world_size,
+            )
+
             def prepare() -> tuple[Optional[CudaRTLibrary], object]:
                 prepared_ipc = self._ipc
                 if prepared_ipc is None and (ext_module is None or owned_buffers):
@@ -2339,7 +2376,9 @@ class PCIeOneshotAllReduce:
         rank_data_bytes: int,
         ext_module,
         stream_affine: bool,
+        sentinel_supported: bool = False,
     ) -> None:
+        self._sentinel_supported = bool(sentinel_supported)
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.device = device
@@ -2401,6 +2440,21 @@ class PCIeOneshotAllReduce:
                         self.eager_buffer_bytes,
                         self._transport_policy,
                     )
+                    if self._sentinel_supported and self._transport_policy[3]:
+                        capacity = int(self.eager_buffer_bytes or 0)
+                        required = 8 * capacity
+                        if all(
+                            any(
+                                buffer.local_ptr <= pointers[self.rank]
+                                and pointers[self.rank] + required
+                                <= buffer.local_ptr + buffer.nbytes
+                                for buffer in self._owned_buffers
+                            )
+                            for pointers in self._eager_ptrs
+                        ):
+                            self._ext._state(
+                                self._ptr
+                            ).plain_remote_push_region_packs = 4 * capacity // 16
                 else:
                     self._ext.register_pcie_buffers(
                         self._ptr,
@@ -2517,6 +2571,10 @@ class PCIeOneshotAllReduce:
             exchange_group=exchange_group,
         )
 
+        sentinel_supported = _tp4_sentinel_supported(
+            device=device_obj, exchange_group=exchange_group, world_size=world_size
+        )
+
         def prepare() -> tuple[CudaRTLibrary, object, int]:
             prepared_ipc = CudaRTLibrary()
             prepared_ipc.cudaSetDevice(_cuda_device_index(device_obj))
@@ -2547,6 +2605,7 @@ class PCIeOneshotAllReduce:
             eager_storage_shards=_eager_storage_shards(
                 world_size,
                 transport_policy,
+                sentinel=sentinel_supported,
             ),
             ipc=ipc,
         )
@@ -2567,6 +2626,7 @@ class PCIeOneshotAllReduce:
             rank_data_bytes=rank_data_bytes,
             ext_module=ext,
             stream_affine=stream_affine,
+            sentinel_supported=sentinel_supported,
         )
 
         def abort_native_runtime() -> None:
@@ -2824,6 +2884,7 @@ class PCIeOneshotAllReduce:
             local_ptr=local_ptr,
             peer_ptrs=tuple(peer_ptrs),
             remote_ptrs=tuple(remote_ptrs),
+            nbytes=int(size_in_bytes),
         )
 
     @classmethod
@@ -3626,6 +3687,7 @@ class PCIeOneshotAllReducePool:
         self._ipc = ipc
         self._ext = ext_module
         self._signal_bytes = 0
+        self._sentinel_supported = False
         if self._channel_factory is None:
             assert self.exchange_group is not None
             _require_full_grid_residency(
@@ -3633,6 +3695,17 @@ class PCIeOneshotAllReducePool:
                 required_sms=(ONESHOT_REQUIRED_SMS * self.max_concurrent_channels),
                 device=self.device,
                 exchange_group=self.exchange_group,
+            )
+
+            self._sentinel_supported = _tp4_sentinel_supported(
+                device=self.device,
+                exchange_group=self.exchange_group,
+                world_size=self.world_size,
+            )
+            self._eager_storage_shards = _eager_storage_shards(
+                self.world_size,
+                self._transport_policy,
+                sentinel=self._sentinel_supported,
             )
 
             def prepare() -> tuple[CudaRTLibrary, object, int]:
@@ -3762,6 +3835,7 @@ class PCIeOneshotAllReducePool:
             rank_data_bytes=self.rank_data_bytes,
             ext_module=self._ext,
             stream_affine=not self.single_channel,
+            sentinel_supported=self._sentinel_supported,
         )
 
         def abort_native_runtime() -> None:

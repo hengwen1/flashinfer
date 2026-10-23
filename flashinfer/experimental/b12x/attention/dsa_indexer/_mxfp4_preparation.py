@@ -174,12 +174,18 @@ def _ordinary_arguments(values, views, score_width, ordered_output):
     counts = values["candidate_lengths"]
     if ids is None:
         ids, counts = output_ids, lengths
+    page_table = values["page_table"]
+    if page_table.stride(0) == 0:
+        # CuTe omits static broadcast strides from the launch ABI. Represent
+        # the shared table as one physical row with the prepared stride ABI.
+        columns = page_table.shape[1]
+        page_table = page_table.as_strided((1, columns), (columns, 1))
     tensors = (
         values["q_mxfp4"],
         values["query_weights"],
         values["index_k_cache"],
         values["q_scales"],
-        values["page_table"],
+        page_table,
         lengths,
         lengths,
         lengths,

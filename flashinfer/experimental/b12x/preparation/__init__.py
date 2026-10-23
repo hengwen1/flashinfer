@@ -17,6 +17,7 @@ from .tuning import (
 )
 from .types import (
     CollectiveRequirement,
+    CollectiveTuningRequirement,
     DeviceIdentity,
     FrozenMapping,
     MemoryRequirements,
@@ -42,6 +43,7 @@ __all__ = [
     "BackendConfig",
     "CollectiveBarrierTimeout",
     "CollectiveRequirement",
+    "CollectiveTuningRequirement",
     "DetectedDevice",
     "DeviceIdentity",
     "EligiblePlan",

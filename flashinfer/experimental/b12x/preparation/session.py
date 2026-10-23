@@ -44,6 +44,7 @@ from ._timing import PreparationTiming
 from .device import DetectedDevice, detect_device
 from .types import (
     CollectiveRequirement,
+    CollectiveTuningRequirement,
     FrozenMapping,
     MemoryRequirements,
     Plan,
@@ -560,7 +561,9 @@ class PreparationSession:
                 progress(state)
             if state.done:
                 return job.result()
-            if state.ready_cache is not None or state.ready_tuning:
+            if state.ready_collective_tuning is not None:
+                authorization = {"collective_tuning": coordinator(state)}
+            elif state.ready_cache is not None or state.ready_tuning:
                 if coordinator is None:
                     raise ValueError("sharded preparation requires a coordinator")
                 key = "cache" if state.ready_cache is not None else "tuning"
@@ -866,6 +869,7 @@ class PreparationJob:
         done,
         ready_tuning=(),
         ready_cache=None,
+        ready_collective_tuning=None,
     ):
         """Build a preparation progress snapshot from the live job state."""
         active_compilations = 0
@@ -877,7 +881,10 @@ class PreparationJob:
             "ready"
             if done
             else "waiting for ranks"
-            if ready_collectives or ready_tuning or ready_cache
+            if ready_collectives
+            or ready_tuning
+            or ready_cache
+            or ready_collective_tuning
             else "compiling"
             if pending_compilation and self._phase != "planning programs"
             else self._phase
@@ -918,6 +925,7 @@ class PreparationJob:
             candidates_described=self._candidates_described,
             restored_candidates=self._restored,
             rejected_candidates=self._rejected,
+            ready_collective_tuning=ready_collective_tuning,
         )
 
     def _collective_barrier(self, requirement: CollectiveRequirement) -> None:
@@ -965,7 +973,9 @@ class PreparationJob:
                 f"collective barrier for {requirement.key!r} failed: {error}"
             ) from error
 
-    def advance(self, *, collective_key=None, tuning=None, cache=None):
+    def advance(
+        self, *, collective_key=None, tuning=None, cache=None, collective_tuning=None
+    ):
         """Advance preparation until work completes or reaches a readiness boundary."""
         started = time.perf_counter()
         if self._last_advance_end is not None:
@@ -973,7 +983,10 @@ class PreparationJob:
         try:
             with self._program_cache.activate():
                 return self._advance(
-                    collective_key=collective_key, tuning=tuning, cache=cache
+                    collective_key=collective_key,
+                    tuning=tuning,
+                    cache=cache,
+                    collective_tuning=collective_tuning,
                 )
         finally:
             if self._result is not None or self._closed:
@@ -991,7 +1004,9 @@ class PreparationJob:
             )
             self._last_advance_end = time.perf_counter()
 
-    def _advance(self, *, collective_key=None, tuning=None, cache=None):
+    def _advance(
+        self, *, collective_key=None, tuning=None, cache=None, collective_tuning=None
+    ):
         """Run work until it reaches a readiness boundary or time slice."""
         self.session._check_thread()
         if self._error is not None:
@@ -1000,12 +1015,30 @@ class PreparationJob:
             return self._progress(False, False, (), True)
         if self._closed:
             raise RuntimeError("preparation job is closed")
-        if self.session._stop.is_set() and self.session._pool is not None:
+        if self._locally_stopped and self.session._pool is not None:
             pool, self.session._pool = self.session._pool, None
             pool.cancel_optional()
             pool.close(terminate=True)
         send_value = None
-        if isinstance(self._blocked, TuningCacheRequirement):
+        if isinstance(self._blocked, CollectiveTuningRequirement):
+            if collective_tuning is None:
+                return self._progress(
+                    False, False, (), False, ready_collective_tuning=self._blocked
+                )
+            peers = tuple(collective_tuning)
+            expected = self._blocked
+            if len(peers) != len(expected.ranks) or any(
+                not isinstance(item, CollectiveTuningRequirement)
+                or (item.key, item.ranks, item.step)
+                != (expected.key, expected.ranks, expected.step)
+                for item in peers
+            ):
+                raise ValueError("collective tuning exchange differs from ready work")
+            self._blocked = None
+            send_value = peers
+        elif collective_tuning is not None:
+            raise ValueError("collective tuning exchange does not match ready work")
+        elif isinstance(self._blocked, TuningCacheRequirement):
             if cache is None:
                 return self._progress(
                     False, False, (), False, ready_cache=self._blocked
@@ -1087,6 +1120,11 @@ class PreparationJob:
                 finally:
                     self._timing.add(self._phase, time.perf_counter() - started)
                 send_value = None
+                if isinstance(signal, CollectiveTuningRequirement):
+                    self._blocked = signal
+                    return self._progress(
+                        False, False, (), False, ready_collective_tuning=signal
+                    )
                 if isinstance(signal, TuningCacheRequirement):
                     self._blocked = signal
                     return self._progress(False, False, (), False, ready_cache=signal)
@@ -1249,9 +1287,21 @@ class PreparationJob:
         return True
 
     @property
+    def _locally_stopped(self):
+        request = self._active_request
+        if (
+            request is not None
+            and request.collective is not None
+            and request.plan.contract.collective_signature is not None
+        ):
+            # Collective cancellation is agreed at drained group boundaries.
+            return False
+        return self.session._stop.is_set()
+
+    @property
     def _warmup_only(self):
         return not self.session.cache_only and (
-            not self.autotune or self.session._stop.is_set()
+            not self.autotune or self._locally_stopped
         )
 
     def _direct_compilation(self):
@@ -1275,7 +1325,7 @@ class PreparationJob:
                     if item.plan.prepared is not None
                     and (
                         not self.autotune
-                        or self.session._stop.is_set()
+                        or self._locally_stopped
                         or item.plan.selection.source != "default"
                     )
                 ),
@@ -1314,7 +1364,7 @@ class PreparationJob:
             prepared = plan.prepared
             if prepared is not None and (
                 not self.autotune
-                or self.session._stop.is_set()
+                or self._locally_stopped
                 or prepared.selection.source != "default"
             ):
                 obligation.selection = prepared.selection
@@ -1340,7 +1390,7 @@ class PreparationJob:
                     obligation.selection is None
                     and not single_product
                     and not self.session.cache_only
-                    and (not self.autotune or self.session._stop.is_set())
+                    and (not self.autotune or self._locally_stopped)
                 ):
                     obligation.selection = self._selection(
                         obligation, configuration.default, "default"
@@ -1357,7 +1407,7 @@ class PreparationJob:
                         while not iterator.done:
                             if (
                                 not single_product
-                                and self.session._stop.is_set()
+                                and self._locally_stopped
                                 and not self.session.cache_only
                             ):
                                 break
@@ -1395,7 +1445,7 @@ class PreparationJob:
                         obligation.selection = self._selection(
                             obligation, config, "fixed", assignment
                         )
-                    elif self.session._stop.is_set() and not self.session.cache_only:
+                    elif self._locally_stopped and not self.session.cache_only:
                         obligation.selection = self._selection(
                             obligation, configuration.default, "default"
                         )
@@ -1427,7 +1477,9 @@ class PreparationJob:
         for obligation in obligations:
             if obligation.selection is None:
                 obligation.planned_candidates = len(
-                    obligation.candidates[rank_index::rank_count]
+                    obligation.candidates
+                    if obligation.request.collective is not None
+                    else obligation.candidates[rank_index::rank_count]
                 )
         self._total_candidates = sum(item.planned_candidates for item in obligations)
         return obligations
@@ -1636,6 +1688,7 @@ class PreparationJob:
         synchronize=True,
         compile_directly=False,
         reject_unlaunchable=False,
+        prime=True,
     ):
         import torch
 
@@ -1664,7 +1717,8 @@ class PreparationJob:
                 rejected = None
                 try:
                     with self._timing.span("prime"):
-                        _prime(call)
+                        if prime:
+                            _prime(call)
                 except Exception as error:
                     if not reject_unlaunchable or not _cooperative_launch_rejected(
                         error
@@ -1711,6 +1765,7 @@ class PreparationJob:
         request=None,
         synchronize=True,
         reject_unlaunchable=False,
+        prime=True,
     ):
         request = obligation.request if request is None else request
         plan = request.plan
@@ -1728,6 +1783,7 @@ class PreparationJob:
                 expected,
                 synchronize=synchronize,
                 reject_unlaunchable=reject_unlaunchable,
+                prime=prime,
             )
 
     def _trial(self, obligation, index, assignment, config):
@@ -1767,7 +1823,7 @@ class PreparationJob:
     def _release_race_resources(self):
         self._race_eviction = None
 
-    def _measure(self, trials, *, champion):
+    def _measure(self, trials, *, champion, sample_exchange=None, launch_exchange=None):
         from ._measurement import _l2_flush_fn, prepare_race_steps, measure_race_steps
 
         calls = [trial.call for trial in trials]
@@ -1790,7 +1846,7 @@ class PreparationJob:
                 primed=True,
                 eviction=self._race_eviction,
             )
-            while not self.session._stop.is_set():
+            while sample_exchange is not None or not self.session._stop.is_set():
                 try:
                     next(steps)
                 except StopIteration as finished:
@@ -1810,15 +1866,18 @@ class PreparationJob:
                 ),
                 eliminate=True,
                 champion=champion,
+                sample_exchange=sample_exchange,
+                launch_exchange=launch_exchange,
             )
-            while not self.session._stop.is_set():
+            response = None
+            while sample_exchange is not None or not self.session._stop.is_set():
                 try:
-                    next(measuring)
+                    signal = measuring.send(response)
                     self._observe(race)
                 except StopIteration as finished:
                     self._observe(race)
                     return finished.value
-                yield "gpu"
+                response = yield "gpu" if signal is None else signal
             return None
         finally:
             closers = []
@@ -2380,7 +2439,14 @@ class PreparationJob:
                 if obligation.selection is None:
                     yield from self._describe_candidates(obligation)
                     self._phase = "selecting"
-                    self._lookup(obligation, selections)
+                    if request.collective is not None:
+                        from ._collective import select
+
+                        obligation.selection = yield from select(
+                            self, obligation, selections
+                        )
+                    else:
+                        self._lookup(obligation, selections)
                 if obligation.selection is not None and obligation.planned_candidates:
                     self._total_candidates -= obligation.planned_candidates
                     obligation.planned_candidates = 0
@@ -2388,10 +2454,6 @@ class PreparationJob:
                     if self.session.cache_only:
                         raise LookupError(f"no completed selection for {request.name}")
                     if not self.session._stop.is_set() and self.autotune:
-                        if request.collective is not None:
-                            raise ValueError(
-                                "collective declarations must be fixed or explicitly pinned"
-                            )
                         result = yield from self._race(obligation)
                         if isinstance(result, TuningRequirement):
                             pending.append((obligation, result))

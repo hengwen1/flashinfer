@@ -56,12 +56,12 @@ def prepare(session, manager, inp, out, arm, threads, blocks):
             call.update(threads=threads, blocks=blocks)
         query = replace(query, call=FrozenMapping(call))
         plan = oneshot.plan(query, runtime=target)
-    native_twoshot = plan.query.surface.startswith("PCIeTwoShotBF16.")
-    prime = (
-        (lambda state: twoshot.prepared_call(state, payload=inp, out=out))
-        if native_twoshot
-        else (lambda state: oneshot._prepare_plain_call(state, inp=inp, out=out))
-    )
+
+    def prime(state):
+        if state.query.surface.startswith("PCIeTwoShotBF16."):
+            return twoshot.prepared_call(state, payload=inp, out=out)
+        return oneshot._prepare_plain_call(state, inp=inp, out=out)
+
     name = f"{arm}-{inp.numel()}"
     session.prepare(
         (

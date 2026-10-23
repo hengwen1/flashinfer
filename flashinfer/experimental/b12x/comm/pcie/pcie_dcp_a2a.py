@@ -833,8 +833,8 @@ class PCIeDCPA2A:
         *,
         plan: Plan,
         is_lse_base_on_e: bool = True,
-        threads: int = 256,
-        block_limit: int = 16,
+        threads: int | None = None,
+        block_limit: int | None = None,
     ) -> torch.Tensor:
         with _device_guard(self.device):
             state = self._prepared_state(plan)
@@ -870,8 +870,13 @@ class PCIeDCPA2A:
             )
         self._validate(partial_output, partial_lse, out)
         threads, block_limit = self._resolve_launch_config(
-            threads=threads, block_limit=block_limit
+            threads=state.query.call["threads"] if threads is None else threads,
+            block_limit=state.query.call["block_limit"]
+            if block_limit is None
+            else block_limit,
         )
+        if threads != state.query.call["threads"]:
+            raise ValueError("DCP threads differ from the prepared launcher")
         rows = int(partial_output.shape[0]) * self.heads_per_rank
         blocks = max(1, min(block_limit, (rows + threads // 32 - 1) // (threads // 32)))
         capturing = _is_current_stream_capturing(self.device)
@@ -942,8 +947,8 @@ class PCIeDCPA2A:
         out: Optional[torch.Tensor] = None,
         *,
         plan: Plan,
-        threads: int = 256,
-        block_limit: int = 16,
+        threads: int | None = None,
+        block_limit: int | None = None,
     ) -> torch.Tensor:
         """Gather rank-local heads into a rank-major head dimension."""
         with _device_guard(self.device):
@@ -1003,9 +1008,13 @@ class PCIeDCPA2A:
         if batch * self.total_heads * self.query_head_dim > self._output_capacity_elems:
             raise ValueError("PCIe DCP all-gather staging capacity exceeded")
         threads, block_limit = self._resolve_launch_config(
-            threads=threads,
-            block_limit=block_limit,
+            threads=state.query.call["threads"] if threads is None else threads,
+            block_limit=state.query.call["block_limit"]
+            if block_limit is None
+            else block_limit,
         )
+        if threads != state.query.call["threads"]:
+            raise ValueError("DCP threads differ from the prepared launcher")
         rows = int(batch) * self.total_heads
         warps_per_block = threads // 32
         blocks = max(
@@ -1981,8 +1990,8 @@ class PCIeDCPA2APool:
         *,
         plan: Plan,
         is_lse_base_on_e=True,
-        threads=256,
-        block_limit=16,
+        threads=None,
+        block_limit=None,
         stream=None,
         channel_id=None,
     ):
@@ -2016,8 +2025,8 @@ class PCIeDCPA2APool:
         out=None,
         *,
         plan: Plan,
-        threads=256,
-        block_limit=16,
+        threads=None,
+        block_limit=None,
         stream=None,
         channel_id=None,
     ):

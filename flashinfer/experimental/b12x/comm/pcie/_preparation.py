@@ -6,6 +6,7 @@ from importlib import import_module
 
 from b12x.preparation import FrozenMapping, Plan
 from ._tuning import PcieConfig, PcieQuery, TUNING
+from ._collective_tuning import CollectiveConfig
 
 
 _OWNER_SURFACES = frozenset(
@@ -46,16 +47,31 @@ def plan(
     *,
     runtime=None,
     invocation=FrozenMapping(),
-    override: PcieConfig | None = None,
+    override: PcieConfig | CollectiveConfig | None = None,
 ) -> Plan:
     """Declare native work; neither topology nor a communicator is constructed.
 
-    The all-reduce manager's ``plan`` method first selects its existing native
-    channel using the original host routing rule, then calls this entry point.
+    DCP head gather and LSE reduce-scatter expose launch candidates on TP2–8.
+    Other low-level declarations retain their explicit native configuration.
+    ``AllReduce.plan`` composes eligible one-shot and two-shot transports.
     """
     if not isinstance(query, PcieQuery):
         raise TypeError("query must be PcieQuery")
     TUNING.validate_query(query, None)
+    if (
+        runtime is not None
+        and query.world_size <= 8
+        and query.surface.startswith(("DcpAllToAll.", "DcpAllToAllPool."))
+        and query.surface.endswith((".lse_reduce_scatter", ".all_gather_heads"))
+    ):
+        from ._collective_tuning import plan as collective_plan
+
+        return collective_plan(
+            {"dcp": (query, runtime)},
+            default="dcp",
+            invocation=invocation,
+            override=override,
+        )
     return _provider(query.surface).plan(
         query,
         runtime=runtime,

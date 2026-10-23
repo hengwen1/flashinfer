@@ -608,9 +608,8 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         # through the copy and barrier phases, which materially increases the
         # graph kernel's register footprint.  Only the local pointer is needed
         # before the barrier; form each remote address at its eventual use.
-        # Two ranks push only the peer's heads into the peer's staging, which the
-        # peer then reads from its own memory; wider worlds stage every head
-        # locally and pull.
+        # TP2 and TP4 push each destination's heads into its local staging.
+        # TP4 indexes incoming rows by source rank to keep the existing capacity.
         if cutlass.const_expr(self._world_size == 2):
             local_staging = staging[1 - self._rank] + slot_offset
         else:
@@ -624,7 +623,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             local_head = row - batch_index * heads_per_rank
             for destination in cutlass.range_constexpr(self._world_size):
                 if cutlass.const_expr(
-                    self._world_size != 2 or destination != self._rank
+                    self._world_size not in (2, 4) or destination != self._rank
                 ):
                     source_row = (
                         Int64(batch_index) * Int64(total_heads)
@@ -639,7 +638,19 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                         )
                         * input_stride_head
                     )
-                    staging_base = source_row * Int64(packs_per_head)
+                    incoming_row = source_row
+                    if cutlass.const_expr(self._world_size == 4):
+                        incoming_row = (
+                            Int64(batch_index) * Int64(total_heads)
+                            + Int64(self._rank) * Int64(heads_per_rank)
+                            + Int64(local_head)
+                        )
+                        destination_staging = staging[destination] + slot_offset
+                        local_stage_words = self._staging_words(destination_staging)
+                        local_stage_lse = self._staging_lse(
+                            destination_staging, lse_offset
+                        )
+                    staging_base = incoming_row * Int64(packs_per_head)
                     pack = lane
                     while pack < packs_per_head:
                         _copy_16b(
@@ -653,7 +664,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                         pack += Int32(32)
                     if lane == Int32(0):
                         value = cute.arch.load(local_lse + source_row, Float32)
-                        cute.arch.store(local_stage_lse + source_row, value)
+                        cute.arch.store(local_stage_lse + incoming_row, value)
             row += warp_stride
 
         block_pair_barrier(
@@ -663,7 +674,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             world_size=self._world_size,
             max_blocks=_MAX_BLOCKS,
         )
-        if cutlass.const_expr(self._world_size == 2):
+        if cutlass.const_expr(self._world_size in (2, 4)):
             # Acquire the peer's pushed partials before reading them locally.
             if Int32(tidx) == Int32(0):
                 _membar_sys()
@@ -683,10 +694,14 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             lane_lse_base = Int64(local_lse.toint())
             for source_index in cutlass.range_constexpr(1, self._world_size):
                 source = (self._rank + source_index) % self._world_size
-                incoming = self._rank if self._world_size == 2 else source
+                incoming = self._rank if self._world_size in (2, 4) else source
                 source_lse_base = (
                     Int64(staging[incoming].toint()) + slot_offset + lse_offset
                 )
+                if cutlass.const_expr(self._world_size == 4):
+                    source_lse_base += (
+                        Int64(source - self._rank) * Int64(heads_per_rank) * Int64(4)
+                    )
                 if lane == Int32(source_index):
                     lane_lse_base = source_lse_base
 
@@ -741,10 +756,17 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                 if cutlass.const_expr(source == self._rank):
                     source_address = local_output.toint() + local_base * Int64(16)
                 else:
-                    incoming = self._rank if self._world_size == 2 else source
+                    incoming = self._rank if self._world_size in (2, 4) else source
+                    incoming_pack = staging_base
+                    if cutlass.const_expr(self._world_size == 4):
+                        incoming_pack += (
+                            Int64(source - self._rank)
+                            * Int64(heads_per_rank)
+                            * Int64(packs_per_head)
+                        )
                     source_address = _add_u64_opaque(
                         staging[incoming].toint(),
-                        slot_offset + staging_base * Int64(16),
+                        slot_offset + incoming_pack * Int64(16),
                     )
                 payload_row_addresses[source_index] = source_address
             for pack in cutlass.range(

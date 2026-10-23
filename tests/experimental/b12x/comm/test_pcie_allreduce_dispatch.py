@@ -10,6 +10,33 @@ from b12x.comm.pcie import pcie_oneshot as oneshot
 from b12x.comm.pcie.pcie_twoshot_bf16 import PCIeTwoShotBF16
 
 
+@pytest.mark.parametrize(
+    "nbytes, expected",
+    (
+        (16, "tp4_push_sentinel"),
+        (24576, "tp4_push_sentinel"),
+        (24592, "tp4_push_rsag"),
+        (655360, "tp4_push_rsag"),
+        (2097168, "tp4_push_rsag"),
+    ),
+)
+def test_payload_ready_graph_plan_requires_owned_incoming_storage(nbytes, expected):
+    native = SimpleNamespace(
+        world_size=4,
+        eager_tables=(256, 512),
+        eager_buffer_bytes=4 << 20,
+        plain_remote_push_region_packs=4 * (4 << 20) // 16,
+        transport_policy=(False, True, True, True, True),
+    )
+    inp = torch.empty(nbytes // 2, dtype=torch.bfloat16)
+    config = oneshot._CuTeOneshotBackend._plain_launch_config
+    assert config(native, inp, graph_channel=True) == (expected, 256, 16)
+    assert config(native, inp, graph_channel=False)[0] == "pull"
+    assert config(native, inp.to(torch.float16), graph_channel=True)[0] == "pull"
+    native.plain_remote_push_region_packs = 0
+    assert config(native, inp, graph_channel=True)[0] == "pull"
+
+
 def _runtime():
     runtime = object.__new__(PCIeTwoShotBF16)
     runtime.device = torch.device("cpu")
@@ -21,18 +48,35 @@ def _runtime():
 
 
 @pytest.mark.parametrize(
-    "nbytes", (65536 - 64, 65536, 65536 + 64, 2 << 20, (2 << 20) + 64)
+    "nbytes",
+    (
+        65536 - 64,
+        65536,
+        65536 + 64,
+        640 << 10,
+        (640 << 10) + 64,
+        2 << 20,
+        (2 << 20) + 64,
+    ),
 )
-def test_output_aware_twoshot_size_band(nbytes):
+@pytest.mark.parametrize("payload_ready", (False, True))
+def test_output_aware_twoshot_size_band(nbytes, payload_ready):
     primary = SimpleNamespace(
-        rank=0, world_size=4, device=torch.device("cpu"), max_size=(2 << 20) + 64
+        rank=0,
+        world_size=4,
+        device=torch.device("cpu"),
+        max_size=(2 << 20) + 64,
+        _sentinel_supported=payload_ready,
+        _transport_policy=(False, True, True, True, True),
     )
     manager = dispatch.PCIeAllReduce(
         primary, "oneshot", bf16_twoshot=_runtime(), algorithm_override="auto"
     )
     inp = torch.empty(nbytes // 2, dtype=torch.bfloat16)
     out = torch.empty_like(inp)
-    expected = 65536 <= nbytes <= 2 << 20
+    expected = (
+        nbytes > 640 << 10 if payload_ready else nbytes >= 65536
+    ) and nbytes <= 2 << 20
     assert manager._use_bf16_twoshot(inp, out) == expected
     assert manager._use_bf16_twoshot(inp, None) == expected
     assert not manager._use_bf16_twoshot(inp, inp)
@@ -40,7 +84,12 @@ def test_output_aware_twoshot_size_band(nbytes):
 
 def test_twoshot_rejects_partially_overlapping_output():
     primary = SimpleNamespace(
-        rank=0, world_size=4, device=torch.device("cpu"), max_size=2 << 20
+        rank=0,
+        world_size=4,
+        device=torch.device("cpu"),
+        max_size=2 << 20,
+        _sentinel_supported=False,
+        _transport_policy=(False, True, True, True, True),
     )
     manager = dispatch.PCIeAllReduce(
         primary, "oneshot", bf16_twoshot=_runtime(), algorithm_override="auto"

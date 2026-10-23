@@ -22,6 +22,7 @@ from b12x.comm.pcie.pcie_oneshot import (
     PCIeOneshotAllReducePool,
     _CuTeOneshotBackend,
 )
+from b12x.comm.pcie._oneshot_cute import _PLAIN_GRAPH_EPOCH_OFFSET
 
 
 pytestmark = pytest.mark.skipif(
@@ -99,6 +100,18 @@ def _local_eager_words(
         )
     stream.synchronize()
     return words[0].value, words[1].value
+
+
+def _payload_epoch(channel, stream):
+    value = ctypes.c_uint32()
+    channel._ipc.cudaMemcpyAsync(
+        ctypes.addressof(value),
+        channel.signal_ptrs[channel.rank] + _PLAIN_GRAPH_EPOCH_OFFSET,
+        ctypes.sizeof(value),
+        int(stream.cuda_stream),
+    )
+    stream.synchronize()
+    return value.value
 
 
 def _dim3_tuple(value) -> tuple[int, int, int]:
@@ -543,6 +556,8 @@ def _run_graph(
             remote_source = (rank + 1) % world_size
         offset = remote_source * channel.eager_buffer_bytes
     snapshots = [_local_eager_words(channel, stream, offset=offset)]
+    payload_ready = plan.query.call["mode"] == "stage_bf16_sentinel"
+    epochs = [_payload_epoch(channel, stream)] if payload_ready else []
 
     for iteration in range(3):
         next_inp, next_residual, _ = _make_inputs(
@@ -566,6 +581,14 @@ def _run_graph(
         _assert_close(out, expected_out, dtype)
         _assert_close(residual, expected_residual, dtype)
         snapshots.append(_local_eager_words(channel, stream, offset=offset))
+        if payload_ready:
+            epochs.append(_payload_epoch(channel, stream))
+            for source in range(world_size):
+                incoming_offset = (world_size + source) * channel.eager_buffer_bytes
+                assert _local_eager_words(channel, stream, offset=incoming_offset) == (
+                    0,
+                    0,
+                )
 
     changed_slots = [
         {
@@ -577,11 +600,15 @@ def _run_graph(
         }
         for index in range(3)
     ]
-    assert all(len(changed) == 1 for changed in changed_slots)
-    assert all(
-        changed_slots[index] != changed_slots[index + 1]
-        for index in range(len(changed_slots) - 1)
-    )
+    if payload_ready:
+        assert epochs == list(range(epochs[0], epochs[0] + 4))
+        assert snapshots == [snapshots[0]] * 4
+    else:
+        assert all(len(changed) == 1 for changed in changed_slots)
+        assert all(
+            changed_slots[index] != changed_slots[index + 1]
+            for index in range(len(changed_slots) - 1)
+        )
     result.close()
     session.close()
 

@@ -259,6 +259,7 @@ class TuningContract(Generic[QueryT, ConfigT]):
     equivalence_key: (
         Callable[[QueryT, DeviceIdentity | None, ConfigT], object] | None
     ) = None
+    collective_signature: Callable[[QueryT], Mapping[str, object]] | None = None
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-z][a-z0-9_.-]*", self.component_id):

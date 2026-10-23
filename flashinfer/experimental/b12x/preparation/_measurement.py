@@ -7,7 +7,7 @@ import gc
 import math
 import os
 import statistics
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 
 from b12x._lib.compile_plan import (
@@ -37,7 +37,10 @@ def capture_benchmark_call(call):
             for _ in range(2):
                 _prime(call)
         stream.synchronize()
-        with call_scope(), torch.cuda.graph(graph, stream=stream):
+        context = (
+            nullcontext() if call.capture_context is None else call.capture_context()
+        )
+        with context, call_scope(), torch.cuda.graph(graph, stream=stream):
             call.invoke()
     except BaseException:
         try:
@@ -226,12 +229,17 @@ class _TimedCall:
             for event in pair:
                 event.record()
 
-    def replay(self):
+    def replay(self, *, align=False):
         import torch
         from .types import call_scope
 
         stream = torch.cuda.current_stream()
         with call_scope():
+            if align:
+                if self.call.reset is not None:
+                    self.call.reset()
+                self.producers[0]()
+                self.call.invoke()
             for index, (start, end) in enumerate(self.events):
                 self.eviction()
                 if self.call.reset is not None:
@@ -261,13 +269,16 @@ class PreparedRace:
     active_count: int = 0
     latest_round_us: tuple[float, ...] = ()
     gate: object = None
+    collective_gate: object = None
     _closed: bool = field(default=False, init=False)
 
     def close(self):
         if self._closed:
             return
         self._closed = True
-        closers = [] if self.gate is None else [self.gate.close]
+        closers = [] if self.collective_gate is None else [self.collective_gate.close]
+        if self.gate is not None:
+            closers.append(self.gate.close)
         closers.extend(timer.close for timer in self.timers)
         _close_all(closers)
 
@@ -373,6 +384,8 @@ def measure_race_steps(
     champion=False,
     sample_observer=None,
     adaptive_repeats=True,
+    sample_exchange=None,
+    launch_exchange=None,
 ):
     """Balanced comparison; cancellation discards this generator's result.
 
@@ -388,6 +401,8 @@ def measure_race_steps(
         rounds = min(rounds, SURVIVOR_ROUNDS)
     prepared.planned_rounds = rounds
     prepared.active_count = len(prepared.timers)
+    if launch_exchange is not None:
+        prepared.collective_gate = _StreamGate()
     values = [[] for _ in prepared.timers]
     active = list(range(len(prepared.timers)))
     overlaps = 0
@@ -406,14 +421,30 @@ def measure_race_steps(
                 for index in (order if repetition % 2 == 0 else reversed(order))
                 if repetition < repeats[index]
             )
-            overlaps += _replay_timers(
-                tuple(prepared.timers[index] for index in indices),
-                device_ordinal=device_ordinal,
-                sample_count=prepared.sample_count,
-                compilation_active=compilation_active,
-            )
-            for index in indices:
-                samples = prepared.timers[index].samples()
+            if launch_exchange is None:
+                overlaps += _replay_timers(
+                    tuple(prepared.timers[index] for index in indices),
+                    device_ordinal=device_ordinal,
+                    sample_count=prepared.sample_count,
+                    compilation_active=compilation_active,
+                )
+            else:
+                import torch
+
+                with torch.cuda.device(device_ordinal), no_compilation():
+                    stream = torch.cuda.current_stream(device_ordinal)
+                    # Queue the entire sample block before any peer starts it.
+                    with _collection_paused(), prepared.collective_gate.hold(stream):
+                        for index in indices:
+                            prepared.timers[index].replay(align=True)
+                        yield from launch_exchange(indices, turn, repetition)
+                    stream.synchronize()
+            sample_groups = tuple(prepared.timers[index].samples() for index in indices)
+            if sample_exchange is not None:
+                sample_groups = yield from sample_exchange(
+                    indices, turn, repetition, sample_groups
+                )
+            for index, samples in zip(indices, sample_groups, strict=True):
                 if sample_observer is not None:
                     sample_observer(index, turn, repetition, samples)
                 latency = statistics.fmean(samples)

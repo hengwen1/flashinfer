@@ -41,6 +41,7 @@ from .pcie_vocab_argmax import (
 )
 from ._preparation import plan, query_from_runtime
 from ._tuning import PcieConfig, PcieQuery
+from ._collective_tuning import CollectiveConfig, CollectiveQuery
 from b12x.preparation import Plan
 
 
@@ -59,6 +60,8 @@ __all__ = [
     "Plan",
     "PcieConfig",
     "PcieQuery",
+    "CollectiveConfig",
+    "CollectiveQuery",
     "plan",
     "query_from_runtime",
     "AllReduce",

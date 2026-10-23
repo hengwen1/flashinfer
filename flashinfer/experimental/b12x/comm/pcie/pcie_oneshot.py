@@ -1621,9 +1621,14 @@ class _CuTeOneshotBackend:
             and state.eager_tables is not None
             and state.eager_buffer_bytes is not None
             and inp.dtype == torch.bfloat16
-            and 0 < nbytes <= min(state.eager_buffer_bytes, 640 * 1024)
+            and 0 < nbytes <= state.eager_buffer_bytes
         ):
-            return "tp4_push_sentinel", 256, 16
+            from ._allreduce_policy import tp4_bf16_transport
+
+            transport = tp4_bf16_transport(
+                nbytes, payload_ready=True, twoshot_available=False
+            )
+            return transport, 256, 16
         return "pull", threads, blocks
 
     @classmethod
@@ -1765,6 +1770,16 @@ class _CuTeOneshotBackend:
             mode = "stage_push"
         else:
             mode = "stage_pull"
+        if (
+            state.world_size == 4
+            and state.plain_remote_push_region_packs > 0
+            and state.eager_tables is not None
+            and inp.dtype == torch.bfloat16
+            and int(inp.shape[-1]) in (4096, 5120, 6144)
+            and 1 <= rows <= 64
+            and inp.numel() * inp.element_size() <= 640 * 1024
+        ):
+            mode = "stage_bf16_sentinel"
         if (
             mode == "stage_pull"
             and state.world_size == 4

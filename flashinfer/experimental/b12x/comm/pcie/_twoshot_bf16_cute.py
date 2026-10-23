@@ -12,7 +12,6 @@ given rank's output is deterministic across runs.
 
 from __future__ import annotations
 
-import functools
 from collections.abc import Callable, Sequence
 
 import cuda.bindings.driver as cuda
@@ -21,6 +20,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import program_cache
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.intrinsics.memory import (
@@ -471,7 +471,7 @@ def _bf16_process_key(
     )
 
 
-@functools.cache
+@program_cache
 def get_twoshot_bf16_launcher(
     operation: str,
     world_size: int,

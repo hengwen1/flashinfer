@@ -16,6 +16,7 @@ from .tuning import (
     make_fixed_contract,
 )
 from .types import (
+    CandidateResourceIneligibleError,
     CollectiveRequirement,
     DeviceIdentity,
     FrozenMapping,
@@ -40,6 +41,7 @@ __all__ = [
     "AutotuneEffort",
     "autotune_effort",
     "BackendConfig",
+    "CandidateResourceIneligibleError",
     "CollectiveBarrierTimeout",
     "CollectiveRequirement",
     "DetectedDevice",

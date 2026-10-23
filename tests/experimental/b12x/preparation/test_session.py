@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from b12x.preparation import (
+    CandidateResourceIneligibleError,
     CollectiveBarrierTimeout,
     CollectiveRequirement,
     DetectedDevice,
@@ -2511,3 +2512,112 @@ def test_missing_plan_warning_uses_component_query_fields(caplog):
         assert "max_rows=19, image_shape=(3, 16, 16), window_width=7" in message
     finally:
         _warn_unprepared_declaration.cache_clear()
+
+
+@pytest.mark.parametrize("cache_policy", ["cold", "warm"])
+@pytest.mark.parametrize("phase", ["materialize", "prime"])
+def test_resource_ineligible_candidate_continues_race(
+    tmp_path, monkeypatch, phase, cache_policy
+):
+    batches, attempted, closed = [], [], []
+    _deterministic_timer(monkeypatch, batches=batches)
+
+    def materialize(selection, device):
+        value = selection.config.width * 3
+        attempted.append(value)
+        if phase == "materialize" and value == 6:
+            raise CandidateResourceIneligibleError("measured occupancy cannot fit grid")
+        return SimpleNamespace(value=value)
+
+    def benchmark(state):
+        def run():
+            if phase == "prime" and state.value == 6:
+                raise CandidateResourceIneligibleError(
+                    "measured occupancy cannot fit grid"
+                )
+            return state.value
+
+        return PreparedCall(run=run, close=lambda: closed.append(state.value))
+
+    req = request(name="resource-race", tuning=contract(), benchmark=benchmark)
+    req = replace(req, plan=replace(req.plan, _materialize=materialize))
+    with session(tmp_path, race_batch=1, cache_policy=cache_policy) as engine:
+        result = engine.prepare((req,))
+        assert result.rejected_candidates == 1
+        assert result.benchmarked_candidates == 2
+        assert result.coverage["resource-race"]["measured_count"] == 2
+        assert req.plan.selection.config.width in (1, 4)
+        assert all(6 not in batch for batch in batches)
+        assert not engine._cache.records
+    assert {3, 6, 12} <= set(attempted)
+    assert closed.count(6) == (1 if phase == "prime" else 0)
+
+
+@pytest.mark.parametrize("cache_policy", ["cold", "warm"])
+@pytest.mark.parametrize("phase", ["materialize", "prime"])
+def test_all_resource_ineligible_candidates_surface_error(
+    tmp_path, phase, cache_policy
+):
+    prepared = []
+
+    def materialize(selection, device):
+        if phase == "materialize":
+            raise CandidateResourceIneligibleError("measured occupancy cannot fit grid")
+        return SimpleNamespace(value=selection.config.width * 3)
+
+    def benchmark(state):
+        def run():
+            raise CandidateResourceIneligibleError("measured occupancy cannot fit grid")
+
+        return PreparedCall(run=run)
+
+    req = request(
+        name="resource-race", tuning=contract(), calls=prepared, benchmark=benchmark
+    )
+    req = replace(req, plan=replace(req.plan, _materialize=materialize))
+    with session(tmp_path, cache_policy=cache_policy) as engine:
+        with pytest.raises(
+            RuntimeError, match="no launchable candidates for resource-race: all 3"
+        ):
+            engine.prepare((req,))
+        assert req.plan.prepared is None
+        assert not engine._cache.records
+    assert not prepared
+
+
+@pytest.mark.parametrize("cache_policy", ["cold", "warm"])
+@pytest.mark.parametrize("pinned", [False, True])
+def test_resource_ineligible_sole_choice_remains_fatal(tmp_path, pinned, cache_policy):
+    def materialize(selection, device):
+        raise CandidateResourceIneligibleError("measured occupancy cannot fit grid")
+
+    req = request(
+        name="resource-fixed", tuning=contract(), pin=Config(2) if pinned else None
+    )
+    req = replace(req, plan=replace(req.plan, _materialize=materialize))
+    with session(tmp_path, autotune=False, cache_policy=cache_policy) as engine:
+        with pytest.raises(
+            CandidateResourceIneligibleError, match="measured occupancy"
+        ):
+            engine.prepare((req,))
+        assert req.plan.prepared is None
+
+
+def test_unrelated_materialization_value_error_remains_fatal(tmp_path, monkeypatch):
+    _deterministic_timer(monkeypatch)
+    attempted = []
+
+    def materialize(selection, device):
+        attempted.append(selection.config.width)
+        raise ValueError("unrelated materialization failure")
+
+    req = request(
+        name="resource-race",
+        tuning=contract(),
+        benchmark=lambda state: PreparedCall(run=lambda: None),
+    )
+    req = replace(req, plan=replace(req.plan, _materialize=materialize))
+    with session(tmp_path) as engine:
+        with pytest.raises(ValueError, match="unrelated materialization failure"):
+            engine.prepare((req,))
+    assert attempted == [1]

@@ -23,9 +23,13 @@ def digest(value):
     return hashlib.sha256(_json(value).encode()).hexdigest()
 
 
-def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
+def cache_identity(
+    namespace: Mapping[str, object], device_ordinal: int, *, cache_policy: str = "cold"
+):
     import torch
 
+    if cache_policy not in ("cold", "warm"):
+        raise ValueError("cache_policy must be cold or warm")
     raw_version = os.environ.get("B12X_TUNING_CACHE_VERSION", "1")
     try:
         version = int(raw_version)
@@ -51,7 +55,9 @@ def cache_identity(namespace: Mapping[str, object], device_ordinal: int):
         return {
             "schema_version": 23,
             "tuning_cache_version": version,
-            "measurement": "stream_gated_events_v1",
+            "measurement": "stream_gated_events_v1"
+            if cache_policy == "cold"
+            else "stream_gated_events_v1_warm",
             "namespace": dict(namespace),
             "compute_capability": [int(properties.major), int(properties.minor)],
             "sm_count": int(properties.multi_processor_count),

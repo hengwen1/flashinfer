@@ -43,6 +43,7 @@ from ._race_cache import RaceCache, RaceCheckpoint
 from ._timing import PreparationTiming
 from .device import DetectedDevice, detect_device
 from .types import (
+    CandidateResourceIneligibleError,
     CollectiveRequirement,
     FrozenMapping,
     MemoryRequirements,
@@ -359,6 +360,7 @@ class PreparationSession:
         cache_only=False,
         race_batch=32,
         race_budget=None,
+        cache_policy="cold",
         collective_barrier=None,
     ):
         """Initialize planning resources and an optional collective entry barrier.
@@ -367,6 +369,9 @@ class PreparationSession:
         safe to call there. A timeout does not cancel that callback; another
         preparation job cannot begin until the callback exits.
         """
+        if cache_policy not in ("cold", "warm"):
+            raise ValueError("cache_policy must be cold or warm")
+        self._cache_policy = cache_policy
         self.device = (
             device if isinstance(device, DetectedDevice) else detect_device(device)
         )
@@ -453,6 +458,11 @@ class PreparationSession:
         self._tuning_ranks = ranks
         self._tuning_cache_synchronized = False
 
+    @property
+    def cache_policy(self):
+        """Whether tuning races evict L2 or retain warmed data between samples."""
+        return self._cache_policy
+
     def _check_thread(self):
         """Reject use from another thread or after the session closes."""
         if threading.get_ident() != self._thread:
@@ -471,7 +481,12 @@ class PreparationSession:
 
                 root = _cute_compile_cache_dir() / "preparation"
             self._cache = SelectionCache(
-                root, cache_identity(self.namespace.to_dict(), self.device.ordinal)
+                root,
+                cache_identity(
+                    self.namespace.to_dict(),
+                    self.device.ordinal,
+                    cache_policy=self.cache_policy,
+                ),
             )
         return self._cache
 
@@ -1653,10 +1668,16 @@ class PreparationJob:
             # remain mutable during later serving warmup and graph replay.
             try:
                 with torch.inference_mode(False), torch.no_grad():
-                    with self._timing.span("materialize"):
-                        state = request.plan._materialize(
-                            selection, self.session.device
-                        )
+                    try:
+                        with self._timing.span("materialize"):
+                            state = request.plan._materialize(
+                                selection, self.session.device
+                            )
+                    except CandidateResourceIneligibleError as error:
+                        if not reject_unlaunchable:
+                            raise
+                        self.session._synchronize()
+                        raise _CandidateLaunchRejected(str(error)) from error
                     with self._timing.span("bind"):
                         call = factory(state)
                     guard = _CallGuard(call)
@@ -1666,8 +1687,9 @@ class PreparationJob:
                     with self._timing.span("prime"):
                         _prime(call)
                 except Exception as error:
-                    if not reject_unlaunchable or not _cooperative_launch_rejected(
-                        error
+                    if not reject_unlaunchable or not (
+                        _cooperative_launch_rejected(error)
+                        or isinstance(error, CandidateResourceIneligibleError)
                     ):
                         raise
                     rejected = error
@@ -1677,9 +1699,12 @@ class PreparationJob:
                     self.session._synchronize()
                     guard.finish()
                     self._temporaries.remove(guard.finish)
-                    raise _CandidateLaunchRejected(
+                    reason = (
                         "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)"
-                    ) from rejected
+                        if _cooperative_launch_rejected(rejected)
+                        else str(rejected)
+                    )
+                    raise _CandidateLaunchRejected(reason) from rejected
                 if synchronize:
                     self.session._synchronize()
             except _CandidateLaunchRejected:
@@ -1781,7 +1806,7 @@ class PreparationJob:
                 with self.session._gpu_scope():
                     self._race_eviction = _l2_flush_fn(
                         torch.device("cuda", self.session.device.ordinal),
-                        enabled=True,
+                        enabled=self.session.cache_policy == "cold",
                     )
             steps = prepare_race_steps(
                 calls,
@@ -1789,6 +1814,7 @@ class PreparationJob:
                 samples=self.session.samples,
                 primed=True,
                 eviction=self._race_eviction,
+                cache_policy=self.session.cache_policy,
             )
             while not self.session._stop.is_set():
                 try:
@@ -2039,8 +2065,8 @@ class PreparationJob:
                     )
                 raise RuntimeError(
                     f"no launchable candidates for {request.name}: "
-                    f"all {rejected_count} candidates rejected with "
-                    "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)"
+                    f"all {rejected_count} candidates rejected by resource or "
+                    "cooperative launch limits"
                 )
             assignment, config = obligation.candidates[best_index]
             candidate_index, latency_us = best_index, measurements[best_index]

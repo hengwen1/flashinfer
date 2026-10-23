@@ -25,6 +25,11 @@ if TYPE_CHECKING:
     from .device import DetectedDevice
     from .tuning import TuningContract
 
+
+class CandidateResourceIneligibleError(RuntimeError):
+    """A prepared candidate exceeds its measured CUDA resource capacity."""
+
+
 ConfigT = TypeVar("ConfigT")
 _SCALAR_TYPES = (str, int, float, bool, type(None))
 

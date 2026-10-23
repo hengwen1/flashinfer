@@ -233,7 +233,8 @@ class _TimedCall:
         stream = torch.cuda.current_stream()
         with call_scope():
             for index, (start, end) in enumerate(self.events):
-                self.eviction()
+                if self.eviction is not None:
+                    self.eviction()
                 if self.call.reset is not None:
                     self.call.reset()
                 self.producers[index % len(self.producers)]()
@@ -305,10 +306,13 @@ def prepare_race_steps(
     samples=DEFAULT_SAMPLES,
     primed=False,
     eviction=None,
+    cache_policy="cold",
 ):
     """Prepare event pairs for asynchronous calls on the current CUDA stream."""
     import torch
 
+    if cache_policy not in ("cold", "warm"):
+        raise ValueError("cache_policy must be cold or warm")
     if not calls or type(samples) is not int or samples <= 0:
         raise ValueError("a race requires candidates and positive samples")
     if any(call.produce is None for call in calls):
@@ -326,10 +330,11 @@ def prepare_race_steps(
         with torch.cuda.device(device_ordinal), no_compilation():
             if eviction is None:
                 eviction = _l2_flush_fn(
-                    torch.device("cuda", device_ordinal), enabled=True
+                    torch.device("cuda", device_ordinal), enabled=cache_policy == "cold"
                 )
             try:
-                eviction()
+                if eviction is not None:
+                    eviction()
                 if not primed:
                     for call in calls:
                         _prime(call)
@@ -465,13 +470,16 @@ def _consume(steps):
             return finished.value
 
 
-def _prepare_race(calls, *, device_ordinal, samples=DEFAULT_SAMPLES, primed=False):
+def _prepare_race(
+    calls, *, device_ordinal, samples=DEFAULT_SAMPLES, primed=False, cache_policy="cold"
+):
     return _consume(
         prepare_race_steps(
             calls,
             device_ordinal=device_ordinal,
             samples=samples,
             primed=primed,
+            cache_policy=cache_policy,
         )
     )
 

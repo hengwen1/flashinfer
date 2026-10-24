@@ -363,13 +363,23 @@ class PreparationSession:
         race_budget=None,
         cache_policy="cold",
         collective_barrier=None,
+        prime=True,
     ):
         """Initialize planning resources and an optional collective entry barrier.
 
         ``collective_barrier(key, ranks)`` runs in a daemon thread and must be
         safe to call there. A timeout does not cancel that callback; another
         preparation job cannot begin until the callback exits.
+
+        ``prime=False`` materializes and binds selected plans without running
+        their prepare calls. The caller must warm every execution path before
+        capture or freeze. Candidate and retained benchmark calls still prime.
+        Prepare-call factories, synchronization, program checks, resource
+        retention, and restore/close hooks run regardless of this setting.
         """
+        if type(prime) is not bool:
+            raise TypeError("prime must be a bool")
+        self.prime = prime
         if cache_policy not in ("cold", "warm"):
             raise ValueError("cache_policy must be cold or warm")
         self._cache_policy = cache_policy
@@ -1737,8 +1747,8 @@ class PreparationJob:
                     self._temporaries.append(guard.finish)
                 rejected = None
                 try:
-                    with self._timing.span("prime"):
-                        if prime:
+                    if prime:
+                        with self._timing.span("prime"):
                             _prime(call)
                 except Exception as error:
                     if not reject_unlaunchable or not (
@@ -1800,7 +1810,7 @@ class PreparationJob:
             for name in request.dependencies
             for program in self._dependency_programs[name]
         )
-        with self._timing.span("materialize_prime"):
+        with self._timing.span("materialize_prime" if prime else "materialize_bind"):
             return self._instantiate(
                 request,
                 selection,
@@ -2270,7 +2280,9 @@ class PreparationJob:
                         )
                     if prepared is None or prepared.selection != selection:
                         self._phase = (
-                            "warming heuristics" if self._warmup_only else "priming"
+                            ("warming heuristics" if self._warmup_only else "priming")
+                            if self.session.prime
+                            else "materializing"
                         )
                         if self._warmup_only:
                             self._direct_compilation()
@@ -2279,13 +2291,18 @@ class PreparationJob:
                                     selection.config, self.session.device
                                 )
                             expected = set(dependencies)
-                            with self._timing.span("materialize_prime"):
+                            with self._timing.span(
+                                "materialize_prime"
+                                if self.session.prime
+                                else "materialize_bind"
+                            ):
                                 state, call, guard, retained = self._instantiate(
                                     item,
                                     selection,
                                     item.prepare_call,
                                     expected,
                                     compile_directly=True,
+                                    prime=self.session.prime,
                                 )
                             expected = frozenset(expected)
                             self._all_programs.update(expected)
@@ -2296,6 +2313,7 @@ class PreparationJob:
                                 selection,
                                 item.prepare_call,
                                 request=item,
+                                prime=self.session.prime,
                             )
                         self._publish(item, selection, state, call, retained, expected)
                         self._temporaries.remove(guard.finish)

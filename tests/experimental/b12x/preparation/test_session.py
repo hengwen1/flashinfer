@@ -1757,7 +1757,10 @@ def test_unprepared_plan_materializes_its_default_with_a_warning_before_freeze_o
             require_prepared(other.plan, "test.arithmetic")
 
 
-def test_priming_closures_release_transients_and_restore_before_readiness(tmp_path):
+@pytest.mark.parametrize("prime", [True, False])
+def test_priming_closures_release_transients_and_restore_before_readiness(
+    tmp_path, prime
+):
     import weakref
 
     class Temporary:
@@ -1782,12 +1785,104 @@ def test_priming_closures_release_transients_and_restore_before_readiness(tmp_pa
         )
 
     req = replace(request(name="temporary"), prepare_call=factory)
-    with session(tmp_path) as engine:
+    with session(tmp_path, prime=prime) as engine:
         engine.prepare((req,))
         gc.collect()
         assert lifetime == ["restored"]
+        assert len(references) == (2 if prime else 1)
         assert all(reference() is None for reference in references)
     assert lifetime == ["restored", "resources closed"]
+
+
+@pytest.mark.parametrize("autotune", [True, False])
+@pytest.mark.parametrize("prime", [True, False])
+def test_selected_plan_priming_preserves_binding_and_resource_lifecycle(
+    tmp_path, autotune, prime
+):
+    events = []
+    owner = object()
+
+    def materialize(selection, device):
+        events.append("materialize")
+        return SimpleNamespace(value=selection.config.width)
+
+    def bind(state):
+        events.append("bind")
+        assert state.value == 2
+        if not prime:
+            assert engine._job._phase == "materializing"
+        return PreparedCall(
+            reset=lambda: events.append("reset"),
+            produce=lambda: events.append("produce"),
+            run=lambda: events.append("run"),
+            restore=lambda: events.append("restore"),
+            owners=(owner,),
+            close=lambda: events.append("close"),
+        )
+
+    plan = replace(
+        declaration(tuning=contract(default=2, values=(2,))), _materialize=materialize
+    )
+    req = plan.request(name="resources", prepare_call=bind)
+    with session(tmp_path, autotune=autotune, prime=prime) as engine:
+        engine.prepare((req,))
+        assert events == ["materialize", "bind"] + (
+            ["reset", "produce", "run"] if prime else []
+        ) + ["restore"]
+        assert plan.prepared.owners == (owner,)
+        assert require_prepared(plan, "test.arithmetic").value == 2
+        engine.prepare((req,))
+        assert events.count("bind") == 1
+    assert events[-1] == "close" and events.count("close") == 1
+
+
+def test_skipping_selected_priming_preserves_candidate_execution_and_cached_restart(
+    tmp_path, monkeypatch
+):
+    _deterministic_timer(monkeypatch)
+    candidates, selected = [], []
+
+    def benchmark(state):
+        def run():
+            candidates.append(state.value)
+            return state.value
+
+        return PreparedCall(run=run, produce=lambda: None)
+
+    for cache_only in (False, True):
+        req = request(
+            name="winner", tuning=contract(), calls=selected, benchmark=benchmark
+        )
+        with session(tmp_path, prime=False, cache_only=cache_only) as engine:
+            result = engine.prepare((req,))
+            assert result.selections["winner"].source == (
+                "cached" if cache_only else "tuned"
+            )
+            assert require_prepared(req.plan, "test.arithmetic").value == 6
+        assert selected == []
+        assert sorted(candidates) == [3, 6, 12]
+
+
+def test_skipping_priming_preserves_program_checks_and_failure_cleanup(tmp_path):
+    from b12x._lib.compile_plan import ProgramKey, record_program
+
+    events = []
+
+    def bind(state):
+        record_program(ProgramKey("cute", "a" * 64, "undeclared"))
+        return PreparedCall(
+            run=lambda: pytest.fail("selected call must not prime"),
+            restore=lambda: events.append("restore"),
+            close=lambda: events.append("close"),
+        )
+
+    req = replace(request(name="undeclared"), prepare_call=bind)
+    with session(tmp_path, prime=False) as engine:
+        with pytest.raises(RuntimeError, match="preparation used undeclared programs"):
+            engine.prepare((req,))
+        assert req.plan.prepared is None
+        assert events == ["restore", "close"]
+    assert events == ["restore", "close"]
 
 
 def test_prepared_resources_remain_mutable_after_inference_mode_priming(tmp_path):
@@ -1838,7 +1933,8 @@ def test_prepared_resources_remain_mutable_after_inference_mode_priming(tmp_path
     assert observed["buffer"].item() == 3
 
 
-def test_frozen_reuse_primes_independent_benchmark_trial(tmp_path):
+@pytest.mark.parametrize("prime", [True, False])
+def test_frozen_reuse_primes_independent_benchmark_trial(tmp_path, prime):
     production, trials, closed = [], [], []
 
     def benchmark(state):
@@ -1852,14 +1948,14 @@ def test_frozen_reuse_primes_independent_benchmark_trial(tmp_path):
         request(name="retained", calls=production, benchmark=benchmark),
         retain_benchmark_call=True,
     )
-    with session(tmp_path) as engine:
+    with session(tmp_path, prime=prime) as engine:
         with engine.prepare((req,)) as first:
             first.benchmark_calls["retained"].invoke()
         assert len(closed) == 1
         engine.freeze()
         with engine.prepare((req,)) as second:
             second.benchmark_calls["retained"].invoke()
-            assert production == [6]
+            assert production == ([6] if prime else [])
             assert [value for _, value in trials] == [6, 6, 6, 6]
             assert trials[0][0] is not trials[2][0]
             assert len(closed) == 1
@@ -2175,7 +2271,8 @@ def test_fifty_layer_bindings_are_one_preparation_request(
     assert len(closed) == (1 if shared else 50)
 
 
-def test_coalesced_collectives_authorize_each_resource_binding(tmp_path):
+@pytest.mark.parametrize("prime", [True, False])
+def test_coalesced_collectives_authorize_each_resource_binding(tmp_path, prime):
     calls, authorizations, progress = [], [], []
     requests = tuple(
         request(
@@ -2193,9 +2290,9 @@ def test_coalesced_collectives_authorize_each_resource_binding(tmp_path):
         authorizations.append(key)
         return key
 
-    with session(tmp_path) as engine:
+    with session(tmp_path, prime=prime) as engine:
         engine.prepare(requests, coordinator=coordinate, progress=progress.append)
-        assert calls == [6, 6]
+        assert calls == ([6, 6] if prime else [])
         assert authorizations == ["first-channel", "second-channel"]
         assert progress[-1].completed_requests == progress[-1].total_requests == 1
         assert requests[0].plan.prepared is not requests[1].plan.prepared

@@ -43,6 +43,7 @@ from ._impl import (
 )
 from ._impl import run_collapse
 from . import META
+from ._ops import run_input, run_coefficients
 
 
 def bind(plan: Plan, **kwargs) -> Binding:
@@ -68,6 +69,8 @@ __all__ = [
     "run_post",
     "run_post_pre",
     "run_collapse",
+    "run_input",
+    "run_coefficients",
     "MIXES",
     "MULT",
     "PARTIALS",

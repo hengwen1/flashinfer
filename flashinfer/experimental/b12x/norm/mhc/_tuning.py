@@ -33,6 +33,7 @@ class MhcQuery:
     # This changes both the producer and finalizer ABI; it is not a runtime
     # optional operand on an ordinary MHC execution.
     lagged_mix: bool = False
+    split_lagged: bool = False
     expanded_residual: bool = False
     bf16x2_eligible: bool = True
     output_mode: str = "provided"
@@ -294,6 +295,8 @@ def _validate(
         raise TypeError("lagged_prepare must be a boolean")
     if config.lagged_prepare and (not query.lagged_mix or config.backend != "native"):
         raise ValueError("lagged preparation requires the native lagged route")
+    if query.split_lagged and not config.lagged_prepare:
+        raise ValueError("split lagged execution requires the native lagged producer")
     if not 1 <= config.partials_per_cta <= 25:
         raise ValueError("partials_per_cta must be in [1, 25]")
     if not config.lagged_prepare and config.partials_per_cta != 4:
@@ -401,6 +404,7 @@ def _validate_query(query, device):
             query.collapse_weighted,
             query.bf16x2_eligible,
             query.lagged_mix,
+            query.split_lagged,
             query.expanded_residual,
         )
     ):
@@ -409,6 +413,16 @@ def _validate_query(query, device):
         raise ValueError("expanded pre layout only applies to the pre operation")
     if query.lagged_mix and query.operation not in ("pre", "post_pre"):
         raise ValueError("lagged MHC supports only pre and post_pre operations")
+    if query.split_lagged and (
+        not query.lagged_mix
+        or not query.has_norm_weight
+        or query.has_fn_bf16
+        or query.output_mode != "provided"
+        or query.max_tokens >= 96
+    ):
+        raise ValueError(
+            "split lagged execution requires normalized caller-owned buffers below 96 rows"
+        )
 
 
 def _autotune_effort(query: MhcQuery) -> AutotuneEffort:
@@ -427,13 +441,19 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
     total_k = _MHC_MULT * query.hidden_size
     tf32 = _tf32_eligible(query)
     pin = _tf32_pin(query)
-    backends = ("native", "tf32_tma") if tf32 else ("native",)
+    backends = (
+        ("native", "tf32_tma") if tf32 and not query.split_lagged else ("native",)
+    )
     if tf32 and pin is not None:
         backends = ("tf32_tma",) if pin else ("native",)
     partials = query.controls.get("B12X_MHC_PARTIALS_PER_CTA")
     values = {
         "backend": backends,
-        "lagged_prepare": (False, True) if query.lagged_mix else (False,),
+        "lagged_prepare": (True,)
+        if query.split_lagged
+        else (False, True)
+        if query.lagged_mix
+        else (False,),
         "partials_per_cta": (int(partials),)
         if partials not in (None, "")
         else (4, 9, 13, 25),
@@ -602,7 +622,7 @@ def _materialize_tuning(query, device, choice):
 
 TUNING = TuningContract(
     component_id="norm.mhc",
-    query_schema_version=22,
+    query_schema_version=23,
     config_schema_version=22,
     query_fields=frozenset(MhcQuery.__dataclass_fields__),
     config_fields=frozenset(MhcConfig.__dataclass_fields__),
@@ -612,7 +632,7 @@ TUNING = TuningContract(
     default_config=_default_config,
     validate_query=_validate_query,
     validate_config=_validate,
-    candidate_contract_version=15,
+    candidate_contract_version=16,
     knobs=(
         Knob(
             name="backend",

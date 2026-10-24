@@ -730,6 +730,7 @@ def _b12x_mhc_pre_impl(
     pre_mix: torch.Tensor | None = None,
     pre_out: torch.Tensor | None = None,
     _state: _MhcState,
+    _input_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _state.require(
         "pre",
@@ -935,18 +936,38 @@ def _b12x_mhc_pre_impl(
             pre_mix=pre_mix,
             y=y_out,
         )
-        _state.launchers["finalize"](
-            residual=residual_out,
-            partials=partials,
-            scale=hc_scale,
-            bias=hc_base,
-            y=y_out,
-            post=post_out,
-            comb=comb_out,
-            norm_weight=norm_weight,
-            pre_mix=pre_mix,
-            pre_out=pre_out,
-        )
+        if _input_only and not _state.query.split_lagged:
+            raise ValueError("input-only execution requires a split lagged declaration")
+        if _state.query.split_lagged:
+            _state.launchers["input"](
+                partials=partials, y=y_out, norm_weight=norm_weight
+            )
+            if not _input_only:
+                _state.launchers["coefficients"](
+                    residual=residual_out,
+                    partials=partials,
+                    scale=hc_scale,
+                    bias=hc_base,
+                    y=y_out,
+                    post=post_out,
+                    comb=comb_out,
+                    norm_weight=norm_weight,
+                    pre_mix=pre_mix,
+                    pre_out=pre_out,
+                )
+        else:
+            _state.launchers["finalize"](
+                residual=residual_out,
+                partials=partials,
+                scale=hc_scale,
+                bias=hc_base,
+                y=y_out,
+                post=post_out,
+                comb=comb_out,
+                norm_weight=norm_weight,
+                pre_mix=pre_mix,
+                pre_out=pre_out,
+            )
         return residual_out, post_out, comb_out, y_out
     if (
         partials is not None
@@ -1015,6 +1036,7 @@ def _b12x_mhc_post_pre_impl(
     pre_mix: torch.Tensor | None = None,
     pre_out: torch.Tensor | None = None,
     _state: _MhcState,
+    _input_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _state.require(
         "post_pre",
@@ -1270,18 +1292,38 @@ def _b12x_mhc_post_pre_impl(
             pre_mix=pre_mix,
             y=y_out,
         )
-        _state.launchers["finalize"](
-            residual=residual_out,
-            partials=partials,
-            scale=hc_scale,
-            bias=hc_base,
-            y=y_out,
-            post=post_out,
-            comb=comb_out,
-            norm_weight=norm_weight,
-            pre_mix=pre_mix,
-            pre_out=pre_out,
-        )
+        if _input_only and not _state.query.split_lagged:
+            raise ValueError("input-only execution requires a split lagged declaration")
+        if _state.query.split_lagged:
+            _state.launchers["input"](
+                partials=partials, y=y_out, norm_weight=norm_weight
+            )
+            if not _input_only:
+                _state.launchers["coefficients"](
+                    residual=residual_out,
+                    partials=partials,
+                    scale=hc_scale,
+                    bias=hc_base,
+                    y=y_out,
+                    post=post_out,
+                    comb=comb_out,
+                    norm_weight=norm_weight,
+                    pre_mix=pre_mix,
+                    pre_out=pre_out,
+                )
+        else:
+            _state.launchers["finalize"](
+                residual=residual_out,
+                partials=partials,
+                scale=hc_scale,
+                bias=hc_base,
+                y=y_out,
+                post=post_out,
+                comb=comb_out,
+                norm_weight=norm_weight,
+                pre_mix=pre_mix,
+                pre_out=pre_out,
+            )
         return residual_out, post_out, comb_out, y_out
     if (
         partials is not None

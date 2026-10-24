@@ -410,6 +410,25 @@ def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
                 pre_out=mix,
                 **_lagged_finalize_options(query, config, native),
             )
+            if query.split_lagged:
+                programs["input"] = kernels._run_mhc_lagged_norm_launch(
+                    partials=partials, y=y, norm_weight=norm, norm_eps=query.norm_eps
+                )
+                options = _lagged_finalize_options(query, config, native)
+                options["fuse_norm"] = False
+                programs["coefficients"] = kernels._run_mhc_finalize_gram_launch(
+                    residual=out,
+                    partials=partials,
+                    scale=scale,
+                    bias=bias,
+                    y=y,
+                    post=prev_post,
+                    comb=prev_comb,
+                    norm_weight=norm,
+                    pre_mix=mix,
+                    pre_out=mix,
+                    **options,
+                )
             return programs
         if query.operation == "pre":
             programs["partial"] = kernels._run_mhc_pre_partial_launch(
@@ -598,10 +617,30 @@ def _launchers(query, config, native, programs):
             _prepared=programs["finalize"],
             **_lagged_finalize_options(query, config, native),
         )
-        return {
+        result = {
             "partial": attach_programs(primary, programs),
             "finalize": attach_programs(finalize, programs),
         }
+        if query.split_lagged:
+            result["input"] = attach_programs(
+                partial(
+                    kernels._run_mhc_lagged_norm_launch,
+                    _prepared=programs["input"],
+                    norm_eps=query.norm_eps,
+                ),
+                programs,
+            )
+            options = _lagged_finalize_options(query, config, native)
+            options["fuse_norm"] = False
+            result["coefficients"] = attach_programs(
+                partial(
+                    kernels._run_mhc_finalize_gram_launch,
+                    _prepared=programs["coefficients"],
+                    **options,
+                ),
+                programs,
+            )
+        return result
     finalize = partial(
         kernels._run_mhc_finalize_gram_launch,
         _prepared=programs["finalize"],
@@ -673,6 +712,16 @@ def plan_mhc(caps, *, invocation=FrozenMapping(), override=None):
         smem_limit=smem,
         **options,
     )
+    if query.split_lagged and (
+        not query.lagged_mix
+        or not query.has_norm_weight
+        or query.operation not in ("pre", "post_pre")
+        or query.output_mode != "provided"
+        or query.max_tokens >= 96
+    ):
+        raise ValueError(
+            "split lagged execution requires provided normalized native decode buffers"
+        )
     lowered = {}
 
     def native(config, device):

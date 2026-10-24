@@ -14,6 +14,15 @@ BF16 collapse and the finalizer then applies optional RMSNorm; each call still
 returns exactly ``residual, post, comb, y`` while writing next-layer
 coefficients to ``pre_out``.
 
+For normalized caller-owned lagged invocations below 96 rows, declaring
+``split_lagged=True`` permits ``run_input(binding, operands, ...)`` followed by
+``run_coefficients(binding, scale, base)``. The first phase writes the BF16
+residual and normalized input, retaining FP32 projection partials. The second
+phase writes FP32 post, combination, and outgoing pre-mix coefficients without
+reading residual or normalized data. Keep partials private until coefficient
+completion and join before coefficient consumption or partial reuse. Ordinary
+``run_pre``/``run_post_pre`` still execute the entire declared operation.
+
 ``plan(Caps(...), invocation=...)`` is allocation-free. ``PreparationSession``
 selects and primes the complete plan before ``bind`` builds scratch views.
 Functional operations carry the same opaque prepared reference through eager,
@@ -47,6 +56,8 @@ META = OpMeta(
         "run_post",
         "run_post_pre",
         "run_collapse",
+        "run_input",
+        "run_coefficients",
         "MIXES",
         "MULT",
         "PARTIALS",
@@ -88,6 +99,8 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         run_post_pre,
         run_pre,
         run_collapse,
+        run_input,
+        run_coefficients,
     )
 
 install_lazy_api(globals(), META)

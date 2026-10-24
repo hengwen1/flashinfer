@@ -81,6 +81,6 @@ def _validate_query(query: PcieQuery, device) -> None:
         )
 
 
-TUNING = replace(TUNING, query_schema_version=29, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=30, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]

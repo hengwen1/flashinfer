@@ -237,7 +237,9 @@ def _owned_resident_layout(runtime, native) -> tuple[int, int, int]:
     if eager_bytes is None:
         return rank_data_nbytes, 0, 0
     shards = _eager_storage_shards(
-        int(runtime.world_size), tuple(bool(value) for value in native.transport_policy)
+        int(runtime.world_size),
+        tuple(bool(value) for value in native.transport_policy),
+        sentinel=runtime._sentinel_supported,
     )
     signal_nbytes = _align_up(int(runtime._ext.meta_size()), IPC_SLAB_ALIGNMENT)
     eager_nbytes = _align_up(int(eager_bytes) * shards, IPC_SLAB_ALIGNMENT)
@@ -384,6 +386,7 @@ def query_from_metadata(
         "eager_storage_shards": _eager_storage_shards(
             int(runtime.world_size),
             tuple(bool(value) for value in native.transport_policy),
+            sentinel=runtime._sentinel_supported,
         ),
         "registered": registered,
         "variants": variants,
@@ -495,6 +498,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         "eager_storage_shards": _eager_storage_shards(
             int(runtime.world_size),
             tuple(bool(value) for value in native.transport_policy),
+            sentinel=runtime._sentinel_supported,
         ),
         "registered": not stage_input,
         "variants": variants,

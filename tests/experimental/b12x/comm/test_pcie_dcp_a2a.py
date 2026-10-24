@@ -420,8 +420,8 @@ def test_graph_lse_forms_remote_slot_addresses_after_the_barrier() -> None:
 
     assert "local_staging = staging[self._rank] + slot_offset" in write_phase
     assert "staging = (\n                staging0 + slot_offset" not in write_phase
-    assert "Int64(staging[source].toint())" in read_phase
-    assert "+ slot_offset\n                    + lse_offset" in read_phase
+    assert "Int64(staging[incoming].toint())" in read_phase
+    assert "+ slot_offset + lse_offset" in read_phase
 
 
 def test_lse_payload_address_add_is_late_and_opaque() -> None:
@@ -433,7 +433,7 @@ def test_lse_payload_address_add_is_late_and_opaque() -> None:
     assert read_phase.index("inv_weight_sum =") < read_phase.index(
         "source_address = _add_u64_opaque("
     )
-    assert "slot_offset + staging_base * Int64(16)" in read_phase
+    assert "slot_offset + incoming_pack * Int64(16)" in read_phase
 
     add_source = inspect.getsource(kernels._add_u64_opaque)
     assert '"add.u64 $0, $1, $2;"' in add_source

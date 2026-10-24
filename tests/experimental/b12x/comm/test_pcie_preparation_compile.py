@@ -17,24 +17,41 @@ from b12x.preparation import FrozenMapping
 
 
 @pytest.mark.parametrize(
-    "factory,args",
+    "module,factory,args",
     [
-        ("get_oneshot_launcher", ("bfloat16", 2, 0, True, False, 0, "pull", 256, 0)),
         (
+            "_oneshot_cute",
+            "get_oneshot_launcher",
+            ("bfloat16", 2, 0, True, False, 0, "pull", 256, 0),
+        ),
+        (
+            "_oneshot_cute",
             "get_fused_oneshot_launcher",
             ("bfloat16", 2, 0, "stage_pull", False, False, False, 0, 256, 0),
         ),
+        (
+            "_twoshot_cute",
+            "get_twoshot_launcher",
+            ("reduce_scatter", 4, 0, False, 0, 512, 4096, 0),
+        ),
+        (
+            "_twoshot_bf16_cute",
+            "get_twoshot_bf16_launcher",
+            ("reduce_scatter", 4, 0, False, 0, 512, 4096, 0),
+        ),
     ],
 )
-def test_oneshot_planning_memo_is_evicted_before_in_process_compile(
-    monkeypatch, factory, args
+def test_launcher_planning_memo_is_evicted_before_in_process_compile(
+    monkeypatch, module, factory, args
 ):
     from b12x._lib.compile_plan import (
         DeferredCuTeKernel,
         ProgramKey,
         evict_planning_artifacts,
     )
-    from b12x.comm.pcie import _oneshot_cute as kernels
+    from importlib import import_module
+
+    kernels = import_module(f"b12x.comm.pcie.{module}")
 
     program = ProgramKey("cute", f"test-{factory}")
     deferred = DeferredCuTeKernel(program, ("test", factory))
@@ -259,8 +276,12 @@ def test_dcp_materialization_resolves_graph_program_before_capture(monkeypatch):
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.comm.pcie import _dcp_preparation as preparation
 
-    kernels = {slot: DeferredCuTeKernel(ProgramKey("cute", f"dcp-materialize-{slot}"), ("dcp", slot))
-               for slot in (False, True)}
+    kernels = {
+        slot: DeferredCuTeKernel(
+            ProgramKey("cute", f"dcp-materialize-{slot}"), ("dcp", slot)
+        )
+        for slot in (False, True)
+    }
     monkeypatch.setattr(preparation, "compile_dcp_surface", lambda *args: kernels)
     monkeypatch.setattr(compiler, "_memory_cache_get", lambda key: None)
     monkeypatch.setattr(compiler, "_memory_cache_put", lambda *args: None)
@@ -271,8 +292,14 @@ def test_dcp_materialization_resolves_graph_program_before_capture(monkeypatch):
         return lambda: key
 
     monkeypatch.setattr(compiler, "_load_cute_compile_from_disk", load)
-    query = PcieQuery(surface="DcpAllToAll.all_gather_heads", world_size=2, rank=0,
-                     topology="pcie_ipc", call=FrozenMapping(), setup=FrozenMapping())
+    query = PcieQuery(
+        surface="DcpAllToAll.all_gather_heads",
+        world_size=2,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping(),
+        setup=FrozenMapping(),
+    )
     runtime = SimpleNamespace(rank=0, world_size=2, device=torch.device("cuda:0"))
     declaration = preparation.plan(query, runtime=runtime)
     state = declaration._materialize(None, SimpleNamespace(ordinal=0))

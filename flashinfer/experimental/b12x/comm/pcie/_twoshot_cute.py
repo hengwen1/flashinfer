@@ -9,7 +9,6 @@ ranks are widened before multiplication.
 
 from __future__ import annotations
 
-import functools
 from collections.abc import Callable, Sequence
 
 import cuda.bindings.driver as cuda
@@ -22,6 +21,7 @@ from cutlass._mlir.dialects import llvm
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import program_cache
 from b12x._lib.intrinsics.conversion import cvt_e4m3x4_to_f32x4
 from b12x._lib.intrinsics.memory import (
     ld_global_nc_f32,
@@ -700,7 +700,7 @@ def _twoshot_process_key(
     )
 
 
-@functools.cache
+@program_cache
 def get_twoshot_launcher(
     operation: str,
     world_size: int,

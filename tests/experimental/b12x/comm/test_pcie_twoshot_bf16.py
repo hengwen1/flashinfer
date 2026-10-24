@@ -170,18 +170,186 @@ def _fill(tensor, rank, step):
     )
 
 
-def _reference(inp):
+def _reference(inp, *, owner_reduction=True):
     values = [torch.empty_like(inp) for _ in range(4)]
     dist.all_gather(values, inp)
-    shard = inp.numel() // 4
+    if not owner_reduction:
+        rank = dist.get_rank()
+        acc = values[rank].float()
+        for offset in range(1, 4):
+            acc.add_(values[(rank + offset) % 4].float())
+        return acc.to(inp.dtype)
+    shard = inp.numel() // 8 // 4 * 8
     result = torch.empty_like(inp).view(-1)
     for owner in range(4):
-        interval = slice(owner * shard, (owner + 1) * shard)
-        acc = torch.zeros(shard, dtype=torch.float32, device=inp.device)
-        for offset in range(4):
+        end = inp.numel() if owner == 3 else (owner + 1) * shard
+        interval = slice(owner * shard, end)
+        acc = values[owner].view(-1)[interval].float()
+        for offset in range(1, 4):
             acc.add_(values[(owner + offset) % 4].view(-1)[interval].float())
         result[interval] = acc.to(torch.bfloat16)
     return result.view_as(inp)
+
+
+def _check_payload_ready(session, manager, rank):
+    for size in (
+        16,
+        32,
+        48,
+        64,
+        24560,
+        24576,
+        24592,
+        65520,
+        65552,
+        655344,
+        655360,
+        655376,
+        2097168,
+    ):
+        for inplace in (False, True):
+            inp = torch.empty(size // 2, dtype=torch.bfloat16, device=manager.device)
+            out = inp if inplace else torch.empty_like(inp)
+            plan = _prepare(session, manager, "all_reduce", inp, out)
+            transport = plan.query.call.get("transport", "twoshot")
+            owner_reduction = transport in ("twoshot", "tp4_push_rsag")
+            graph = torch.cuda.CUDAGraph()
+            _fill(inp, rank, 123)
+            with session.capture(), manager.capture(), torch.cuda.graph(graph):
+                manager.all_reduce(inp, plan=plan, out=out)
+            for step in range(6):
+                _fill(inp, rank, 91 + step)
+                if step == 1:
+                    inp.zero_()
+                elif step == 2:
+                    inp.mul_(2**-100)
+                elif step == 3:
+                    inp.fill_(1 if rank % 2 else -1)
+                expected = _reference(inp, owner_reduction=owner_reduction)
+                if not inplace:
+                    out.fill_(float("nan"))
+                torch.cuda.synchronize()
+                before = _allocation_state(manager.device)
+                with session.capture(), kernel_resolution_guard("payload-ready replay"):
+                    graph.replay()
+                torch.cuda.synchronize()
+                assert _allocation_state(manager.device) == before
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            graph.reset()
+
+
+def _check_payload_protocol_transitions(session, manager, rank):
+    from b12x.comm.pcie import _oneshot_preparation as oneshot
+    from b12x.comm.pcie._oneshot_cute import _PLAIN_GRAPH_EPOCH_OFFSET
+
+    channel = manager._runtime._prepared_channel_for_stream(None, None)
+    cases = []
+    for rows, fused in ((1, False), (8, False), (3, True)):
+        shape = (rows, 5120)
+        inp = torch.ones(
+            (*shape[:1], 3, shape[1]) if fused else shape,
+            device=manager.device,
+            dtype=torch.bfloat16,
+        )
+        out = torch.empty(shape, device=manager.device, dtype=torch.bfloat16)
+        if fused:
+            residual = torch.empty(shape, device=manager.device, dtype=torch.float32)
+            addend = torch.zeros(shape, device=manager.device, dtype=torch.bfloat16)
+            weights = torch.ones((rows, 3), device=manager.device)
+            ids = torch.zeros((rows, 3), device=manager.device, dtype=torch.int32)
+            options = dict(
+                input_addend=addend,
+                group_weights=weights,
+                group_ids=ids,
+                group_id_limit=8,
+            )
+            plan = manager.plan(
+                inp, operation="all_reduce_fused_add", residual=residual, **options
+            )
+            assert plan.query.call["mode"] == "stage_bf16_sentinel"
+            session.prepare(
+                (
+                    plan.request(
+                        name="grouped-residual",
+                        collective=CollectiveRequirement(
+                            key="grouped-residual", ranks=tuple(range(4))
+                        ),
+                        prepare_call=lambda state: oneshot._prepare_fused_call(
+                            state,
+                            inp=inp,
+                            residual=residual,
+                            weight=None,
+                            out=None,
+                            residual_out=residual,
+                            epsilon=0.0,
+                            **options,
+                        ),
+                    ),
+                ),
+                coordinator=lambda progress: progress.ready_collectives[0].key
+                if progress.ready_collectives
+                else None,
+            )
+            run = lambda: manager.all_reduce_fused_add(
+                inp, residual, plan=plan, **options
+            )
+        else:
+            plan = _prepare(session, manager, "all_reduce", inp, out)
+            run = lambda: manager.all_reduce(inp, plan=plan, out=out)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), manager.capture(), torch.cuda.graph(graph):
+            run()
+        cases.append((graph, inp, out, plan, fused))
+
+    # The payload protocol drains consumed records and can wrap without retaining tags.
+    epoch = ctypes.c_uint32(0xFFFFFFFC)
+    stream = torch.cuda.current_stream(manager.device)
+    channel._ipc.cudaMemcpyAsync(
+        channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET,
+        ctypes.addressof(epoch),
+        ctypes.sizeof(epoch),
+        int(stream.cuda_stream),
+    )
+    stream.synchronize()
+    dist.barrier()
+    for step in range(8):
+        for graph, inp, out, plan, fused in cases[:: 1 if step % 2 else -1]:
+            _fill(inp, rank, 500 + step)
+            if fused:
+                ids.fill_(-1 if step == 1 else 0)
+                weights.fill_(0.25)
+                addend.fill_(-0.5)
+                residual.fill_(0.125)
+                local = torch.zeros_like(residual)
+                for group in range(3):
+                    local += (
+                        torch.where(
+                            ids[:, group, None] >= 0, inp[:, group].float(), 0.0
+                        )
+                        * weights[:, group, None]
+                    )
+                local = (local.bfloat16().float() + addend.float()).bfloat16()
+                values = [torch.empty_like(local) for _ in range(4)]
+                dist.all_gather(values, local)
+                expected = values[rank].float()
+                for offset in range(1, 4):
+                    expected += values[(rank + offset) % 4].float()
+                expected += residual
+                actual = residual
+            else:
+                expected = _reference(
+                    inp, owner_reduction=plan.query.call["transport"] == "tp4_push_rsag"
+                )
+                actual = out
+            torch.cuda.synchronize()
+            before = _allocation_state(manager.device)
+            with session.capture(), kernel_resolution_guard("mixed payload replay"):
+                graph.replay()
+            torch.cuda.synchronize()
+            assert _allocation_state(manager.device) == before
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for graph, *_ in cases:
+        graph.reset()
 
 
 def _allocation_state(device):
@@ -207,6 +375,9 @@ def _epoch(runtime):
 
 def _check_dispatch(session, manager, rank, *, benchmark=False, benchmark_only=False):
     sizes = (
+        (24 << 10) - 64,
+        24 << 10,
+        (24 << 10) + 64,
         65536 - 64,
         65536,
         65536 + 64,
@@ -225,7 +396,12 @@ def _check_dispatch(session, manager, rank, *, benchmark=False, benchmark_only=F
         plan = _prepare(session, manager, "all_reduce", inp, out)
         push = plan.query.surface == "PCIeTwoShotBF16.all_reduce"
         if not benchmark_only:
-            assert push == (65536 <= size <= 2 << 20), (size, plan.query.surface)
+            assert push == (640 << 10 < size <= 2 << 20), (size, plan.query.surface)
+            if not push:
+                expected_transport = (
+                    "tp4_push_sentinel" if size <= 24 << 10 else "tp4_push_rsag"
+                )
+                assert plan.query.call["transport"] == expected_transport
         with session.capture():
             manager.all_reduce(inp, plan=plan, out=out)
         torch.cuda.synchronize()
@@ -300,7 +476,7 @@ def _check_dispatch(session, manager, rank, *, benchmark=False, benchmark_only=F
 
 
 def _check_dispatch_contracts(session, manager, rank):
-    inp = torch.empty(32768, device=manager.device, dtype=torch.bfloat16)
+    inp = torch.empty(524288, device=manager.device, dtype=torch.bfloat16)
     out = torch.empty_like(inp)
     _fill(inp, rank, 71)
     prepared = _prepare(session, manager, "all_reduce", inp, out)
@@ -506,6 +682,8 @@ def main():
         )
         if not args.benchmark_only:
             _check_dispatch_contracts(session, manager, rank)
+            _check_payload_ready(session, manager, rank)
+            _check_payload_protocol_transitions(session, manager, rank)
             _check_mixed(session, manager._bf16_twoshot, rank)
             if rank == 0:
                 print(

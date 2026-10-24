@@ -3,10 +3,15 @@
 Caller-owned runtimes retain CUDA-IPC handles and mapped peer buffers.
 ``query_from_runtime`` and ``plan`` declare work for an established channel;
 ``PreparationSession`` prepares the plan required by mathematical methods.
-``AllReduce.plan`` performs its existing world/message routing during planning.
+``AllReduce.plan`` declares eligible native transports for joint group tuning.
+DCP head gathers and LSE reduce-scatter tune their launch geometry. Equivalent
+shape/dtype/layout declarations share a selection regardless of request name.
+The benchmark operands and arithmetic checks live in this package; preparation
+coordinators exchange readiness and per-rank timing contributions. See README.md.
 Pools select only channels provisioned before preparation.
 
-Fused one-shot reduction supports up to 36 contiguous rows with independently
+Fused one-shot reduction supports up to 64 contiguous rows on qualified TP4
+BF16 payload-ready channels, and up to 36 rows on other transports with independently
 declared input, residual, normalization weight, and output dtypes (FP16, BF16,
 or FP32). Declare the actual ``residual``, ``weight``, and ``out`` tensors with
 ``AllReduce.plan(inp, operation="all_reduce_fused_add_rms_norm", ...)``.
@@ -52,6 +57,8 @@ META = OpMeta(
         "Plan",
         "PcieConfig",
         "PcieQuery",
+        "CollectiveConfig",
+        "CollectiveQuery",
         "plan",
         "query_from_runtime",
         "AllReduce",
@@ -87,6 +94,8 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         Plan,
         PcieConfig,
         PcieQuery,
+        CollectiveConfig,
+        CollectiveQuery,
         plan,
         query_from_runtime,
         AllReduce,

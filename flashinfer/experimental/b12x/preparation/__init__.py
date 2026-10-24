@@ -18,6 +18,7 @@ from .tuning import (
 from .types import (
     CandidateResourceIneligibleError,
     CollectiveRequirement,
+    CollectiveTuningRequirement,
     DeviceIdentity,
     FrozenMapping,
     MemoryRequirements,
@@ -44,6 +45,7 @@ __all__ = [
     "CandidateResourceIneligibleError",
     "CollectiveBarrierTimeout",
     "CollectiveRequirement",
+    "CollectiveTuningRequirement",
     "DetectedDevice",
     "DeviceIdentity",
     "EligiblePlan",

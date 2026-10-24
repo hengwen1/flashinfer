@@ -87,6 +87,8 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             "query_head_dim": int(runtime.query_head_dim),
             "slot_bytes": int(runtime._slot_bytes),
             "signal_words": len(runtime._signal_ptrs),
+            "threads_override": int(runtime._threads_override),
+            "blocks_override": int(runtime._block_limit_override),
         }
     )
     requested_threads = int(call.get("threads", 256))
@@ -103,6 +105,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             shape=tuple(value.shape),
             stride=tuple(value.stride()),
             lse_shape=tuple(lse.shape),
+            lse_stride=tuple(lse.stride()),
             natural_log=bool(call.get("is_lse_base_on_e", True)),
         )
     elif surface.endswith("all_gather_heads"):
@@ -127,6 +130,20 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         metadata["threads"] = 512
     elif surface.endswith("kimi_topk16"):
         metadata["threads"] = int(call.get("threads", 256))
+    if surface.endswith(("lse_reduce_scatter", "all_gather_heads")):
+        out = call.get("out")
+        heads = (
+            runtime.heads_per_rank
+            if surface.endswith("lse_reduce_scatter")
+            else runtime.total_heads
+        )
+        shape = (value.shape[0], heads, value.shape[-1])
+        metadata.update(
+            out_shape=tuple(out.shape) if out is not None else shape,
+            out_stride=tuple(out.stride())
+            if out is not None
+            else (heads * shape[-1], shape[-1], 1),
+        )
     return PcieQuery(
         surface=surface,
         world_size=int(runtime.world_size),
@@ -216,16 +233,16 @@ class _DcpExecutionState:
                 call.get("out"),
                 state=self,
                 is_lse_base_on_e=call.get("is_lse_base_on_e", True),
-                threads=call.get("threads", 256),
-                block_limit=call.get("block_limit", 16),
+                threads=call.get("threads", self.query.call["threads"]),
+                block_limit=call.get("block_limit", self.query.call["block_limit"]),
             )
         if surface.endswith("all_gather_heads"):
             return self.runtime._all_gather_heads_on_device(
                 call["local_input"],
                 call.get("out"),
                 state=self,
-                threads=call.get("threads", 256),
-                block_limit=call.get("block_limit", 16),
+                threads=call.get("threads", self.query.call["threads"]),
+                block_limit=call.get("block_limit", self.query.call["block_limit"]),
             )
         if surface.endswith("all_gather_pair_kimi_topk"):
             return self.runtime._all_gather_pair_kimi_topk_on_device(

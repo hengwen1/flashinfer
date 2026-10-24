@@ -14,6 +14,7 @@ from torch.distributed import ProcessGroup
 
 from b12x.preparation import FrozenMapping, Plan
 from b12x.preparation.types import require_prepared
+from ._collective_tuning import CollectiveConfig
 from ._tuning import PcieConfig
 
 from .pcie_hierarchical import (
@@ -46,6 +47,11 @@ from .pcie_oneshot import (
 )
 from .pcie_twoshot_bf16 import PCIeTwoShotBF16
 from .pcie_twoshot import TWOSHOT_REQUIRED_SMS
+from ._allreduce_policy import (
+    BF16_TWOSHOT_MIN_BYTES,
+    BF16_TWOSHOT_MAX_BYTES,
+    tp4_bf16_transport,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -57,11 +63,6 @@ ISLAND_RS_MAX_BYTES = 160 * 1024
 # Partial islands use the leader path without the equal-quarter alternative.
 # Limit default dispatch to decode vectors of at most 32 KiB.
 PARTIAL_ISLAND_MAX_BYTES = 32 * 1024
-# Serialized TP4 BF16 messages above this size favor single-rounding two-shot.
-BF16_TWOSHOT_MIN_BYTES = 64 * 1024
-# The push two-shot stays below one-shot through verification-sized batches;
-# the cap bounds the channel's staging (two slots plus the reduce-scatter shard).
-BF16_TWOSHOT_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _bf16_twoshot_supported(*, exchange_group, device, world_size) -> bool:
@@ -135,11 +136,10 @@ def _algorithm_for_world_size(world_size: int) -> str:
 class PCIeAllReduce:
     """Select a peer-safe all-reduce implementation from the world size.
 
-    Worlds through TP8 use the low-latency all-peer oneshot runtime. Serialized
-    TP4 BF16 messages in the 64 KiB–2 MiB band use single-rounding two-shot
-    when every rank has at least 64 visible SMs and supplied output storage
-    is disjoint from the input. TP9,
-    TP10, TP12 and TP16 use islands of up to four GPUs so no context maps more than
+    Worlds through TP8 use all-peer transports. Serialized TP4 BF16 declarations
+    also admit single-rounding two-shot when every rank has at least 64 visible
+    SMs and the output is disjoint from the input. TP9, TP10, TP12 and TP16 use
+    islands of up to four GPUs so no context maps more than
     six peers. Other worlds fail closed instead of exceeding the CUDA peer
     connection limit.
     """
@@ -230,7 +230,7 @@ class PCIeAllReduce:
             if (
                 world_size == 4
                 and single_channel
-                and max_size >= BF16_TWOSHOT_MIN_BYTES
+                and max_size >= 64
                 and _bf16_twoshot_supported(
                     exchange_group=exchange_group,
                     device=runtime.device,
@@ -399,6 +399,18 @@ class PCIeAllReduce:
             or not target.accepts(inp)
         ):
             return False
+        payload_ready = (
+            self._runtime._sentinel_supported and self._runtime._transport_policy[3]
+        )
+        if (
+            tp4_bf16_transport(
+                inp.numel() * inp.element_size(),
+                payload_ready=payload_ready,
+                twoshot_available=True,
+            )
+            != "twoshot"
+        ):
+            return False
         if out is None:
             return True
         if not target.accepts(out) or inp.shape != out.shape:
@@ -454,7 +466,7 @@ class PCIeAllReduce:
         stream: object = None,
         channel_id: Optional[str] = None,
         invocation: FrozenMapping = FrozenMapping(),
-        override: PcieConfig | None = None,
+        override: PcieConfig | CollectiveConfig | None = None,
         **call,
     ) -> Plan:
         """Select an existing native channel once, then declare its plan.
@@ -470,6 +482,52 @@ class PCIeAllReduce:
             "all_reduce_fused_add",
         ):
             raise ValueError(f"unsupported all-reduce operation {operation!r}")
+        if self.algorithm == "oneshot" and self.single_channel:
+            from ._collective_tuning import (
+                oneshot_alternatives,
+                plan as collective_plan,
+            )
+
+            target = self._runtime._prepared_channel_for_stream(stream, channel_id)
+            query = query_from_runtime(
+                target,
+                surface=f"OneshotAllReduce.{operation}",
+                call={"inp": inp, **call},
+            )
+            if query.call["stage_input"]:
+                alternatives = oneshot_alternatives(query, target)
+                default = query.call[
+                    "transport" if operation == "all_reduce" else "mode"
+                ]
+                output = call.get("out")
+                inplace = output is not None and output.data_ptr() == inp.data_ptr()
+                twoshot = self._bf16_twoshot
+                nbytes = inp.numel() * inp.element_size()
+                disjoint = output is None or (
+                    inp.data_ptr() + nbytes <= output.data_ptr()
+                    or output.data_ptr() + nbytes <= inp.data_ptr()
+                )
+                if (
+                    operation == "all_reduce"
+                    and twoshot is not None
+                    and twoshot.accepts(inp)
+                    and disjoint
+                ):
+                    native = query_from_runtime(
+                        twoshot,
+                        surface="PCIeTwoShotBF16.all_reduce",
+                        call={"inp": inp, **call},
+                    )
+                    alternatives["twoshot"] = (native, twoshot)
+                    if self._use_bf16_twoshot(inp, output):
+                        default = "twoshot"
+                return collective_plan(
+                    alternatives,
+                    default=default,
+                    inplace=inplace,
+                    invocation=invocation,
+                    override=override,
+                )
         if operation == "all_reduce" and self._use_bf16_twoshot(inp, call.get("out")):
             query = query_from_runtime(
                 self._bf16_twoshot,
@@ -512,8 +570,20 @@ class PCIeAllReduce:
                 )
             if stream is not None:
                 with torch.cuda.stream(stream):
-                    return self._bf16_twoshot.all_reduce(inp, plan=plan, out=out)
-            return self._bf16_twoshot.all_reduce(inp, plan=plan, out=out)
+                    return self._bf16_twoshot.all_reduce(
+                        inp,
+                        plan=plan,
+                        out=out,
+                        threads=state.query.call["threads"],
+                        block_limit=state.query.call["block_limit"],
+                    )
+            return self._bf16_twoshot.all_reduce(
+                inp,
+                plan=plan,
+                out=out,
+                threads=state.query.call["threads"],
+                block_limit=state.query.call["block_limit"],
+            )
         if self.algorithm == "hierarchical":
             if peer_input_ptrs is not None:
                 raise ValueError(

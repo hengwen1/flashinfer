@@ -257,6 +257,23 @@ class CollectiveRequirement:
 
 
 @dataclass(frozen=True)
+class CollectiveTuningRequirement:
+    """One rank's contribution at a collective race synchronization point."""
+
+    key: str
+    ranks: tuple[int, ...]
+    step: str
+    payload: FrozenMapping
+
+    def __post_init__(self):
+        requirement = CollectiveRequirement(self.key, self.ranks)
+        if not isinstance(self.step, str) or not self.step:
+            raise ValueError("collective tuning requires a synchronization step")
+        object.__setattr__(self, "ranks", requirement.ranks)
+        object.__setattr__(self, "payload", FrozenMapping(self.payload))
+
+
+@dataclass(frozen=True)
 class TuningCacheRequirement:
     """Rank-local completed selections to reconcile before sharding candidates."""
 
@@ -362,6 +379,7 @@ class PreparationProgress:
     candidates_described: int = 0
     restored_candidates: int = 0
     rejected_candidates: int = 0
+    ready_collective_tuning: CollectiveTuningRequirement | None = None
 
     @property
     def completed_candidates(self):
@@ -390,6 +408,8 @@ class PreparedCall:
     close: Callable[[], None] | None = None
     capture_safe: bool = True
     benchmark_producers: tuple[Callable[[], None], ...] = ()
+    validate: Callable[[], None] | None = None
+    capture_context: Callable[[], object] | None = None
 
     def invoke(self):
         result = self.run()
@@ -548,6 +568,7 @@ class Plan(_PreparedSlot, Generic[ConfigT]):
     dependencies: tuple[str, ...] = ()
     _device: object | None = None
     shared: bool = False
+    _benchmark_call: Callable[[object], PreparedCall] | None = None
     _prepared: _Prepared | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -578,7 +599,9 @@ class Plan(_PreparedSlot, Generic[ConfigT]):
             name=name,
             plan=self,
             prepare_call=prepare_call,
-            benchmark_call=benchmark_call,
+            benchmark_call=self._benchmark_call
+            if benchmark_call is None
+            else benchmark_call,
             dependencies=tuple(dict.fromkeys((*self.dependencies, *dependencies))),
             collective=collective,
             retain_benchmark_call=retain_benchmark_call,

@@ -4,6 +4,7 @@ Run with B12X_RUN_COLLECTIVE_TUNING_TEST=1 and two or four visible SM120 GPUs.
 """
 
 import os
+import weakref
 from pathlib import Path
 
 import pytest
@@ -82,6 +83,7 @@ def _worker(rank, world, directory):
     )
     manager.prepare_channels(("tuning",))
     members = tuple(range(world))
+    fixture_refs = []
 
     def declarations(*, dtype=torch.bfloat16, mismatch=False, width=None):
         plans, requests, operands = [], [], []
@@ -107,6 +109,20 @@ def _worker(rank, world, directory):
                     collective=CollectiveRequirement(f"layer{index}", members),
                 )
             )
+            from dataclasses import replace
+
+            factory = requests[-1].benchmark_call
+
+            def benchmark(state, factory=factory):
+                call = factory(state)
+                inputs = call.owners[0]
+                fixture_refs.extend(
+                    weakref.ref(value)
+                    for value in (inputs, inputs.source, inputs.out, *inputs.seeds)
+                )
+                return call
+
+            requests[-1] = replace(requests[-1], benchmark_call=benchmark)
             plans.append(plan)
             operands.append((source, out))
         return plans, requests, operands
@@ -126,7 +142,19 @@ def _worker(rank, world, directory):
         for iteration in range(2):
             owner = session("reuse", cache_only=iteration == 1)
             plans, requests, operands = declarations()
-            result = _drive(owner, requests)
+            from b12x.preparation._measurement import _collection_paused
+
+            before_tuning = torch.cuda.memory_allocated()
+            with _collection_paused():
+                result = _drive(owner, requests)
+                # Completed candidate fixtures must retire before full job cleanup.
+                assert not any(reference() is not None for reference in fixture_refs)
+            assert torch.cuda.memory_allocated() == before_tuning
+            print(
+                f"rank {rank} iteration {iteration}: allocated before/after tuning "
+                f"{before_tuning}/{torch.cuda.memory_allocated()}",
+                flush=True,
+            )
             assert plans[0].selection.config == plans[1].selection.config
             assert all(
                 plan.selection.source == ("tuned" if iteration == 0 else "cached")

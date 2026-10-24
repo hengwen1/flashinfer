@@ -76,9 +76,6 @@ class _ReductionInputs:
                     dtype=getattr(torch, call["group_ids_dtype"]),
                     device=device,
                 )
-        self.producers = tuple(
-            partial(self.produce, index) for index in range(len(self.seeds))
-        )
 
     def produce(self, index):
         self.step = index
@@ -163,11 +160,16 @@ def benchmark_call(state, *, inplace=False):
     inputs = _DcpInputs(state) if dcp else _ReductionInputs(state, inplace=inplace)
     if not dcp and not inputs.twoshot:
         state.bind_input(inputs.source)
+    # Callbacks own the operands; the operands must not own callbacks bound to
+    # themselves, or GPU tensors survive until an unrelated cyclic collection.
+    producers = tuple(
+        partial(inputs.produce, index) for index in range(len(inputs.seeds))
+    )
     return PreparedCall(
         run=inputs.run,
         output=inputs.out,
-        produce=inputs.producers[0],
-        benchmark_producers=inputs.producers,
+        produce=producers[0],
+        benchmark_producers=producers,
         validate=inputs.validate,
         owners=(inputs, state.runtime),
         capture_context=None if dcp else state.runtime.capture,
@@ -223,7 +225,6 @@ class _DcpInputs:
         else:
             expected = stacked.permute(1, 0, 2, 3).reshape(self.out.shape)
         self.expected = (expected, torch.zeros_like(expected))
-        self.producers = tuple(partial(self.produce, index) for index in range(2))
 
     def produce(self, index):
         self.step = index

@@ -1,0 +1,1542 @@
+// SPDX-License-Identifier: Apache-2.0
+// Small-M MXFP8 x MXFP8 -> BF16 GEMV for sm_120 (decode-shaped dense GEMMs).
+//
+// C[M, N] = A[M, K] (e4m3, per-32 ue8m0 scales) x B[N, K]^T (e4m3, per-32 ue8m0 scales)
+//
+// Both scale tensors use FlashInfer's F8_128x4 swizzled layout (the layout vLLM's
+// FlashInferCutlassMxfp8LinearKernel already stores for weights and produces for
+// activations), so this kernel is a drop-in for mm_mxfp8(backend="cutlass") when
+// M <= 16 (the tensor-core path accepts up to 64 rows). The CUTLASS SM120 blockscaled
+// GEMM runs a 128-row MMA tile for a 6-row decode batch and averages 16 us for a 5 MB
+// weight (profile of DeepSeek-V4.1-Flash on RTX PRO 6000, 2026-09-18); the weight
+// stream alone is ~3 us at 1.7 TB/s.
+//
+// `mxfp8_gemv_grouped` (below) is the same tensor-core kernel with the operand layouts
+// of DeepSeek-V4's grouped o-projection (`wo_a`): checkpoint MXFP8 weights + row-major
+// ue8m0 scales, activations from fused_inv_rope_fp8_quant with DeepGEMM's packed
+// MN-major scales. On sm_120 vLLM otherwise falls back to BF16 weights + cuBLAS bmm.
+//
+// Since 2026-10-02 the v3 / v1 / grouped kernels are launched with programmatic dependent
+// launch (VLLM_MOET_GEMV_PDL, see griddep_wait / launch_mode): a GEMV comes up while the kernel
+// before it (FlashInfer's MXFP8 quantize, the Triton norm+quant / inverse-RoPE+quant kernels,
+// all PDL-aware) still runs, issues its first weight loads, waits, then reads the activations;
+// v3's weight loads skip L1 with an L2 evict-first policy (VLLM_MOET_GEMV_EVICT_FIRST). Same
+// arithmetic, same bits; with both switches at 0 the launches and kernels are the ones served
+// until then (SASS-identical).
+//
+// Mapping: one warp per output column n, 8 warps per block. The block stages A
+// (M x CHUNK e4m3) and its scales in shared memory once per K-chunk; every lane then
+// issues ALL of its 16-byte weight loads for the chunk up front (up to 10 in flight
+// for K = 5120) before converting, so a row costs one HBM latency instead of one per
+// 512 elements -- the weights are never L2-resident in the server (a decode step
+// streams ~2 GB). Each lane's 16 weights sit in exactly one 32-wide scale block, so
+// the block scale product 2^(ea + eb - 254) is applied per lane before the warp
+// reduction. Accumulation is fp32 like the CUTLASS kernel.
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+
+namespace vllm_moet_sm120 {
+
+constexpr int kBlockSize = 32;  // MXFP8 scale block
+constexpr int kWarps = 8;       // rows (n) per block
+constexpr int kThreads = kWarps * 32;
+constexpr int kStepElems = 32 * 16;  // one uint4 per lane per step
+
+// F8_128x4 swizzle: rows in tiles of 128 (4 x 32), scale columns in tiles of 4.
+__device__ __forceinline__ int sf_offset(int row, int kc, int num_k_tiles) {
+  const int mt = row >> 7, r = row & 127, a = r >> 5, b = r & 31;
+  const int kt = kc >> 2, c = kc & 3;
+  return ((((mt * num_k_tiles + kt) * 32 + b) * 4 + a) * 4 + c);
+}
+
+__device__ __forceinline__ void fp8x16_to_float(const uint4& v, float* out) {
+  const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const __half2_raw lo =
+        __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(w[i] & 0xffffu), __NV_E4M3);
+    const __half2_raw hi =
+        __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(w[i] >> 16), __NV_E4M3);
+    const float2 flo = __half22float2(__half2(lo));
+    const float2 fhi = __half22float2(__half2(hi));
+    out[4 * i + 0] = flo.x;
+    out[4 * i + 1] = flo.y;
+    out[4 * i + 2] = fhi.x;
+    out[4 * i + 3] = fhi.y;
+  }
+}
+
+// 2^(e - 127) for a ue8m0 byte; e == 0 maps to 0 (only produced for all-zero blocks).
+__device__ __forceinline__ float ue8m0_to_float(uint32_t e) {
+  return e == 0u ? 0.0f : __uint_as_float(e << 23);
+}
+
+// Programmatic dependent launch (PDL, 2026-10-02). A kernel launched with programmatic stream
+// serialization may start while the kernel before it still runs; until griddepcontrol.wait it may
+// read only immutable data (the weights and their scales), and every read of the activations and
+// every global write comes after it. Both kinds of loads of the PDL variants are asm volatile, so
+// the compiler keeps their order relative to the wait (an __ldg is an invariant load it may move
+// across it), and predicated inside the asm (a conditional asm load would become a branch per
+// load). The activations are weak L1-cached loads (griddepcontrol.wait makes the prerequisite
+// grids' writes visible to them), not the non-coherent path (the activations are not read-only
+// while the grid runs) and not ld.global.cg: every CTA re-reads the same few KB of activations,
+// and as L2-only (STRONG.GPU) loads they queue on the same L2 lines - 6x slower at 16 rows.
+// Predicated-off loads return 0.
+__device__ __forceinline__ void griddep_wait() {
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+}
+__device__ __forceinline__ void griddep_launch_dependents() {
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+#define VLLM_MOET_PRED_LD(NAME, QUAL)                                            \
+  __device__ __forceinline__ uint4 NAME##_v4(const void* ptr, bool pred) {       \
+    uint4 v = make_uint4(0, 0, 0, 0);                                            \
+    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %5, 0;\n @p ld.global" QUAL \
+                 ".v4.u32 {%0, %1, %2, %3}, [%4];\n}"                            \
+                 : "+r"(v.x), "+r"(v.y), "+r"(v.z), "+r"(v.w)                    \
+                 : "l"(ptr), "r"((int)pred));                                    \
+    return v;                                                                    \
+  }                                                                              \
+  __device__ __forceinline__ uint2 NAME##_v2(const void* ptr, bool pred) {       \
+    uint2 v = make_uint2(0, 0);                                                  \
+    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %3, 0;\n @p ld.global" QUAL \
+                 ".v2.u32 {%0, %1}, [%2];\n}"                                    \
+                 : "+r"(v.x), "+r"(v.y)                                          \
+                 : "l"(ptr), "r"((int)pred));                                    \
+    return v;                                                                    \
+  }                                                                              \
+  __device__ __forceinline__ uint32_t NAME##_u32(const void* ptr, bool pred) {   \
+    uint32_t v = 0;                                                              \
+    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %2, 0;\n @p ld.global" QUAL \
+                 ".u32 %0, [%1];\n}"                                             \
+                 : "+r"(v)                                                       \
+                 : "l"(ptr), "r"((int)pred));                                    \
+    return v;                                                                    \
+  }                                                                              \
+  __device__ __forceinline__ uint32_t NAME##_u8(const void* ptr, bool pred) {    \
+    uint32_t v = 0;                                                              \
+    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %2, 0;\n @p ld.global" QUAL \
+                 ".u8 %0, [%1];\n}"                                              \
+                 : "+r"(v)                                                       \
+                 : "l"(ptr), "r"((int)pred));                                    \
+    return v;                                                                    \
+  }
+VLLM_MOET_PRED_LD(ld_w, ".nc")  // weights / weight scales (immutable)
+VLLM_MOET_PRED_LD(ld_act, "")   // activations / activation scales (after griddepcontrol.wait)
+#undef VLLM_MOET_PRED_LD
+
+// EV = 1 (v3's PDL variants): the weight loads (not the scales) skip L1 and carry an L2
+// evict-first policy - every weight byte is read once per decode step. In CUDA graphs of the
+// served neighbour kernels the v3 calls get 0.3-0.6 us shorter and the gaps around them smaller;
+// the kernel alone under ncu (caches flushed) is unchanged (same L1 / L2 hit rates, same time).
+// Not for v1 / grouped: measured slower there (that layout shares each weight line between four
+// warps).
+__device__ __forceinline__ uint64_t evict_first_policy() {
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
+template <int EV>
+__device__ __forceinline__ uint4 ld_weight_v4(const void* ptr, bool pred, uint64_t pol) {
+  if constexpr (EV == 0) return ld_w_v4(ptr, pred);
+  uint4 v = make_uint4(0, 0, 0, 0);
+  asm volatile(
+      "{\n .reg .pred p;\n setp.ne.b32 p, %5, 0;\n"
+      " @p ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0, %1, %2, %3}, [%4], %6;\n}"
+      : "+r"(v.x), "+r"(v.y), "+r"(v.z), "+r"(v.w)
+      : "l"(ptr), "r"((int)pred), "l"(pol));
+  return v;
+}
+
+// blockIdx.x -> group of kWarps output columns, blockIdx.y -> K-chunk (split-K).
+// With SPLIT (gridDim.y > 1) every block handles one K chunk and writes its fp32
+// partial sums to `Cf[chunk, M, N]`; `finalize_kernel` sums the chunks and converts.
+// Without split (gridDim.y == 1) the block loops over all chunks and writes bf16.
+template <int MAXM, int CHUNK, bool SPLIT>
+__global__ void __launch_bounds__(kThreads)
+    mxfp8_gemv_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ A_sf,
+                      const uint8_t* __restrict__ B, const uint8_t* __restrict__ B_sf,
+                      __nv_bfloat16* __restrict__ C, float* __restrict__ Cf, int M, int N, int K,
+                      int num_k_tiles) {
+  constexpr int STEPS = CHUNK / kStepElems;
+  constexpr int SF_PER_ROW = CHUNK / kBlockSize;
+  __shared__ __align__(16) uint8_t s_a[MAXM * CHUNK];
+  __shared__ float s_asf[MAXM * SF_PER_ROW];
+
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int n = blockIdx.x * kWarps + warp;
+  const bool row_ok = n < N;
+
+  float acc[MAXM];
+#pragma unroll
+  for (int m = 0; m < MAXM; ++m) acc[m] = 0.0f;
+
+  const int num_chunks = (K + CHUNK - 1) / CHUNK;
+  const int chunk_begin = SPLIT ? blockIdx.y : 0;
+  const int chunk_end = SPLIT ? blockIdx.y + 1 : num_chunks;
+  for (int chunk = chunk_begin; chunk < chunk_end; ++chunk) {
+    const int k0 = chunk * CHUNK;
+    const int k_len = min(CHUNK, K - k0);  // multiple of 32 (K % 32 == 0)
+
+    // Issue this row's weight loads for the whole chunk before touching shared memory.
+    uint4 wv[STEPS];
+    const uint8_t* brow = B + (size_t)n * K + k0;
+#pragma unroll
+    for (int s = 0; s < STEPS; ++s) {
+      const int kk = s * kStepElems + lane * 16;
+      wv[s] = (row_ok && kk < k_len) ? *reinterpret_cast<const uint4*>(brow + kk)
+                                     : make_uint4(0, 0, 0, 0);
+    }
+
+    // Stage A[:M, k0:k0+k_len] (16 B per thread per pass) and its block scales.
+    __syncthreads();
+    {
+      const int vec_per_row = k_len / 16;
+      const int total_vec = M * vec_per_row;
+      for (int idx = threadIdx.x; idx < total_vec; idx += kThreads) {
+        const int m = idx / vec_per_row;
+        const int v = idx - m * vec_per_row;
+        *reinterpret_cast<uint4*>(s_a + m * CHUNK + v * 16) =
+            *reinterpret_cast<const uint4*>(A + (size_t)m * K + k0 + v * 16);
+      }
+      const int blocks_per_row = k_len / kBlockSize;
+      const int total_sf = M * blocks_per_row;
+      for (int idx = threadIdx.x; idx < total_sf; idx += kThreads) {
+        const int m = idx / blocks_per_row;
+        const int kb = idx - m * blocks_per_row;
+        s_asf[m * SF_PER_ROW + kb] =
+            ue8m0_to_float(A_sf[sf_offset(m, (k0 / kBlockSize) + kb, num_k_tiles)]);
+      }
+    }
+    __syncthreads();
+    if (!row_ok) continue;
+
+#pragma unroll
+    for (int s = 0; s < STEPS; ++s) {
+      const int kk = s * kStepElems + lane * 16;
+      if (kk >= k_len) break;
+      const int kb = kk / kBlockSize;  // scale block within the chunk (2 lanes per block)
+      const float wsf = ue8m0_to_float(B_sf[sf_offset(n, (k0 / kBlockSize) + kb, num_k_tiles)]);
+      float w[16];
+      fp8x16_to_float(wv[s], w);
+#pragma unroll
+      for (int m = 0; m < MAXM; ++m) {
+        if (m < M) {
+          float a[16];
+          const uint4 av = *reinterpret_cast<const uint4*>(s_a + m * CHUNK + kk);
+          fp8x16_to_float(av, a);
+          float part = 0.0f;
+#pragma unroll
+          for (int j = 0; j < 16; ++j) part = fmaf(a[j], w[j], part);
+          acc[m] = fmaf(part, wsf * s_asf[m * SF_PER_ROW + kb], acc[m]);
+        }
+      }
+    }
+  }
+
+  if (!row_ok) return;
+#pragma unroll
+  for (int m = 0; m < MAXM; ++m) {
+    float v = acc[m];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+    acc[m] = v;
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int m = 0; m < MAXM; ++m) {
+      if (m < M) {
+        if (SPLIT) {
+          Cf[((size_t)blockIdx.y * M + m) * N + n] = acc[m];
+        } else {
+          C[(size_t)m * N + n] = __float2bfloat16(acc[m]);
+        }
+      }
+    }
+  }
+}
+
+__global__ void finalize_kernel(const float* __restrict__ Cf, __nv_bfloat16* __restrict__ C,
+                                int total, int num_chunks) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  float v = 0.0f;
+  for (int c = 0; c < num_chunks; ++c) v += Cf[(size_t)c * total + i];
+  C[i] = __float2bfloat16(v);
+}
+
+// ---------------------------------------------------------------------------
+// Tensor-core variant: mma.sync.m16n8k32 (e4m3 x e4m3 -> f32), rows padded to 16.
+// A block owns 8 output columns; its 8 warps split the K blocks (kb = warp, warp+8,
+// ...). Physical k is permuted inside each 32-wide MX block so that every lane's
+// fragment bytes are contiguous (lane tig holds physical k = kb*32 + tig*8 .. +8 as
+// {a0/b0 (first 4), a2/b1 (next 4)}); A and B use the same permutation, so the dot
+// product is unchanged and every mma stays inside one scale block. The per-block
+// result is then scaled by 2^(sa[m]+sb[n]-254) before accumulation.
+//
+// Generalised (2026-09-18) for the grouped o-projection (`wo_a`, one [T, K] x [Ng, K]^T
+// GEMM per head group, blockIdx.y = group) and for M up to 64 (MT m16 tiles share the
+// weight fragment). Scale layouts are template parameters:
+//   SF_F8_128x4  - FlashInfer's swizzled layout (dense path, both operands)
+//   SF_ROWMAJOR  - [rows, K/32] ue8m0 bytes (vLLM's MXFP8 checkpoint weight_scale)
+//   SF_MN_PACKED - DeepGEMM/SM100 activation layout written by vLLM's
+//                  fused_inv_rope_fp8_quant(tma_aligned_scales=True): int32 words that
+//                  pack 4 consecutive K-block ue8m0 bytes, stored [K/128][T_aligned]
+constexpr int kMmaCols = 8;
+enum : int { SF_F8_128x4 = 0, SF_ROWMAJOR = 1, SF_MN_PACKED = 2 };
+
+struct GemvArgs {
+  const uint8_t* A;
+  const uint8_t* A_sf;
+  const uint8_t* B;
+  const uint8_t* B_sf;
+  __nv_bfloat16* C;
+  int M, N, K, num_k_tiles;
+  int ldc;                 // C row stride (elements)
+  long long a_gstride;     // bytes between groups
+  long long a_sf_gstride;  // bytes between groups
+  long long b_gstride;     // bytes between groups
+  long long b_sf_gstride;  // bytes between groups
+  long long c_gstride;     // elements between groups
+  int a_sf_t_al;           // SF_MN_PACKED: T_aligned (int32 words per K-block column)
+  int b_sf_ld;             // SF_ROWMAJOR: bytes per row
+  int lda_s;               // v2 SA: shared-memory row stride of the staged A slice (bytes)
+};
+
+template <int LAYOUT>
+__device__ __forceinline__ size_t sf_byte_offset(int row, int kb, int num_k_tiles, int t_al,
+                                                 int ld) {
+  if constexpr (LAYOUT == SF_F8_128x4) {
+    return sf_offset(row, kb, num_k_tiles);
+  } else if constexpr (LAYOUT == SF_ROWMAJOR) {
+    return (size_t)row * ld + kb;
+  } else {
+    return ((size_t)(kb >> 2) * t_al + row) * 4 + (kb & 3);
+  }
+}
+
+// LD: 0 = plain load, 1 = weight scale of a PDL variant, 2 = activation scale of a PDL variant
+// (predicated by `pred`, 0 when off).
+template <int LAYOUT, int LD = 0>
+__device__ __forceinline__ uint32_t load_sf(const uint8_t* __restrict__ sf, int row, int kb,
+                                            int num_k_tiles, int t_al, int ld, bool pred = true) {
+  const size_t off = sf_byte_offset<LAYOUT>(row, kb, num_k_tiles, t_al, ld);
+  if constexpr (LD == 1) {
+    return ld_w_u8(sf + off, pred);
+  } else if constexpr (LD == 2) {
+    return ld_act_u8(sf + off, pred);
+  } else {
+    return sf[off];
+  }
+}
+
+__device__ __forceinline__ void mma_m16n8k32_e4m3(float* d, const uint32_t* a, uint32_t b0,
+                                                  uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "f"(0.0f), "f"(0.0f),
+        "f"(0.0f), "f"(0.0f));
+}
+
+// PDL (see griddep_wait): 0 = plain launch; 1 = the first step's weight loads issued before
+// griddepcontrol.wait, the activation loads after it, launch_dependents right after the wait;
+// 2 = launch_dependents after the output stores instead; 3 = after the K loop. The arithmetic
+// is the same in every variant (same K split per warp, same per-lane fma order, same cross-warp
+// reduction): the same output bits.
+template <int MT, int A_SF, int B_SF, int PDL = 0>
+__global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_kernel(const GemvArgs p) {
+  __shared__ float s_red[kWarps][32][4 * MT];
+
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int g = lane >> 2;   // groupID: A row (and row + 8), B column
+  const int tig = lane & 3;  // thread in group
+  const int grp = blockIdx.y;
+  const uint8_t* __restrict__ A = p.A + grp * p.a_gstride;
+  const uint8_t* __restrict__ A_sf = p.A_sf + grp * p.a_sf_gstride;
+  const uint8_t* __restrict__ B = p.B + grp * p.b_gstride;
+  const uint8_t* __restrict__ B_sf = p.B_sf + grp * p.b_sf_gstride;
+  __nv_bfloat16* __restrict__ C = p.C + grp * p.c_gstride;
+  const int M = p.M, N = p.N, K = p.K, num_k_tiles = p.num_k_tiles;
+  const int n0 = blockIdx.x * kMmaCols;
+  const int KB = K / kBlockSize;
+
+  const int n = n0 + g;
+  const bool col_ok = n < N;
+  const uint8_t* brow = B + (size_t)n * K + tig * 8;
+  const uint8_t* acol = A + tig * 8;
+  // Scales needed at the accumulate step: rows g / g+8 (A) and columns tig*2 / tig*2+1
+  // (B) of this block. Loaded inline with the weights (1 byte each, L2-resident) rather
+  // than staged: a block-wide staging pass of 24 x KB scattered bytes was a serial
+  // latency chain in front of the first mma when the scales are cold in the server.
+  const int c0 = n0 + tig * 2, c1 = c0 + 1;
+  const bool c0_ok = c0 < N, c1_ok = c1 < N;
+
+  float acc[MT][4];
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc[t][i] = 0.0f;
+
+  constexpr int UNROLL = 4;
+  if constexpr (PDL == 0) {
+    for (int kb0 = warp; kb0 < KB; kb0 += kWarps * UNROLL) {
+      uint2 wa0[MT][UNROLL], wa1[MT][UNROLL], wb[UNROLL];
+      uint32_t sa0[MT][UNROLL], sa1[MT][UNROLL], sb0[UNROLL], sb1[UNROLL];
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        const int kb = kb0 + u * kWarps;
+        const bool ok = kb < KB;
+        const size_t off = (size_t)kb * kBlockSize;
+        const int kbc = ok ? kb : 0;
+        wb[u] = (ok && col_ok) ? *reinterpret_cast<const uint2*>(brow + off) : make_uint2(0, 0);
+        sb0[u] = c0_ok ? load_sf<B_SF>(B_sf, c0, kbc, num_k_tiles, 0, p.b_sf_ld) : 0u;
+        sb1[u] = c1_ok ? load_sf<B_SF>(B_sf, c1, kbc, num_k_tiles, 0, p.b_sf_ld) : 0u;
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          const int r0 = g + 16 * t, r1 = r0 + 8;
+          const bool r0_ok = r0 < M, r1_ok = r1 < M;
+          wa0[t][u] = (ok && r0_ok) ? *reinterpret_cast<const uint2*>(acol + (size_t)r0 * K + off)
+                                    : make_uint2(0, 0);
+          wa1[t][u] = (ok && r1_ok) ? *reinterpret_cast<const uint2*>(acol + (size_t)r1 * K + off)
+                                    : make_uint2(0, 0);
+          sa0[t][u] = r0_ok ? load_sf<A_SF>(A_sf, r0, kbc, num_k_tiles, p.a_sf_t_al, p.K / 32) : 0u;
+          sa1[t][u] = r1_ok ? load_sf<A_SF>(A_sf, r1, kbc, num_k_tiles, p.a_sf_t_al, p.K / 32) : 0u;
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        const int kb = kb0 + u * kWarps;
+        if (kb >= KB) break;
+        const float fb0 = ue8m0_to_float(sb0[u]), fb1 = ue8m0_to_float(sb1[u]);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          const uint32_t afrag[4] = {wa0[t][u].x, wa1[t][u].x, wa0[t][u].y, wa1[t][u].y};
+          float d[4];
+          mma_m16n8k32_e4m3(d, afrag, wb[u].x, wb[u].y);
+          // d0,d1: row g, cols tig*2 + {0,1}; d2,d3: row g + 8, same cols.
+          const float fa0 = ue8m0_to_float(sa0[t][u]), fa1 = ue8m0_to_float(sa1[t][u]);
+          acc[t][0] = fmaf(d[0], fa0 * fb0, acc[t][0]);
+          acc[t][1] = fmaf(d[1], fa0 * fb1, acc[t][1]);
+          acc[t][2] = fmaf(d[2], fa1 * fb0, acc[t][2]);
+          acc[t][3] = fmaf(d[3], fa1 * fb1, acc[t][3]);
+        }
+      }
+    }
+  } else {
+    // The same K loop with the first step's weight half issued before griddepcontrol.wait (ptxas
+    // keeps only some of these loads in front of the wait in this kernel; v3 keeps all). The
+    // step is peeled rather than guarded inside the loop (a guard put every K block's loads into
+    // its own branch region).
+    uint2 wb[UNROLL];
+    uint32_t sb0[UNROLL], sb1[UNROLL];
+    auto load_b = [&](int kb0) {
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        const int kb = kb0 + u * kWarps;
+        const bool ok = kb < KB;
+        const int kbc = ok ? kb : 0;
+        wb[u] = ld_w_v2(brow + (size_t)kbc * kBlockSize, ok && col_ok);
+        sb0[u] = load_sf<B_SF, 1>(B_sf, c0, kbc, num_k_tiles, 0, p.b_sf_ld, c0_ok);
+        sb1[u] = load_sf<B_SF, 1>(B_sf, c1, kbc, num_k_tiles, 0, p.b_sf_ld, c1_ok);
+      }
+    };
+    auto k_step = [&](int kb0, auto with_b) {
+      uint2 wa0[MT][UNROLL], wa1[MT][UNROLL];
+      uint32_t sa0[MT][UNROLL], sa1[MT][UNROLL];
+      if constexpr (decltype(with_b)::value) load_b(kb0);
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        const int kb = kb0 + u * kWarps;
+        const bool ok = kb < KB;
+        const size_t off = (size_t)kb * kBlockSize;
+        const int kbc = ok ? kb : 0;
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          const int r0 = g + 16 * t, r1 = r0 + 8;
+          const bool r0_ok = r0 < M, r1_ok = r1 < M;
+          wa0[t][u] = ld_act_v2(acol + (size_t)r0 * K + off, ok && r0_ok);
+          wa1[t][u] = ld_act_v2(acol + (size_t)r1 * K + off, ok && r1_ok);
+          sa0[t][u] = load_sf<A_SF, 2>(A_sf, r0, kbc, num_k_tiles, p.a_sf_t_al, p.K / 32, r0_ok);
+          sa1[t][u] = load_sf<A_SF, 2>(A_sf, r1, kbc, num_k_tiles, p.a_sf_t_al, p.K / 32, r1_ok);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        const int kb = kb0 + u * kWarps;
+        if (kb >= KB) break;
+        const float fb0 = ue8m0_to_float(sb0[u]), fb1 = ue8m0_to_float(sb1[u]);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          const uint32_t afrag[4] = {wa0[t][u].x, wa1[t][u].x, wa0[t][u].y, wa1[t][u].y};
+          float d[4];
+          mma_m16n8k32_e4m3(d, afrag, wb[u].x, wb[u].y);
+          const float fa0 = ue8m0_to_float(sa0[t][u]), fa1 = ue8m0_to_float(sa1[t][u]);
+          acc[t][0] = fmaf(d[0], fa0 * fb0, acc[t][0]);
+          acc[t][1] = fmaf(d[1], fa0 * fb1, acc[t][1]);
+          acc[t][2] = fmaf(d[2], fa1 * fb0, acc[t][2]);
+          acc[t][3] = fmaf(d[3], fa1 * fb1, acc[t][3]);
+        }
+      }
+    };
+    load_b(warp);
+    griddep_wait();
+    if constexpr (PDL == 1) griddep_launch_dependents();
+    if (warp < KB) k_step(warp, std::false_type{});
+    for (int kb0 = warp + kWarps * UNROLL; kb0 < KB; kb0 += kWarps * UNROLL)
+      k_step(kb0, std::true_type{});
+    if constexpr (PDL == 3) griddep_launch_dependents();
+  }
+
+  // Reduce the 8 K-split warps.
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) s_red[warp][lane][4 * t + i] = acc[t][i];
+  __syncthreads();
+  if (warp == 0) {
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+      float r[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+      for (int w = 0; w < kWarps; ++w)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) r[i] += s_red[w][lane][4 * t + i];
+      const int r0 = g + 16 * t, r1 = r0 + 8;
+      if (r0 < M) {
+        if (c0_ok) C[(size_t)r0 * p.ldc + c0] = __float2bfloat16(r[0]);
+        if (c1_ok) C[(size_t)r0 * p.ldc + c1] = __float2bfloat16(r[1]);
+      }
+      if (r1 < M) {
+        if (c0_ok) C[(size_t)r1 * p.ldc + c0] = __float2bfloat16(r[2]);
+        if (c1_ok) C[(size_t)r1 * p.ldc + c1] = __float2bfloat16(r[3]);
+      }
+    }
+  }
+  if constexpr (PDL == 2) griddep_launch_dependents();
+}
+
+// ---------------------------------------------------------------------------
+// v2 (2026-09-19): same math, different work distribution. In the server the v1 kernel
+// streamed the dense weights at 0.4-1.1 TB/s: 144-224 blocks for the N = 1152 / 1792
+// shapes (under one block per SM), 24 scattered loads per lane per 4 K-blocks (one
+// 8-byte weight load + two 1-byte swizzled scale loads + A + two A-scale bytes per
+// K-block), and 32-byte weight segments spread over 4 warps. v2:
+//   * a warp owns whole 128-wide K tiles (kt = 4 MX blocks): the 4 weight loads of a
+//     lane cover 128 contiguous bytes per row, and the 4 scale bytes of a row for one
+//     kt sit in one 32-bit word in all three scale layouts -> one word load per row
+//     per kt instead of 4 byte loads (F8_128x4: word ((mt*nkt+kt)*32+b)*4+a;
+//     row-major: bytes kt*4..+3; MN-packed: exactly one word per (row, kt));
+//   * split-K across blocks (gridDim.z = S) when the column count leaves the GPU
+//     under-filled: every block writes its fp32 partial [M, 8 cols] to a workspace,
+//     bumps a per-column-block counter, and the last block to arrive sums the S
+//     partials in fixed order (deterministic) and writes bf16 -- no extra launch.
+//     Counters live in a per-stream buffer that the last block resets to 0, so the
+//     scheme is CUDA-graph replay safe without a memset node.
+// Both layouts of the result are bit-for-bit the same accumulation formula as v1
+// (fp32 MMA result x 2^(ea+eb-254) per MX block, fp32 sum); only the summation order
+// changes, i.e. the same class of differences as between v1 and CUTLASS.
+constexpr int kKtBlocks = 4;  // MX blocks per 128-wide K tile
+
+template <int LAYOUT>
+__device__ __forceinline__ uint32_t load_sf_word(const uint8_t* __restrict__ sf, int row, int kt,
+                                                 int num_k_tiles, int t_al, int ld) {
+  if constexpr (LAYOUT == SF_F8_128x4) {
+    const int mt = row >> 7, r = row & 127, a = r >> 5, b = r & 31;
+    return reinterpret_cast<const uint32_t*>(sf)[(((mt * num_k_tiles + kt) * 32 + b) * 4 + a)];
+  } else if constexpr (LAYOUT == SF_ROWMAJOR) {
+    return *reinterpret_cast<const uint32_t*>(sf + (size_t)row * ld + (size_t)kt * 4);
+  } else {
+    return reinterpret_cast<const uint32_t*>(sf)[(size_t)kt * t_al + row];
+  }
+}
+
+__device__ __forceinline__ float sf_byte_to_float(uint32_t word, int u) {
+  return ue8m0_to_float((word >> (8 * u)) & 0xffu);
+}
+
+struct SplitKArgs {
+  float* partials;  // [S][groups][M][N] fp32
+  int* counters;    // [groups * col_blocks], zero at rest
+  int S;
+};
+
+// ABL (perf ablations, dense only): 1 = no A loads, 2 = no B loads, 3 = no scale loads,
+// 4 = no MMA (sum of raw words), 5 = loads only (no math, no epilogue writes except one)
+template <int MT, int A_SF, int B_SF, int UKT, bool SA = false, int ABL = 0>
+__global__ void __launch_bounds__(kThreads)
+    mxfp8_mma_gemv_v2_kernel(const GemvArgs p, const SplitKArgs sk) {
+  __shared__ float s_red[kWarps][32][4 * MT];
+  __shared__ int s_last;
+
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int g = lane >> 2;
+  const int tig = lane & 3;
+  const int grp = blockIdx.y;
+  const uint8_t* __restrict__ A = p.A + grp * p.a_gstride;
+  const uint8_t* __restrict__ A_sf = p.A_sf + grp * p.a_sf_gstride;
+  const uint8_t* __restrict__ B = p.B + grp * p.b_gstride;
+  const uint8_t* __restrict__ B_sf = p.B_sf + grp * p.b_sf_gstride;
+  __nv_bfloat16* __restrict__ C = p.C + grp * p.c_gstride;
+  const int M = p.M, N = p.N, K = p.K, num_k_tiles = p.num_k_tiles;
+  const int n0 = blockIdx.x * kMmaCols;
+  const int KB = K / kBlockSize;
+  const int KT = (KB + kKtBlocks - 1) / kKtBlocks;
+  // balanced kt range of this split
+  const int S = sk.S, s = blockIdx.z;
+  const int kt_begin = (KT * s) / S, kt_end = (KT * (s + 1)) / S;
+
+  const int n = n0 + g;
+  const bool col_ok = n < N;
+  const uint8_t* brow = B + (size_t)(col_ok ? n : 0) * K + tig * 8;
+  const uint8_t* acol = A + tig * 8;
+  if constexpr (ABL == 7) acol = B + (size_t)((blockIdx.x * 16) % (N - 16)) * K + tig * 8;
+  const int c0 = n0 + tig * 2, c1 = c0 + 1;
+  const bool c0_ok = c0 < N, c1_ok = c1 < N;
+
+  float acc[MT][4];
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc[t][i] = 0.0f;
+
+  // SA: the block's A slice (rows < M, K tiles [kt_begin, kt_end)) and its scale words are
+  // staged in dynamic shared memory with 16-byte coalesced loads after the first round of
+  // weight loads is in flight; every block otherwise re-reads the same 30 KB of A from
+  // L2 with 8-byte row-strided loads, and with 150-600 blocks doing that at once the few
+  // L2 slices holding A become the bottleneck (measured 2026-09-19: -2 us per call).
+  extern __shared__ __align__(16) uint8_t dyn_smem[];
+  const int kt_span = kt_end - kt_begin;
+  const int lda_s = SA ? (p.lda_s) : 0;
+  const int lds_s = SA ? (kt_span | 1) : 0;
+  uint8_t* s_a = dyn_smem;
+  uint32_t* s_as = reinterpret_cast<uint32_t*>(dyn_smem + (size_t)(SA ? 16 : 0) * lda_s);
+  const int k_begin = kt_begin * kKtBlocks * kBlockSize;
+
+  auto load_b_round = [&](int kt0, uint2(&wb)[UKT][kKtBlocks], uint32_t(&sb0)[UKT],
+                          uint32_t(&sb1)[UKT]) {
+#pragma unroll
+    for (int v = 0; v < UKT; ++v) {
+      const int kt = kt0 + v * kWarps;
+      const bool kt_ok = kt < kt_end;
+      const int ktc = kt_ok ? kt : kt_begin;
+      sb0[v] = (ABL != 3 && ABL != 6 && kt_ok && c0_ok)
+                   ? load_sf_word<B_SF>(B_sf, c0, ktc, num_k_tiles, 0, p.b_sf_ld)
+                   : 0x7f7f7f7fu;
+      sb1[v] = (ABL != 3 && ABL != 6 && kt_ok && c1_ok)
+                   ? load_sf_word<B_SF>(B_sf, c1, ktc, num_k_tiles, 0, p.b_sf_ld)
+                   : 0x7f7f7f7fu;
+#pragma unroll
+      for (int u = 0; u < kKtBlocks; ++u) {
+        const int kb = ktc * kKtBlocks + u;
+        const bool ok = kt_ok && kb < KB;
+        if constexpr (ABL == 8) {  // as if the 8 rows' 32-byte chunks were interleaved: one
+                                   // 256-byte segment per warp load
+          const uint8_t* bi = B + (size_t)blockIdx.x * 8 * K + (size_t)kb * 256 + g * 32 + tig * 8;
+          wb[v][u] = ok ? *reinterpret_cast<const uint2*>(bi) : make_uint2(0, 0);
+        } else {
+          wb[v][u] = (ABL != 2 && ABL != 6 && ok && col_ok)
+                         ? *reinterpret_cast<const uint2*>(brow + (size_t)kb * kBlockSize)
+                         : make_uint2(0, 0);
+        }
+      }
+    }
+  };
+
+  uint2 wb[UKT][kKtBlocks];
+  uint32_t sb0[UKT], sb1[UKT];
+  int kt0 = kt_begin + warp;
+  load_b_round(kt0, wb, sb0, sb1);
+
+  if constexpr (SA) {
+    const int k_len = min(kt_span * kKtBlocks * kBlockSize, K - k_begin);
+    const int vec_per_row = k_len / 16;
+    for (int idx = threadIdx.x; idx < M * vec_per_row; idx += kThreads) {
+      const int r = idx / vec_per_row, v = idx - r * vec_per_row;
+      *reinterpret_cast<uint4*>(s_a + (size_t)r * lda_s + v * 16) =
+          *reinterpret_cast<const uint4*>(A + (size_t)r * K + k_begin + v * 16);
+    }
+    for (int idx = threadIdx.x; idx < M * kt_span; idx += kThreads) {
+      const int r = idx / kt_span, kt = idx - r * kt_span;
+      s_as[r * lds_s + kt] =
+          load_sf_word<A_SF>(A_sf, r, kt_begin + kt, num_k_tiles, p.a_sf_t_al, p.K / 32);
+    }
+    __syncthreads();
+  }
+
+  while (true) {
+    uint2 wa0[MT][UKT][kKtBlocks], wa1[MT][UKT][kKtBlocks];
+    uint32_t sa0[MT][UKT], sa1[MT][UKT];
+#pragma unroll
+    for (int v = 0; v < UKT; ++v) {
+      const int kt = kt0 + v * kWarps;
+      const bool kt_ok = kt < kt_end;
+      const int ktc = kt_ok ? kt : kt_begin;
+#pragma unroll
+      for (int u = 0; u < kKtBlocks; ++u) {
+        const int kb = ktc * kKtBlocks + u;
+        const bool ok = kt_ok && kb < KB;
+        const size_t off = (size_t)kb * kBlockSize;
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          const int r0 = g + 16 * t, r1 = r0 + 8;
+          if constexpr (SA) {
+            const size_t soff = (size_t)(kb - kt_begin * kKtBlocks) * kBlockSize + tig * 8;
+            wa0[t][v][u] = (ok && r0 < M)
+                               ? *reinterpret_cast<const uint2*>(s_a + (size_t)r0 * lda_s + soff)
+                               : make_uint2(0, 0);
+            wa1[t][v][u] = (ok && r1 < M)
+                               ? *reinterpret_cast<const uint2*>(s_a + (size_t)r1 * lda_s + soff)
+                               : make_uint2(0, 0);
+          } else {
+            wa0[t][v][u] = (ABL != 1 && ABL != 6 && ok && r0 < M)
+                               ? *reinterpret_cast<const uint2*>(acol + (size_t)r0 * K + off)
+                               : make_uint2(0, 0);
+            wa1[t][v][u] = (ABL != 1 && ABL != 6 && ok && r1 < M)
+                               ? *reinterpret_cast<const uint2*>(acol + (size_t)r1 * K + off)
+                               : make_uint2(0, 0);
+          }
+        }
+      }
+#pragma unroll
+      for (int t = 0; t < MT; ++t) {
+        const int r0 = g + 16 * t, r1 = r0 + 8;
+        if constexpr (SA) {
+          sa0[t][v] = (kt_ok && r0 < M) ? s_as[r0 * lds_s + (ktc - kt_begin)] : 0x7f7f7f7fu;
+          sa1[t][v] = (kt_ok && r1 < M) ? s_as[r1 * lds_s + (ktc - kt_begin)] : 0x7f7f7f7fu;
+        } else {
+          sa0[t][v] = (ABL != 3 && ABL != 6 && kt_ok && r0 < M)
+                          ? load_sf_word<A_SF>(A_sf, r0, ktc, num_k_tiles, p.a_sf_t_al, p.K / 32)
+                          : 0x7f7f7f7fu;
+          sa1[t][v] = (ABL != 3 && ABL != 6 && kt_ok && r1 < M)
+                          ? load_sf_word<A_SF>(A_sf, r1, ktc, num_k_tiles, p.a_sf_t_al, p.K / 32)
+                          : 0x7f7f7f7fu;
+        }
+      }
+    }
+#pragma unroll
+    for (int v = 0; v < UKT; ++v) {
+      const int kt = kt0 + v * kWarps;
+      if (kt >= kt_end) break;
+#pragma unroll
+      for (int u = 0; u < kKtBlocks; ++u) {
+        if (kt * kKtBlocks + u >= KB) break;
+        const float fb0 = sf_byte_to_float(sb0[v], u), fb1 = sf_byte_to_float(sb1[v], u);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          const uint32_t afrag[4] = {wa0[t][v][u].x, wa1[t][v][u].x, wa0[t][v][u].y,
+                                     wa1[t][v][u].y};
+          float d[4];
+          if constexpr (ABL == 4 || ABL == 5 || ABL == 6) {
+            d[0] = __uint_as_float((afrag[0] ^ wb[v][u].x) & 0x3fffffffu);
+            d[1] = __uint_as_float((afrag[1] ^ wb[v][u].y) & 0x3fffffffu);
+            d[2] = __uint_as_float((afrag[2] ^ wb[v][u].x) & 0x3fffffffu);
+            d[3] = __uint_as_float((afrag[3] ^ wb[v][u].y) & 0x3fffffffu);
+          } else {
+            mma_m16n8k32_e4m3(d, afrag, wb[v][u].x, wb[v][u].y);
+          }
+          const float fa0 = sf_byte_to_float(sa0[t][v], u), fa1 = sf_byte_to_float(sa1[t][v], u);
+          acc[t][0] = fmaf(d[0], fa0 * fb0, acc[t][0]);
+          acc[t][1] = fmaf(d[1], fa0 * fb1, acc[t][1]);
+          acc[t][2] = fmaf(d[2], fa1 * fb0, acc[t][2]);
+          acc[t][3] = fmaf(d[3], fa1 * fb1, acc[t][3]);
+        }
+      }
+    }
+    kt0 += kWarps * UKT;
+    if (kt0 >= kt_end) break;
+    load_b_round(kt0, wb, sb0, sb1);
+  }
+
+  // Reduce the 8 K-split warps.
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) s_red[warp][lane][4 * t + i] = acc[t][i];
+  __syncthreads();
+  if (warp != 0) return;
+  float r[MT][4];
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      float v = 0.0f;
+#pragma unroll
+      for (int w = 0; w < kWarps; ++w) v += s_red[w][lane][4 * t + i];
+      r[t][i] = v;
+    }
+
+  if (S > 1) {
+    // Publish this split's partial, then let the last-arriving block finish the column block.
+    const int col_blocks = gridDim.x;
+    float* part = sk.partials + ((size_t)s * gridDim.y + grp) * ((size_t)M * N);
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+      const int r0 = g + 16 * t, r1 = r0 + 8;
+      if (r0 < M) {
+        if (c0_ok) part[(size_t)r0 * N + c0] = r[t][0];
+        if (c1_ok) part[(size_t)r0 * N + c1] = r[t][1];
+      }
+      if (r1 < M) {
+        if (c0_ok) part[(size_t)r1 * N + c0] = r[t][2];
+        if (c1_ok) part[(size_t)r1 * N + c1] = r[t][3];
+      }
+    }
+    __threadfence();
+    __syncwarp();
+    if (lane == 0) {
+      const int prev = atomicAdd(&sk.counters[grp * col_blocks + blockIdx.x], 1);
+      s_last = (prev == S - 1);
+    }
+    __syncwarp();
+    if (!s_last) return;
+    __threadfence();
+    if (lane == 0) sk.counters[grp * col_blocks + blockIdx.x] = 0;  // re-arm for the next launch
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) r[t][i] = 0.0f;
+    for (int q = 0; q < S; ++q) {  // fixed order -> deterministic
+      const float* pq = sk.partials + ((size_t)q * gridDim.y + grp) * ((size_t)M * N);
+#pragma unroll
+      for (int t = 0; t < MT; ++t) {
+        const int r0 = g + 16 * t, r1 = r0 + 8;
+        if (r0 < M) {
+          if (c0_ok) r[t][0] += __ldcg(pq + (size_t)r0 * N + c0);
+          if (c1_ok) r[t][1] += __ldcg(pq + (size_t)r0 * N + c1);
+        }
+        if (r1 < M) {
+          if (c0_ok) r[t][2] += __ldcg(pq + (size_t)r1 * N + c0);
+          if (c1_ok) r[t][3] += __ldcg(pq + (size_t)r1 * N + c1);
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int t = 0; t < MT; ++t) {
+    const int r0 = g + 16 * t, r1 = r0 + 8;
+    if (r0 < M) {
+      if (c0_ok) C[(size_t)r0 * p.ldc + c0] = __float2bfloat16(r[t][0]);
+      if (c1_ok) C[(size_t)r0 * p.ldc + c1] = __float2bfloat16(r[t][1]);
+    }
+    if (r1 < M) {
+      if (c0_ok) C[(size_t)r1 * p.ldc + c0] = __float2bfloat16(r[t][2]);
+      if (c1_ok) C[(size_t)r1 * p.ldc + c1] = __float2bfloat16(r[t][3]);
+    }
+  }
+}
+
+// Per-stream split-K scratch: counters stay zero between launches (the last block of
+// every column block resets its counter), partials are overwritten every launch.
+struct SplitKScratch {
+  torch::Tensor counters;  // int32 [max_col_blocks]
+  torch::Tensor partials;  // fp32 [n_floats]
+};
+
+// Fixed sizes: the buffers' addresses get baked into captured CUDA graphs, so they are
+// never reallocated; a launch that does not fit runs without split-K instead.
+constexpr int64_t kSplitKCounters = 4096;
+constexpr int64_t kSplitKFloats = 1 << 20;  // 4 MB: S x groups x M x N fp32
+
+static SplitKScratch* splitk_scratch(cudaStream_t stream, int device, int64_t n_counters,
+                                     int64_t n_floats) {
+  if (n_counters > kSplitKCounters || n_floats > kSplitKFloats) return nullptr;
+  static std::mutex mu;
+  static std::unordered_map<cudaStream_t, SplitKScratch> pool;
+  std::lock_guard<std::mutex> lock(mu);
+  auto& sc = pool[stream];
+  if (!sc.counters.defined()) {
+    const auto opts = torch::TensorOptions().device(torch::kCUDA, device);
+    sc.counters = torch::zeros({kSplitKCounters}, opts.dtype(torch::kInt32));
+    sc.partials = torch::empty({kSplitKFloats}, opts.dtype(torch::kFloat32));
+  }
+  return &sc;
+}
+
+static int env_int(const char* name, int def) {
+  const char* v = std::getenv(name);
+  return v == nullptr ? def : std::atoi(v);
+}
+
+// How the v3 / v1 / grouped kernels are launched (2026-10-02, see griddep_wait):
+//   VLLM_MOET_GEMV_PDL          0 = plain launch (the kernels served until then), 1 = PDL with
+//                               launch_dependents right after griddepcontrol.wait, 2 = PDL with
+//                               launch_dependents after the output stores, 3 = PDL with
+//                               launch_dependents after the K loop (before the reduction)
+//   VLLM_MOET_GEMV_EVICT_FIRST  1 = v3's PDL variants load the weights with an L2 evict-first
+//                               policy (no L1 allocation), 0 = plain non-coherent loads
+// A call may override both (pdl= / evict= of the Python entry points; -1 = these defaults).
+struct LaunchMode {
+  int pdl;
+  int ev;
+};
+// Defaults since 2026-10-02 (test_gemv_pdl_sm120.py: every mode returns the committed kernels'
+// bits; cold-weight CUDA graphs of the served neighbour kernels, RTX PRO 6000, 6 rows: the
+// attention sublayer's quantize -> q_a+kv_a -> norm+quant -> q_b -> ... -> inv-RoPE+quant -> wo_a
+// -> quantize -> wo_b chain 48.7 -> 38.6 us per layer; the trigger after the K loop (3) ties
+// with 1 there and is slower for the grouped kernel at 48 tokens on the RTX 5090).
+constexpr int kPdlDefault = 1;
+constexpr int kEvictFirstDefault = 1;
+
+static LaunchMode launch_mode(int pdl, int ev) {
+  static const int env_pdl = env_int("VLLM_MOET_GEMV_PDL", kPdlDefault);
+  static const int env_ev = env_int("VLLM_MOET_GEMV_EVICT_FIRST", kEvictFirstDefault);
+  LaunchMode m{pdl < 0 ? env_pdl : pdl, ev < 0 ? env_ev : ev};
+  m.pdl = std::min(std::max(m.pdl, 0), 3);
+  m.ev = m.ev != 0 ? 1 : 0;
+  return m;
+}
+
+template <typename... KArgs, typename... Args>
+static void launch_kernel(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem,
+                          cudaStream_t stream, bool pdl, Args... args) {
+  if (!pdl) {
+    kernel<<<grid, block, smem, stream>>>(args...);
+    return;
+  }
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = block;
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, args...));
+}
+
+// VLLM_MOET_GEMV_IMPL: "v3" (default since 2026-09-19: the bandwidth rewrite of the dense
+// M <= 8 path below; grouped wo_a, M > 8 and K % 128 != 0 fall back to v1), "v1" (the kernel
+// served until then), "v2" (experiment: no gain, see tools/dsv41_sm120/README.md), "scalar".
+static int gemv_impl_version() {
+  static const int v = [] {
+    const char* s = std::getenv("VLLM_MOET_GEMV_IMPL");
+    if (s == nullptr) return 3;
+    const std::string str(s);
+    if (str == "v1") return 1;
+    if (str == "v2") return 2;
+    if (str == "scalar") return 0;
+    return 3;
+  }();
+  return v;
+}
+
+// Work distribution (measured 2026-09-19, tools/dsv41_sm120/README.md): with 1-3 blocks per
+// SM these GEMVs are bound by the chain of memory round trips per warp, not by bandwidth --
+// each "round" (issue the loads of UKT K tiles, wait, MMA) costs a full DRAM latency while
+// the whole grid is quiet. So every warp should issue all of its K tiles in ONE round:
+// UKT = ceil(KT_per_split / 8), capped at kMaxUkt (register file); K tiles beyond that
+// are split across blocks (gridDim.z) and reduced by the last-arriving block.
+constexpr int kMaxUkt = 5;      // 5 x (4 weight + 8 A + 4 scale) loads in flight per lane
+constexpr int kMaxUktWide = 2;  // M > 16 (MT >= 2): twice the A fragments per K tile
+
+template <typename Kernel>
+static void set_dyn_smem(Kernel kernel, size_t smem) {
+  static std::mutex mu;
+  static std::unordered_map<const void*, size_t> configured;
+  std::lock_guard<std::mutex> lock(mu);
+  auto& cur = configured[reinterpret_cast<const void*>(kernel)];
+  if (smem > cur) {
+    TORCH_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int)smem) == cudaSuccess,
+                "cannot reserve ", smem, " bytes of dynamic shared memory");
+    cur = smem;
+  }
+}
+
+template <int MT, int A_SF, int B_SF, bool SA>
+static void launch_v2_ukt(int ukt, const dim3& grid, const dim3& block, const GemvArgs& p,
+                          const SplitKArgs& sk, size_t smem, cudaStream_t stream) {
+#define VLLM_MOET_V2_LAUNCH(MTV, UKTV)                               \
+  {                                                                  \
+    auto* kfn = mxfp8_mma_gemv_v2_kernel<MTV, A_SF, B_SF, UKTV, SA>; \
+    if (smem > 0) set_dyn_smem(kfn, smem);                           \
+    kfn<<<grid, block, smem, stream>>>(p, sk);                       \
+  }
+  switch (ukt) {
+    case 1:
+      VLLM_MOET_V2_LAUNCH(MT, 1) break;
+    case 2:
+      VLLM_MOET_V2_LAUNCH(MT, 2) break;
+    default:
+      if constexpr (MT == 1) {
+        switch (ukt) {
+          case 3:
+            VLLM_MOET_V2_LAUNCH(1, 3) break;
+          case 4:
+            VLLM_MOET_V2_LAUNCH(1, 4) break;
+          default:
+            VLLM_MOET_V2_LAUNCH(1, 5) break;
+        }
+      } else {
+        VLLM_MOET_V2_LAUNCH(MT, 2)
+      }
+  }
+#undef VLLM_MOET_V2_LAUNCH
+}
+
+template <int A_SF, int B_SF>
+static void launch_mma_v2(const GemvArgs& p, int groups, int device, cudaStream_t stream) {
+  const int col_blocks = (p.N + kMmaCols - 1) / kMmaCols;
+  const int KT = (p.K / kBlockSize + kKtBlocks - 1) / kKtBlocks;
+  const int mt = p.M <= 16 ? 1 : (p.M <= 32 ? 2 : (p.M <= 48 ? 3 : 4));
+  const int max_ukt = env_int("VLLM_MOET_GEMV_UKT_MAX", mt == 1 ? kMaxUkt : kMaxUktWide);
+  static const int max_split = env_int("VLLM_MOET_GEMV_SPLITK_MAX", 8);
+  // smallest split count that lets one round of max_ukt tiles per warp cover the split
+  int S = std::min(max_split, std::max(1, (KT + kWarps * max_ukt - 1) / (kWarps * max_ukt)));
+  int kt_per_split = (KT + S - 1) / S;
+  int ukt = std::min(max_ukt, std::max(1, (kt_per_split + kWarps - 1) / kWarps));
+  static const int force_ukt = env_int("VLLM_MOET_GEMV_UKT", 0);
+  if (force_ukt > 0) ukt = std::min(force_ukt, mt == 1 ? kMaxUkt : kMaxUktWide);
+  static const int force_split = env_int("VLLM_MOET_GEMV_SPLITK", 0);
+  if (force_split > 0) S = force_split;
+  SplitKArgs sk{nullptr, nullptr, S};
+  if (S > 1) {
+    SplitKScratch* sc = splitk_scratch(stream, device, (int64_t)groups * col_blocks,
+                                       (int64_t)S * groups * p.M * p.N);
+    if (sc == nullptr) {
+      sk.S = S = 1;
+    } else {
+      sk.partials = sc->partials.data_ptr<float>();
+      sk.counters = sc->counters.data_ptr<int>();
+    }
+  }
+  const dim3 grid(col_blocks, groups, S), block(kThreads);
+  static const int abl = env_int("VLLM_MOET_GEMV_ABLATE", 0);
+  if (mt == 1 && abl != 0 && A_SF == SF_F8_128x4) {  // perf ablations, UKT = 1
+    switch (abl) {
+      case 1:
+        mxfp8_mma_gemv_v2_kernel<1, A_SF, B_SF, 1, false, 1><<<grid, block, 0, stream>>>(p, sk);
+        break;
+      case 2:
+        mxfp8_mma_gemv_v2_kernel<1, A_SF, B_SF, 1, false, 2><<<grid, block, 0, stream>>>(p, sk);
+        break;
+      case 3:
+        mxfp8_mma_gemv_v2_kernel<1, A_SF, B_SF, 1, false, 3><<<grid, block, 0, stream>>>(p, sk);
+        break;
+      case 6:
+        mxfp8_mma_gemv_v2_kernel<1, A_SF, B_SF, 1, false, 6><<<grid, block, 0, stream>>>(p, sk);
+        break;
+      case 7:
+        mxfp8_mma_gemv_v2_kernel<1, A_SF, B_SF, 1, false, 7><<<grid, block, 0, stream>>>(p, sk);
+        break;
+      case 8:
+        mxfp8_mma_gemv_v2_kernel<1, A_SF, B_SF, 1, false, 8><<<grid, block, 0, stream>>>(p, sk);
+        break;
+      default:
+        mxfp8_mma_gemv_v2_kernel<1, A_SF, B_SF, 1, false, 4><<<grid, block, 0, stream>>>(p, sk);
+        break;
+    }
+    return;
+  }
+  // Stage A in shared memory (M <= 16) when the slice fits in 96 KB (>= 2 blocks per SM).
+  static const int sa_enabled = env_int("VLLM_MOET_GEMV_STAGE_A", 1);
+  GemvArgs pl = p;
+  size_t smem = 0;
+  bool sa = false;
+  if (mt == 1 && sa_enabled) {
+    const int kt_span = (KT + S - 1) / S;
+    const int slice = kt_span * kKtBlocks * kBlockSize;  // bytes per row
+    const int words = slice / 4;
+    const int pad_words = ((8 - (words % 32)) % 32 + 32) % 32;  // rows on distinct banks
+    pl.lda_s = slice + pad_words * 4;
+    smem = (size_t)16 * pl.lda_s + (size_t)16 * (kt_span | 1) * 4;
+    if (smem <= 96 * 1024) {
+      sa = true;
+    } else {
+      smem = 0;
+    }
+  }
+  if (sa) {
+    launch_v2_ukt<1, A_SF, B_SF, true>(ukt, grid, block, pl, sk, smem, stream);
+    return;
+  }
+  switch (mt) {
+    case 1:
+      launch_v2_ukt<1, A_SF, B_SF, false>(ukt, grid, block, p, sk, 0, stream);
+      break;
+    case 2:
+      launch_v2_ukt<2, A_SF, B_SF, false>(ukt, grid, block, p, sk, 0, stream);
+      break;
+    case 3:
+      launch_v2_ukt<3, A_SF, B_SF, false>(ukt, grid, block, p, sk, 0, stream);
+      break;
+    default:
+      launch_v2_ukt<4, A_SF, B_SF, false>(ukt, grid, block, p, sk, 0, stream);
+      break;
+  }
+}
+
+template <int MT, int A_SF, int B_SF, bool kModes>
+static void launch_mma_mt(const dim3& grid, const dim3& block, const GemvArgs& p,
+                          cudaStream_t stream, const LaunchMode& m) {
+  if constexpr (kModes) {
+    if (m.pdl == 1) {
+      launch_kernel(mxfp8_mma_gemv_kernel<MT, A_SF, B_SF, 1>, grid, block, 0, stream, true, p);
+      return;
+    }
+    if (m.pdl == 2) {
+      launch_kernel(mxfp8_mma_gemv_kernel<MT, A_SF, B_SF, 2>, grid, block, 0, stream, true, p);
+      return;
+    }
+    if (m.pdl == 3) {
+      launch_kernel(mxfp8_mma_gemv_kernel<MT, A_SF, B_SF, 3>, grid, block, 0, stream, true, p);
+      return;
+    }
+  }
+  mxfp8_mma_gemv_kernel<MT, A_SF, B_SF><<<grid, block, 0, stream>>>(p);
+}
+
+// Dense calls above 16 rows (not served: vLLM takes CUTLASS there) keep the plain launch.
+template <int A_SF, int B_SF>
+static void launch_mma(const GemvArgs& p, int groups, cudaStream_t stream, const LaunchMode& m) {
+  constexpr bool kGrouped = A_SF == SF_MN_PACKED;
+  const dim3 grid((p.N + kMmaCols - 1) / kMmaCols, groups), block(kThreads);
+  if (p.M <= 16) {
+    launch_mma_mt<1, A_SF, B_SF, true>(grid, block, p, stream, m);
+  } else if (p.M <= 32) {
+    launch_mma_mt<2, A_SF, B_SF, kGrouped>(grid, block, p, stream, m);
+  } else if (p.M <= 48) {
+    launch_mma_mt<3, A_SF, B_SF, kGrouped>(grid, block, p, stream, m);
+  } else {
+    launch_mma_mt<4, A_SF, B_SF, kGrouped>(grid, block, p, stream, m);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v3 (2026-09-19): the bandwidth-oriented rewrite of the dense path (M <= 8, both operands
+// F8_128x4, K % 128 == 0). ncu on v1 (RTX 5090, cold L2, M = 6): DRAM at 17-50 % of peak,
+// long-scoreboard stalls in 70-80 % of the issue slots, 3.6 M warp instructions for a
+// 10 MB weight -- one 8-byte weight load, four 1-byte scale loads and two 8-byte A loads
+// per MX block per lane, every warp instruction touching eight 32-byte pieces of eight
+// different rows. v3 keeps v1's decomposition (a block owns 8 columns, its 8 warps split K)
+// and changes only how the bytes move:
+//   * K is cut into 128-byte units (4 MX blocks = one F8_128x4 scale word). Warp w owns the
+//     units u = w (mod 8) and streams them in rounds of R units. All weight bytes of a round
+//     (R x 8 rows x 128 B) are issued up front as 16-byte loads -- one warp instruction
+//     covers four rows x 128 contiguous bytes -- parked in registers, then written to the
+//     warp's shared-memory tile, from which the mma fragments are read. The loads of round
+//     r+1 are issued before the math of round r.
+//   * the round's slice of A (M rows x R x 128 B, L2-resident) is staged the same way.
+//   * scales: one 32-bit word per (row, unit), one LDG.32 per lane per round for the
+//     8 x R weight words and the M x R A words (double-buffered in smem).
+// R = 2 keeps the block at ~32 KB of shared memory (3 blocks / SM); R = 4 doubles the bytes
+// in flight per warp but leaves one block per SM.
+constexpr int kV3MaxM = 8;
+
+__device__ __forceinline__ uint32_t sf_word_index(int row, int kt, int num_k_tiles) {
+  const int mt = row >> 7, r = row & 127, a = r >> 5, b = r & 31;
+  return ((mt * num_k_tiles + kt) * 32 + b) * 4 + a;  // the 4 bytes kb = 4kt..4kt+3
+}
+
+template <int R>
+struct V3Smem {
+  static constexpr int kRoundK = R * 128;                // k per round
+  static constexpr int kRoundKB = kRoundK / kBlockSize;  // MX blocks per round
+  static constexpr int kWTile = kMmaCols * kRoundK;      // weight bytes per warp per round
+  static constexpr int kATile = kV3MaxM * kRoundK;       // A bytes per warp per round
+  static constexpr int kSfWords = 2 * R * kMmaCols;      // per operand, 2 buffers
+  static constexpr int kPerWarp = kWTile + kATile + 2 * kSfWords * 4;
+  static constexpr size_t kBytes = (size_t)kWarps * kPerWarp;
+};
+
+// PDL / EV: as for mxfp8_mma_gemv_kernel; the PDL variants issue round 0's weight half before
+// griddepcontrol.wait (and ptxas keeps all of it there).
+template <int R, int PDL = 0, int EV = 0>
+__device__ __forceinline__ void mxfp8_mma_gemv_v3_body(const GemvArgs p, const SplitKArgs sk) {
+  using S = V3Smem<R>;
+  extern __shared__ __align__(16) uint8_t v3_smem[];
+  __shared__ float s_red[kWarps][32][2];
+  __shared__ int s_last;
+
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, tig = lane & 3;
+  const int M = p.M, N = p.N, K = p.K, nkt = p.num_k_tiles;
+  const int n0 = blockIdx.x * kMmaCols;
+  // Split-K over 128-byte units: block (x, s) owns units [u_begin, u_begin + units).
+  const int units_all = K >> 7;
+  const int ups = (units_all + gridDim.y - 1) / gridDim.y;
+  const int u_begin = blockIdx.y * ups;
+  const int units = max(0, min(units_all - u_begin, ups));
+
+  uint8_t* s_w = v3_smem + (size_t)warp * S::kPerWarp;             // [8 rows][kRoundK]
+  uint8_t* s_a = s_w + S::kWTile;                                  // [kV3MaxM rows][kRoundK]
+  uint32_t* s_bsf = reinterpret_cast<uint32_t*>(s_a + S::kATile);  // [2][R][8]
+  uint32_t* s_asf = s_bsf + S::kSfWords;                           // [2][R][8]
+
+  const int nu = units > warp ? (units - warp + kWarps - 1) / kWarps : 0;
+  const int rounds = (nu + R - 1) / R;
+
+  // Weight chunks of this lane per unit: rows lr0 / lr1 (0..7), 16-byte offset lo.
+  const int lr0 = lane >> 3, lr1 = lr0 + 4, lo = (lane & 7) << 4;
+  const bool r0_ok = n0 + lr0 < N, r1_ok = n0 + lr1 < N;
+  const uint8_t* b_row0 = p.B + (size_t)(n0 + (r0_ok ? lr0 : 0)) * K + lo;
+  const uint8_t* b_row1 = p.B + (size_t)(n0 + (r1_ok ? lr1 : 0)) * K + lo;
+  // A chunks of this lane per unit: the same (row, offset) pattern over kV3MaxM rows.
+  const bool a0_ok = lr0 < M, a1_ok = lr1 < M;
+  const uint8_t* a_row0 = p.A + (size_t)(a0_ok ? lr0 : 0) * K + lo;
+  const uint8_t* a_row1 = p.A + (size_t)(a1_ok ? lr1 : 0) * K + lo;
+  // Scale words: lanes 0..8R-1 load weight words (row lane&7, unit lane>>3), lanes
+  // 16..16+8R-1 load A words (row (lane-16)&7, unit (lane-16)>>3). R <= 2 keeps both
+  // inside one warp instruction each; for R = 4 the two sets alias, so two loads.
+  const uint32_t* b_sf32 = reinterpret_cast<const uint32_t*>(p.B_sf);
+  const uint32_t* a_sf32 = reinterpret_cast<const uint32_t*>(p.A_sf);
+  const int sl_row = lane & 7, sl_j = (lane >> 3) % R;
+  const bool sl_b = lane < 8 * R && n0 + sl_row < N;
+  const bool sl_a = lane < 8 * R && sl_row < M;
+
+  uint4 wreg[R][2], areg[R][2];
+  uint32_t sbw = 0u, saw = 0u;
+
+  auto issue_round = [&](int r) {
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+      const int i = r * R + j;
+      const bool ok = i < nu;
+      const size_t k0 = (size_t)(u_begin + warp + kWarps * i) << 7;
+      wreg[j][0] = (ok && r0_ok) ? __ldg(reinterpret_cast<const uint4*>(b_row0 + k0))
+                                 : make_uint4(0, 0, 0, 0);
+      wreg[j][1] = (ok && r1_ok) ? __ldg(reinterpret_cast<const uint4*>(b_row1 + k0))
+                                 : make_uint4(0, 0, 0, 0);
+      areg[j][0] = (ok && a0_ok) ? __ldg(reinterpret_cast<const uint4*>(a_row0 + k0))
+                                 : make_uint4(0, 0, 0, 0);
+      areg[j][1] = (ok && a1_ok) ? __ldg(reinterpret_cast<const uint4*>(a_row1 + k0))
+                                 : make_uint4(0, 0, 0, 0);
+    }
+    const int i = r * R + sl_j;
+    const int kt = u_begin + warp + kWarps * i;
+    const bool ok = i < nu;
+    sbw = (ok && sl_b) ? __ldg(b_sf32 + sf_word_index(n0 + sl_row, kt, nkt)) : 0u;
+    saw = (ok && sl_a) ? __ldg(a_sf32 + sf_word_index(sl_row, kt, nkt)) : 0u;
+  };
+  // With PDL a round is split: the weight half may be issued before griddepcontrol.wait ...
+  const uint64_t pol = (PDL != 0 && EV != 0) ? evict_first_policy() : 0;
+  auto issue_round_w = [&](int r) {
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+      const int i = r * R + j;
+      const bool ok = i < nu;
+      const size_t k0 = (size_t)(u_begin + warp + kWarps * i) << 7;
+      wreg[j][0] = ld_weight_v4<EV>(b_row0 + k0, ok && r0_ok, pol);
+      wreg[j][1] = ld_weight_v4<EV>(b_row1 + k0, ok && r1_ok, pol);
+    }
+    const int i = r * R + sl_j;
+    const int kt = u_begin + warp + kWarps * i;
+    sbw = ld_w_u32(b_sf32 + sf_word_index(n0 + sl_row, kt, nkt), i < nu && sl_b);
+  };
+  // ... the activation half (written by the kernel before) only after it, through L2.
+  auto issue_round_a = [&](int r) {
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+      const int i = r * R + j;
+      const bool ok = i < nu;
+      const size_t k0 = (size_t)(u_begin + warp + kWarps * i) << 7;
+      areg[j][0] = ld_act_v4(a_row0 + k0, ok && a0_ok);
+      areg[j][1] = ld_act_v4(a_row1 + k0, ok && a1_ok);
+    }
+    const int i = r * R + sl_j;
+    const int kt = u_begin + warp + kWarps * i;
+    saw = ld_act_u32(a_sf32 + sf_word_index(sl_row, kt, nkt), i < nu && sl_a);
+  };
+
+  if constexpr (PDL == 0) {
+    if (rounds > 0) issue_round(0);
+  } else {
+    if (rounds > 0) issue_round_w(0);
+    griddep_wait();
+    if constexpr (PDL == 1) griddep_launch_dependents();
+    if (rounds > 0) issue_round_a(0);
+  }
+
+  float acc0 = 0.0f, acc1 = 0.0f;
+  const int c0 = n0 + tig * 2, c1 = c0 + 1;
+  const bool g_ok = g < M;
+
+  for (int r = 0; r < rounds; ++r) {
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+      *reinterpret_cast<uint4*>(s_w + (size_t)lr0 * S::kRoundK + j * 128 + lo) = wreg[j][0];
+      *reinterpret_cast<uint4*>(s_w + (size_t)lr1 * S::kRoundK + j * 128 + lo) = wreg[j][1];
+      *reinterpret_cast<uint4*>(s_a + (size_t)lr0 * S::kRoundK + j * 128 + lo) = areg[j][0];
+      *reinterpret_cast<uint4*>(s_a + (size_t)lr1 * S::kRoundK + j * 128 + lo) = areg[j][1];
+    }
+    const int buf = r & 1;
+    if (lane < 8 * R) {
+      s_bsf[(buf * R + sl_j) * kMmaCols + sl_row] = sbw;
+      s_asf[(buf * R + sl_j) * kMmaCols + sl_row] = saw;
+    }
+    __syncwarp();
+    if (r + 1 < rounds) {
+      if constexpr (PDL == 0) {
+        issue_round(r + 1);
+      } else {
+        issue_round_w(r + 1);
+        issue_round_a(r + 1);
+      }
+    }
+
+    uint32_t sb0w[R], sb1w[R], saw_g[R];
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+      sb0w[j] = s_bsf[(buf * R + j) * kMmaCols + tig * 2];
+      sb1w[j] = s_bsf[(buf * R + j) * kMmaCols + tig * 2 + 1];
+      saw_g[j] = s_asf[(buf * R + j) * kMmaCols + g];
+    }
+    const int nb = min(S::kRoundKB, (nu - r * R) * 4);
+#pragma unroll
+    for (int kb = 0; kb < S::kRoundKB; ++kb) {
+      if (kb >= nb) break;
+      const int j = kb >> 2, c = kb & 3;
+      const uint2 wb =
+          *reinterpret_cast<const uint2*>(s_w + (size_t)g * S::kRoundK + kb * 32 + tig * 8);
+      const uint2 wa =
+          g_ok ? *reinterpret_cast<const uint2*>(s_a + (size_t)g * S::kRoundK + kb * 32 + tig * 8)
+               : make_uint2(0, 0);
+      const uint32_t afrag[4] = {wa.x, 0u, wa.y, 0u};
+      float d[4];
+      mma_m16n8k32_e4m3(d, afrag, wb.x, wb.y);
+      const float fb0 = ue8m0_to_float((sb0w[j] >> (8 * c)) & 0xffu);
+      const float fb1 = ue8m0_to_float((sb1w[j] >> (8 * c)) & 0xffu);
+      const float fa = ue8m0_to_float((saw_g[j] >> (8 * c)) & 0xffu);
+      acc0 = fmaf(d[0], fa * fb0, acc0);
+      acc1 = fmaf(d[1], fa * fb1, acc1);
+    }
+    __syncwarp();
+  }
+  if constexpr (PDL == 3) griddep_launch_dependents();
+
+  s_red[warp][lane][0] = acc0;
+  s_red[warp][lane][1] = acc1;
+  __syncthreads();
+  if (gridDim.y == 1) {
+    if (warp == 0) {
+      float r0 = 0.0f, r1 = 0.0f;
+#pragma unroll
+      for (int w = 0; w < kWarps; ++w) {
+        r0 += s_red[w][lane][0];
+        r1 += s_red[w][lane][1];
+      }
+      if (g < M) {
+        if (c0 < N) p.C[(size_t)g * p.ldc + c0] = __float2bfloat16(r0);
+        if (c1 < N) p.C[(size_t)g * p.ldc + c1] = __float2bfloat16(r1);
+      }
+    }
+    if constexpr (PDL == 2) griddep_launch_dependents();
+    return;
+  }
+  // Split-K: publish this block's [kV3MaxM][8] fp32 partial, the last-arriving block sums.
+  float* part = sk.partials + ((size_t)blockIdx.y * gridDim.x + blockIdx.x) * (kV3MaxM * kMmaCols);
+  if (warp == 0) {
+    float r0 = 0.0f, r1 = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) {
+      r0 += s_red[w][lane][0];
+      r1 += s_red[w][lane][1];
+    }
+    part[g * kMmaCols + tig * 2] = r0;
+    part[g * kMmaCols + tig * 2 + 1] = r1;
+    __threadfence();
+  }
+  __syncthreads();
+  if (threadIdx.x == 0)
+    s_last = (atomicAdd(sk.counters + blockIdx.x, 1) == (int)gridDim.y - 1) ? 1 : 0;
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  if (threadIdx.x < kV3MaxM * kMmaCols) {
+    const int m = threadIdx.x >> 3, col = threadIdx.x & 7;
+    float sum = 0.0f;
+    for (int q = 0; q < (int)gridDim.y; ++q)
+      sum += __ldcg(sk.partials + ((size_t)q * gridDim.x + blockIdx.x) * (kV3MaxM * kMmaCols) +
+                    m * kMmaCols + col);
+    if (m < M && n0 + col < N) p.C[(size_t)m * p.ldc + n0 + col] = __float2bfloat16(sum);
+  }
+  if (threadIdx.x == 0) sk.counters[blockIdx.x] = 0;  // ready for the next launch / graph replay
+  if constexpr (PDL == 2) griddep_launch_dependents();
+}
+
+// Preserve the source kernel body while exposing pointer/scalar arguments
+// separately to native package export. No scalar pair can be read as a pointer.
+template <int R, int PDL = 0, int EV = 0>
+__global__ void __launch_bounds__(kThreads)
+    mxfp8_mma_gemv_v3_kernel(const GemvArgs p, const SplitKArgs sk) {
+  mxfp8_mma_gemv_v3_body<R, PDL, EV>(p, sk);
+}
+
+template <int PDL, int EV>
+__global__ void __launch_bounds__(kThreads)
+    reference_projection_kernel(const uint8_t* a, const uint8_t* asf, const uint8_t* w,
+                                const uint8_t* wsf, __nv_bfloat16* out, int rows, int columns,
+                                int inner) {
+  GemvArgs p{};
+  p.A = a;
+  p.A_sf = asf;
+  p.B = w;
+  p.B_sf = wsf;
+  p.C = out;
+  p.M = rows;
+  p.N = columns;
+  p.K = inner;
+  p.num_k_tiles = inner / 128;
+  p.ldc = columns;
+  mxfp8_mma_gemv_v3_body<1, PDL, EV>(p, SplitKArgs{nullptr, nullptr, 1});
+}
+
+static int v3_units_per_round() { return env_int("VLLM_MOET_GEMV_V3_R", 1); }
+
+static int device_sm_count(int device) {
+  static std::mutex mu;
+  static std::unordered_map<int, int> sms;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = sms.find(device);
+  if (it != sms.end()) return it->second;
+  int n = 0;
+  cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, device);
+  return sms[device] = (n > 0 ? n : 128);
+}
+
+template <int PDL>
+static void launch_v3_r1(int ev, const dim3& grid, const GemvArgs& p, const SplitKArgs& sk,
+                         cudaStream_t stream) {
+  auto* kfn = ev ? mxfp8_mma_gemv_v3_kernel<1, PDL, 1> : mxfp8_mma_gemv_v3_kernel<1, PDL, 0>;
+  set_dyn_smem(kfn, V3Smem<1>::kBytes);
+  launch_kernel(kfn, grid, dim3(kThreads), V3Smem<1>::kBytes, stream, true, p, sk);
+}
+
+// Split K across blocks until the grid holds ~2 blocks per SM (the small-N shapes run 72-224
+// blocks otherwise), keeping >= 8 units (one per warp) in every split.
+static void launch_mma_v3(const GemvArgs& p, int device, cudaStream_t stream, const LaunchMode& m) {
+  const int col_blocks = (p.N + kMmaCols - 1) / kMmaCols;
+  const int units = p.K >> 7;
+  static const int target = env_int("VLLM_MOET_GEMV_V3_BLOCKS_PER_SM", 2);
+  static const int max_split =
+      env_int("VLLM_MOET_GEMV_V3_SPLITK_MAX", 1);  // split-K measured slower (see README)
+  int S = 1;
+  if (max_split > 1) {
+    S = std::min(max_split,
+                 std::max(1, (target * device_sm_count(device) + col_blocks - 1) / col_blocks));
+    S = std::min(S, std::max(1, units / kWarps));
+  }
+  SplitKArgs sk{nullptr, nullptr, S};
+  if (S > 1) {
+    SplitKScratch* sc = splitk_scratch(stream, device, (int64_t)col_blocks,
+                                       (int64_t)S * col_blocks * kV3MaxM * kMmaCols);
+    if (sc == nullptr) {
+      sk.S = S = 1;
+    } else {
+      sk.partials = sc->partials.data_ptr<float>();
+      sk.counters = sc->counters.data_ptr<int>();
+    }
+  }
+  const dim3 grid(col_blocks, S);
+  // Units per round (VLLM_MOET_GEMV_V3_R): 1 measured best on every served shape (RTX 5090 and
+  // RTX PRO 6000, M = 6): one 128-byte unit per warp per round keeps the stream steady; 2 and 4
+  // put more bytes in flight per round but pipeline fewer rounds and cost shared memory.
+  int R = v3_units_per_round();
+  if (R <= 0) R = 1;
+  if (R >= 4) {
+    auto* kfn = mxfp8_mma_gemv_v3_kernel<4>;
+    set_dyn_smem(kfn, V3Smem<4>::kBytes);
+    kfn<<<grid, dim3(kThreads), V3Smem<4>::kBytes, stream>>>(p, sk);
+  } else if (R == 2) {
+    auto* kfn = mxfp8_mma_gemv_v3_kernel<2>;
+    set_dyn_smem(kfn, V3Smem<2>::kBytes);
+    kfn<<<grid, dim3(kThreads), V3Smem<2>::kBytes, stream>>>(p, sk);
+  } else if (m.pdl == 1) {
+    launch_v3_r1<1>(m.ev, grid, p, sk, stream);
+  } else if (m.pdl == 2) {
+    launch_v3_r1<2>(m.ev, grid, p, sk, stream);
+  } else if (m.pdl == 3) {
+    launch_v3_r1<3>(m.ev, grid, p, sk, stream);
+  } else {
+    auto* kfn = mxfp8_mma_gemv_v3_kernel<1>;
+    set_dyn_smem(kfn, V3Smem<1>::kBytes);
+    kfn<<<grid, dim3(kThreads), V3Smem<1>::kBytes, stream>>>(p, sk);
+  }
+}
+
+static bool v3_applicable(int M, int K) { return M <= kV3MaxM && K % 128 == 0; }
+
+template <int MAXM, int CHUNK>
+static void launch(const uint8_t* A, const uint8_t* Asf, const uint8_t* B, const uint8_t* Bsf,
+                   __nv_bfloat16* Cp, torch::Tensor& a, int M, int N, int K, int num_k_tiles,
+                   cudaStream_t stream) {
+  const dim3 block(kThreads);
+  const int col_blocks = (N + kWarps - 1) / kWarps;
+  const int num_chunks = (K + CHUNK - 1) / CHUNK;
+  // Split over K chunks only when the column count alone leaves the GPU under-filled.
+  if (num_chunks > 1 && col_blocks < 400) {
+    auto cf = torch::empty({num_chunks, M, N}, a.options().dtype(torch::kFloat32));
+    float* Cf = cf.data_ptr<float>();
+    mxfp8_gemv_kernel<MAXM, CHUNK, true><<<dim3(col_blocks, num_chunks), block, 0, stream>>>(
+        A, Asf, B, Bsf, Cp, Cf, M, N, K, num_k_tiles);
+    const int total = M * N;
+    finalize_kernel<<<(total + 255) / 256, 256, 0, stream>>>(Cf, Cp, total, num_chunks);
+  } else {
+    mxfp8_gemv_kernel<MAXM, CHUNK, false>
+        <<<dim3(col_blocks), block, 0, stream>>>(A, Asf, B, Bsf, Cp, nullptr, M, N, K, num_k_tiles);
+  }
+}
+
+void projection_out(torch::Tensor a, torch::Tensor sf, torch::Tensor w, torch::Tensor ws,
+                    torch::Tensor out, int pdl) {
+  TORCH_CHECK(a.is_cuda() && sf.is_cuda() && w.is_cuda() && ws.is_cuda() && out.is_cuda(),
+              "CUDA operands required");
+  TORCH_CHECK(a.device() == w.device() && a.device() == sf.device() && a.device() == ws.device() &&
+                  a.device() == out.device(),
+              "same CUDA device required");
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 2 && out.dim() == 2 && a.is_contiguous() &&
+                  w.is_contiguous() && out.is_contiguous(),
+              "contiguous matrices required");
+  TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn &&
+                  w.scalar_type() == torch::kFloat8_e4m3fn && out.scalar_type() == torch::kBFloat16,
+              "E4M3 operands and BF16 output required");
+  const int M = a.size(0), K = a.size(1), N = w.size(0), kt = K / 128;
+  TORCH_CHECK(M >= 1 && M <= 8 && K % 128 == 0 && K > 0 && N > 0 && w.size(1) == K &&
+                  out.size(0) == M && out.size(1) == N,
+              "unsupported geometry");
+  TORCH_CHECK(sf.numel() * sf.element_size() >= (int64_t)((M + 127) / 128) * kt * 512 &&
+                  ws.numel() * ws.element_size() >= (int64_t)((N + 127) / 128) * kt * 512,
+              "F8_128x4 scales too small");
+  TORCH_CHECK(pdl == 0 || pdl == 1, "PDL must be zero or one");
+  const dim3 grid((N + 7) / 8, 1);
+  auto stream = c10::cuda::getCurrentCUDAStream(a.get_device()).stream();
+  const uint8_t *A = (const uint8_t*)a.data_ptr(), *AS = (const uint8_t*)sf.data_ptr();
+  const uint8_t *W = (const uint8_t*)w.data_ptr(), *WS = (const uint8_t*)ws.data_ptr();
+  __nv_bfloat16* C = (__nv_bfloat16*)out.data_ptr();
+  if (pdl) {
+    auto* kernel = reference_projection_kernel<1, 1>;
+    set_dyn_smem(kernel, V3Smem<1>::kBytes);
+    launch_kernel(kernel, grid, dim3(kThreads), V3Smem<1>::kBytes, stream, true, A, AS, W, WS, C, M,
+                  N, K);
+  } else {
+    auto* kernel = reference_projection_kernel<0, 0>;
+    set_dyn_smem(kernel, V3Smem<1>::kBytes);
+    kernel<<<grid, dim3(kThreads), V3Smem<1>::kBytes, stream>>>(A, AS, W, WS, C, M, N, K);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace vllm_moet_sm120
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("projection_out", &vllm_moet_sm120::projection_out);
+}

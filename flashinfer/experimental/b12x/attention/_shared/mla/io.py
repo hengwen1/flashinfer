@@ -270,6 +270,49 @@ def io_issue_gather(
     IDENTICAL across sections, so this body is section-agnostic and the no-extra
     DSV4 / GLM PTX is unchanged (the caller never emits the extra branch).
     """
+    if cutlass.const_expr(dsv41 and not dsv41_fp8 and io_threads == 32 and bi == 64):
+        idx0, idx1 = Int32(-1), Int32(-1)
+        if g_start + io_lane < g_end:
+            idx0 = Int32(topk_indices[g_start + io_lane])
+        if g_start + io_lane + Int32(32) < g_end:
+            idx1 = Int32(topk_indices[g_start + io_lane + Int32(32)])
+        io_issue_packed_payload(
+            kv_cache_u8,
+            kv_fp8_dst_addr,
+            full_mbar_ptr,
+            idx0,
+            idx1,
+            page_block_size,
+            stride_kv_block,
+            io_lane,
+            kv_smem_stride=kv_smem_stride,
+            record_bytes=528 if dsv41_swa else 288,
+            bulk_tx_bytes=bi * (528 if dsv41_swa else 288),
+        )
+        token_idx_view[io_lane] = idx0
+        token_idx_view[io_lane + Int32(32)] = idx1
+        tag0 = Uint32(1 if dsv41_swa else 0)
+        tag1 = tag0
+        if idx0 < Int32(0):
+            tag0 = Uint32(2)
+        if idx1 < Int32(0):
+            tag1 = Uint32(2)
+        st_shared_u32(
+            kv_fp8_dst_addr + io_lane * Int32(kv_smem_stride) + Int32(528), tag0
+        )
+        st_shared_u32(
+            kv_fp8_dst_addr
+            + (io_lane + Int32(32)) * Int32(kv_smem_stride)
+            + Int32(528),
+            tag1,
+        )
+        # Bulk payload and metadata stores use disjoint bytes. Release the
+        # phase only after publishing tags; completed copies alone cannot do so.
+        cute.arch.fence_acq_rel_cta()
+        if io_lane == Int32(0):
+            cute.arch.mbarrier_arrive(full_mbar_ptr)
+        return
+
     # Section-agnostic gather: ``kv_cache_u8`` / ``topk_indices`` /
     # ``page_block_size`` / ``stride_kv_block`` are THIS section's pool (the caller
     # selects main vs extra). Aliased to the historical ``_section_*`` names used

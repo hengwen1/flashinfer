@@ -69,6 +69,162 @@ def _fake_bound(
     pass
 
 
+@torch.library.custom_op("b12x::mhc_lagged_input", mutates_args=("buffers",))
+def _input(
+    inputs: list[torch.Tensor],
+    buffers: list[torch.Tensor],
+    coefficients: list[torch.Tensor],
+    norm_weight: torch.Tensor,
+    pre_mix: torch.Tensor,
+    operation: str,
+    plan_handle: int,
+) -> None:
+    from . import _impl
+
+    plan = plan_from_handle(plan_handle)
+    state = require_prepared(plan, "norm.mhc")
+    if not state.query.split_lagged:
+        raise ValueError("input phase requires a split lagged declaration")
+    binding = _impl.B12XMHCBinding(
+        state=state,
+        plan=plan,
+        partials=buffers[0],
+        y=buffers[1],
+        out=buffers[2],
+        post_buffer=coefficients[0],
+        comb_buffer=coefficients[1],
+        pre_out=coefficients[2],
+    )
+    query = state.query
+    options = dict(
+        binding=binding,
+        _state=state,
+        _input_only=True,
+        norm_weight=norm_weight,
+        pre_mix=pre_mix,
+        rms_eps=query.rms_eps,
+        hc_eps=query.hc_eps,
+        sinkhorn_iters=query.sinkhorn_iters,
+        norm_eps=query.norm_eps,
+    )
+    entry = (
+        _impl._b12x_mhc_pre_impl
+        if operation == "pre"
+        else _impl._b12x_mhc_post_pre_impl
+    )
+    entry(*inputs, **options)
+
+
+@_input.register_fake
+def _fake_input(
+    inputs, buffers, coefficients, norm_weight, pre_mix, operation, plan_handle
+):
+    pass
+
+
+@torch.library.custom_op(
+    "b12x::mhc_lagged_coefficients", mutates_args=("coefficients",)
+)
+def _coefficients(
+    partials: torch.Tensor,
+    out: torch.Tensor,
+    y: torch.Tensor,
+    coefficients: list[torch.Tensor],
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    plan_handle: int,
+) -> None:
+    state = require_prepared(plan_from_handle(plan_handle), "norm.mhc")
+    if not state.query.split_lagged:
+        raise ValueError("coefficient phase requires a split lagged declaration")
+    from . import _impl
+
+    tokens, query = partials.shape[0], state.query
+    if not 0 <= tokens <= query.max_tokens:
+        raise ValueError("coefficient rows exceed the prepared capacity")
+    _impl._validate_mhc_binding_views(
+        partials=partials,
+        y=y,
+        out=out,
+        post=coefficients[0],
+        comb=coefficients[1],
+        tokens=tokens,
+        hidden_size=query.hidden_size,
+        split_k=query.split_k,
+        dtype=torch.bfloat16,
+        device=state.caps.device,
+    )
+    _impl._validate_optional_view(
+        coefficients[2],
+        shape=(tokens, 4),
+        dtype=torch.float32,
+        device=state.caps.device,
+        name="mHC pre_out",
+    )
+    _impl._validate_optional_view(
+        scale, shape=(3,), dtype=torch.float32, device=partials.device, name="mHC scale"
+    )
+    _impl._validate_optional_view(
+        base, shape=(24,), dtype=torch.float32, device=partials.device, name="mHC base"
+    )
+    if not partials.shape[0]:
+        return
+    state.launchers["coefficients"](
+        residual=out,
+        partials=partials,
+        scale=scale,
+        bias=base,
+        y=y,
+        post=coefficients[0],
+        comb=coefficients[1],
+        norm_weight=y,
+        pre_mix=coefficients[2],
+        pre_out=coefficients[2],
+    )
+
+
+@_coefficients.register_fake
+def _fake_coefficients(partials, out, y, coefficients, scale, base, plan_handle):
+    pass
+
+
+def run_input(binding, inputs, *, norm_weight, pre_mix):
+    """Write residual and normalized input; retain partials until coefficient completion."""
+    if not complete(binding, pre_mix) or binding.plan is None:
+        raise ValueError("split lagged input requires a complete caller-owned binding")
+    if binding.state is not require_prepared(binding.plan, "norm.mhc"):
+        raise ValueError("binding and plan have different prepared states")
+    _input(
+        list(inputs),
+        [binding.partials, binding.y, binding.out],
+        [binding.post_buffer, binding.comb_buffer, binding.pre_out],
+        norm_weight,
+        pre_mix,
+        binding.state.query.operation,
+        binding.plan.handle,
+    )
+    return binding.y
+
+
+def run_coefficients(binding, scale, base):
+    """Read retained partials and write the following boundary's FP32 coefficients."""
+    if not complete(binding, binding.pre_out) or binding.plan is None:
+        raise ValueError(
+            "split lagged coefficients require a complete caller-owned binding"
+        )
+    if binding.state is not require_prepared(binding.plan, "norm.mhc"):
+        raise ValueError("binding and plan have different prepared states")
+    _coefficients(
+        binding.partials,
+        binding.out,
+        binding.y,
+        [binding.post_buffer, binding.comb_buffer, binding.pre_out],
+        scale,
+        base,
+        binding.plan.handle,
+    )
+
+
 def complete(binding, pre_mix):
     return (
         binding is not None

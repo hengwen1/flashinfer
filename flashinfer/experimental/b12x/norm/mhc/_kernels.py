@@ -5300,6 +5300,102 @@ def _run_mhc_post_launch(
     )
 
 
+class _MhcLaggedNorm:
+    """Normalize the producer's rounded collapse without coefficient dependencies."""
+
+    def __init__(self, hidden_size, norm_eps):
+        self.hidden_size = hidden_size
+        self.norm_eps = norm_eps
+        self.source_tiles = hidden_size // _SOURCE_TILE_H
+        self.source_warps = (self.source_tiles + 31) // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        partials: cute.Tensor,
+        y: cute.Tensor,
+        norm: cute.Tensor,
+        tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(partials, y, norm).launch(
+            grid=(self.hidden_size // _GRAM_BLOCK_H, tokens, 1),
+            block=(_GRAM_BLOCK_H, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(self, partials: cute.Tensor, y: cute.Tensor, norm: cute.Tensor):
+        tile, token, _ = cute.arch.block_idx()
+        tid = cute.arch.thread_idx()[0]
+        allocator = cutlass_utils.SmemAllocator()
+        sums = allocator.allocate_tensor(
+            Float32, cute.make_layout((self.source_warps + 1,), stride=(1,))
+        )
+        value = Float32(0.0)
+        if tid < Int32(self.source_warps * 32):
+            if tid < Int32(self.source_tiles):
+                value = Float32(partials[token, Int32(self.source_tiles) + tid, 0])
+            value = _warp_allreduce_sum(value)
+            if tid % Int32(32) == Int32(0):
+                sums[tid // Int32(32)] = value
+        cute.arch.sync_threads()
+        if tid == Int32(0):
+            total = Float32(0.0)
+            for warp_index in cutlass.range_constexpr(self.source_warps):
+                total += Float32(sums[warp_index])
+            sums[self.source_warps] = cute.math.rsqrt(
+                total / Float32(self.hidden_size) + Float32(self.norm_eps),
+                fastmath=True,
+            )
+        cute.arch.sync_threads()
+        h = Int64(tile) * Int64(_GRAM_BLOCK_H) + Int64(tid)
+        value = Float32(y[token, h])
+        value = value * Float32(sums[self.source_warps]) * Float32(norm[h])
+        y[token, h] = value.to(cutlass.BFloat16)
+
+
+@lru_cache(maxsize=64)
+def _lagged_norm_kernel(hidden_size, norm_eps):
+    return _MhcLaggedNorm(hidden_size, norm_eps)
+
+
+def _run_mhc_lagged_norm_launch(*, partials, y, norm_weight, norm_eps, _prepared=None):
+    tokens, hidden = y.shape
+    args = (
+        _to_kernel_tensor(
+            partials, cutlass.Float32, assumed_align=4, dynamic_layout=True
+        ),
+        _to_kernel_tensor(y, cutlass.BFloat16, dynamic_layout=True),
+        _norm_weight_kernel_tensor(norm_weight, y),
+        Int32(tokens),
+        current_cuda_stream(),
+    )
+    if _prepared is not None:
+        return run_compiled(_prepared, args)
+    key = (
+        hidden,
+        float(norm_eps),
+        str(norm_weight.dtype),
+        tensor_key(
+            "partials",
+            partials,
+            dims=(
+                DimKey.dynamic(),
+                DimKey.exact(partials.shape[1]),
+                DimKey.exact(_PARTIALS),
+            ),
+        ),
+        tensor_key("y", y, dims=(DimKey.dynamic(), DimKey.exact(hidden))),
+    )
+    return _compile_mhc_entry(
+        _lagged_norm_kernel(hidden, float(norm_eps)),
+        compile_spec=KernelCompileSpec.from_key("norm.mhc.lagged_norm", 1, key),
+        compile_args=args,
+        runtime_args=args,
+    )
+
+
 def _run_mhc_pre_partial_launch(
     *,
     residual: torch.Tensor,

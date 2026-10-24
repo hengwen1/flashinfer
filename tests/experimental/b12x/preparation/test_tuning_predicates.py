@@ -504,7 +504,13 @@ def test_a16_small_m_mxfp8_wide_tile_remains_eligible():
     )
     space = TUNING.parameter_space(narrow, IDENTITY)
     assignment = dict(
-        mode="a16", tile_m=16, tile_n=64, tile_k=64, split_k=1, mma_warps=4
+        mode="a16",
+        tile_m=16,
+        tile_n=64,
+        tile_k=64,
+        split_k=1,
+        mma_warps=4,
+        dense_config=None,
     )
     space.validate(assignment)
     space.validate({**assignment, "tile_n": 128})
@@ -527,7 +533,13 @@ def test_iq2_transposed_tiles_are_raced_without_split_k():
         out_features=136,
     )
     assignment = dict(
-        mode="a16", tile_m=8, tile_n=128, tile_k=256, split_k=1, mma_warps=None
+        mode="a16",
+        tile_m=8,
+        tile_n=128,
+        tile_k=256,
+        split_k=1,
+        mma_warps=None,
+        dense_config=None,
     )
     TUNING.parameter_space(query, IDENTITY).validate(assignment)
     TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)
@@ -563,7 +575,13 @@ def test_nvfp4_a16_races_k256_tiles():
     )
     for tile_m in (16, 32, 64):
         assignment = dict(
-            mode="a16", tile_m=tile_m, tile_n=128, tile_k=256, split_k=4, mma_warps=None
+            mode="a16",
+            tile_m=tile_m,
+            tile_n=128,
+            tile_k=256,
+            split_k=4,
+            mma_warps=None,
+            dense_config=None,
         )
         TUNING.parameter_space(query, IDENTITY).validate(assignment)
         TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)

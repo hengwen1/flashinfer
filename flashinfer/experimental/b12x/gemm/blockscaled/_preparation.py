@@ -24,6 +24,7 @@ from b12x._lib.utils.pointers import make_ptr
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import _CompositePlan
 from ._tuning import (
+    MXFP8_PREFILL_MIN_ROWS as _MXFP8_PREFILL_MIN_ROWS,
     MXFP8_A16_DEQUANT_MIN_ROWS,
     BlockscaledConfig,
     BlockscaledQuery,
@@ -31,9 +32,9 @@ from ._tuning import (
     effective_a16_config,
     functional_mxfp8_quantization,
     mxfp8_a16_dequant,
+    quantized_expected_m,
+    quantized_query,
 )
-
-_MXFP8_PREFILL_MIN_ROWS = 2048
 
 
 def _compile_query_payload(query):
@@ -52,23 +53,14 @@ def _decode_query(payload):
 
 
 def _lower_dense_with_hint(query, config, device, expected_m):
-    from b12x.gemm._preparation import _default_lowering
-    from b12x.gemm._tuning import DenseGemmQuery
+    from b12x.gemm._preparation import _configured_lowering, _default_lowering
+    from b12x.gemm._tuning import TUNING as DENSE_TUNING
 
-    functional = functional_mxfp8_quantization(query, config)
-    inner = DenseGemmQuery(
-        recipe=query.recipe,
-        entry_point="gemm.blockscaled.mm",
-        weight_storage="native",
-        output_dtype="bfloat16",
-        batch=1,
-        max_rows=query.num_tokens,
-        in_features=query.padded_in_features,
-        out_features=query.out_features,
-        output_mode="functional" if functional else "provided",
-        alpha_mode="unit" if functional else "tensor",
-        expected_m=expected_m,
-    )
+    inner = quantized_query(query, expected_m=expected_m)
+    if config.dense_config is not None:
+        return _configured_lowering(
+            inner, DENSE_TUNING.decode_config(config.dense_config), device.identity
+        )
     return _default_lowering(inner, device.identity)
 
 
@@ -83,16 +75,16 @@ def _has_mxfp8_prefill_regime(query):
 def _dense_lowering(query, config, device):
     # Both programs are compiled for the declared capacity. The large-row hint
     # must not force underfilled short prefills onto a large M tile.
-    expected_m = (
-        query.num_tokens if _has_mxfp8_prefill_regime(query) else query.expected_m
-    )
+    expected_m = quantized_expected_m(query)
     return _lower_dense_with_hint(query, config, device, expected_m)
 
 
 def _short_dense_lowering(query, config, device):
     if not _has_mxfp8_prefill_regime(query):
         return None
-    return _lower_dense_with_hint(query, config, device, None)
+    return _lower_dense_with_hint(
+        query, replace(config, dense_config=None), device, None
+    )
 
 
 @program_cache(scope="preparation")
@@ -270,6 +262,10 @@ def _workspace_bytes(query, config):
             return max(partials, query.out_features * query.padded_in_features * 2)
         return partials
     if functional_mxfp8_quantization(query, config):
+        if config.dense_config is not None and not query.codegen["split_k_atomic"]:
+            slices = config.dense_config["split_k_slices"]
+            if slices > 1:
+                return slices * query.num_tokens * query.out_features * 4
         return 0
     from ._a16 import _layout
 
@@ -438,6 +434,9 @@ class _PackedExecutionState:
                         scales.view(torch.float8_e8m0fnu),
                     ),
                     stream=stream,
+                    split_k_workspace=None
+                    if workspace is None
+                    else workspace.view(torch.float32),
                 )[:, :, 0]
                 return result.view(*source.shape[:-1], q.out_features)
             _check_tensor("source", source, self.device, torch.bfloat16)

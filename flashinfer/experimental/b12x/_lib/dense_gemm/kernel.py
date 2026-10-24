@@ -974,7 +974,11 @@ class DenseGemmKernel:
         thr_mma: cute.ThrMma,
         tidx: int,
     ):
-        return sm120_utils.partition_fragment_SFA(sfa_tensor, thr_mma, tidx)
+        fragment = sm120_utils.partition_fragment_SFA(sfa_tensor, thr_mma, tidx)
+        if self.a_dtype == cutlass.Float4E2M1FN and self.sf_vec_size == 32:
+            # MXFP4 scale repetitions share the MMA fragment's K coordinate.
+            fragment = cute.group_modes(fragment, 2, cute.rank(fragment))
+        return fragment
 
     def _partition_fragment_SFB(
         self,
@@ -982,7 +986,11 @@ class DenseGemmKernel:
         thr_mma: cute.ThrMma,
         tidx: int,
     ):
-        return sm120_utils.partition_fragment_SFB(sfb_tensor, thr_mma, tidx)
+        fragment = sm120_utils.partition_fragment_SFB(sfb_tensor, thr_mma, tidx)
+        if self.a_dtype == cutlass.Float4E2M1FN and self.sf_vec_size == 32:
+            # MXFP4 scale repetitions share the MMA fragment's K coordinate.
+            fragment = cute.group_modes(fragment, 2, cute.rank(fragment))
+        return fragment
 
     def _thrfrg_SFA(self, sfa_tensor, tiled_mma: cute.TiledMma):
         return sm120_utils.thrfrg_SFA(sfa_tensor, tiled_mma)

@@ -213,10 +213,10 @@ class MoeDecodeConfig:
 # Each pair is (K, N). Both fused phases share a CTA, hence their thread
 # counts must match; their tile shapes may differ. These are existing kernel
 # geometries, independent of the codec's packed storage and live token count.
-_BLOCK_MOE_TILES = ((128, 64), (64, 128), (128, 128), (64, 256))
+_W4A16_MOE_TILES = ((128, 64), (64, 128), (128, 128), (64, 256))
 
 
-def _validate_block_moe_launch(query, config):
+def _validate_w4a16_launch(query, config):
     knobs = (
         config.w4a16_tile_config,
         config.w4a16_block_size_m,
@@ -224,8 +224,13 @@ def _validate_block_moe_launch(query, config):
     )
     if all(value is None for value in knobs):
         return
-    if config.backend != "w4a16" or query.source_format not in BLOCK_CODECS:
-        raise ValueError("W4A16 tile tuning requires a block-codec W4A16 query")
+    is_block_codec = query.source_format in BLOCK_CODECS
+    if config.backend != "w4a16" or not (
+        is_block_codec or query.source_format in ("modelopt_nvfp4", "fp4_e8m0_k32")
+    ):
+        raise ValueError("W4A16 tile tuning requires packed FP4 or block-codec weights")
+    if not is_block_codec and config.w4a16_route_mode != "packed":
+        raise ValueError("explicit FP4 W4A16 launch geometry requires packed routing")
     if any(value is None for value in knobs):
         raise ValueError(
             "W4A16 tile, route-block and pipeline choices must be specified together"
@@ -245,7 +250,7 @@ def _validate_block_moe_launch(query, config):
         raise ValueError("W4A16 tuning conflicts with the declared route-block size")
     if config.w4a16_route_mode == "direct" and block != 8:
         raise ValueError("direct block-codec routing requires an M8 route block")
-    if tiles[:2] not in _BLOCK_MOE_TILES or tiles[2:] not in _BLOCK_MOE_TILES:
+    if tiles[:2] not in _W4A16_MOE_TILES or tiles[2:] not in _W4A16_MOE_TILES:
         raise ValueError("unsupported W4A16 tile geometry")
     if tiles[0] * tiles[1] != tiles[2] * tiles[3]:
         raise ValueError("fused W4A16 FC1/FC2 thread counts must match")
@@ -267,7 +272,10 @@ def _validate_block_moe_launch(query, config):
             tile_k=tile_k,
             cta_threads=tile_n * tile_k // 64,
             max_shared_mem=_DEFAULT_MAX_SHARED_MEM - 512,
-            weight_layout=query.source_format,
+            weight_layout=query.source_format
+            if is_block_codec
+            else (query.w4a16_weight_layout or "packed"),
+            scale_format=query.w4a16_scale_format or "e4m3_k16",
             uses_m_block_8=block == 8,
             pipeline_stages=stages,
         ):
@@ -404,7 +412,7 @@ def validate_moe_decode_config(
     _device: DeviceIdentity | None,
 ) -> None:
     """Reject a decode config the query's recipe cannot execute."""
-    _validate_block_moe_launch(query, config)
+    _validate_w4a16_launch(query, config)
     if query.source_format in BLOCK_CODECS:
         if query.quant_mode != "w4a16" or query.io_dtype != "bfloat16":
             raise ValueError("IQ2_XS requires BF16 W4A16 execution")
@@ -768,7 +776,7 @@ def _launch_parameter_space(query, device):
 
         tiles = tuple(
             a + b
-            for a, b in product(_BLOCK_MOE_TILES, repeat=2)
+            for a, b in product(_W4A16_MOE_TILES, repeat=2)
             if a[0] * a[1] == b[0] * b[1]
         )
         blocks = (
@@ -847,16 +855,43 @@ def _launch_parameter_space(query, device):
 
 
 def _tuning_parameters(query, device):
-    space = _launch_parameter_space(query, device)
+    launch_query = query
+    if query.quant_mode == "multi":
+        non_a16 = tuple(mode for mode in query.quant_modes if mode != "w4a16")
+        if len(non_a16) != 1:
+            raise ValueError("multi-recipe MoE requires one non-W4A16 recipe")
+        launch_query = replace(query, quant_mode=non_a16[0])
+    space = _launch_parameter_space(launch_query, device)
     if not isinstance(space, ParameterSpace):
         space = ParameterSpace.create(TUNING.knobs, values=space)
+    w4a16_values = {}
+    if query.source_format in ("modelopt_nvfp4", "fp4_e8m0_k32") and (
+        query.quant_mode == "w4a16" or "w4a16" in query.quant_modes
+    ):
+        from itertools import product
+
+        tiles = tuple(
+            a + b
+            for a, b in product(_W4A16_MOE_TILES, repeat=2)
+            if a[0] * a[1] == b[0] * b[1]
+        )
+        blocks = (
+            (query.w4a16_block_size_m,)
+            if query.w4a16_block_size_m is not None
+            else (8, 16, 32, 48, 64)
+        )
+        w4a16_values = {
+            "w4a16_tile_config": (None, *tiles),
+            "w4a16_block_size_m": (None, *blocks),
+            "w4a16_pipeline_stages": (None, 2, 3, 4, 5),
+        }
     grid_knob = next(k for k in space.knobs if k.name == "max_active_clusters")
     sparse_grids = frozenset(grid_knob.values)
     limit = max((v for v in sparse_grids if v is not None), default=0)
     grids = (None, *range(1, limit + 1))
     return ParameterSpace.create(
         space.knobs,
-        values={"max_active_clusters": grids},
+        values={"max_active_clusters": grids, **w4a16_values},
         predicates=space.predicates,
         efficiency_predicates=(
             EfficiencyPredicate(
@@ -975,7 +1010,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=35,
+    candidate_contract_version=36,
     knobs=(
         Knob(
             name="backend",

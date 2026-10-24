@@ -63,11 +63,13 @@ class BlockscaledQuery:
 
 @dataclass(frozen=True, kw_only=True)
 class BlockscaledConfig:
-    """A16 launch knobs or an MXFP8 dense GEMM configuration.
+    """A16 launch knobs or a quantized dense GEMM configuration.
 
-    Quantized MXFP8 candidates carry the native dense configuration so the
+    Quantized candidates carry the native dense configuration so the
     precision race times activation quantization and the selected GEMM together.
-    A null dense configuration uses the dense heuristic.
+    A null dense configuration uses the dense heuristic. ``a16_backend="packed"``
+    retains the packed-weight kernel at every row count; ``"auto"`` may expand
+    MXFP8 weights for a BF16 GEMM when caller scratch and capacity permit it.
     """
 
     mode: str
@@ -77,6 +79,7 @@ class BlockscaledConfig:
     split_k: int | None = None
     mma_warps: int | None = None
     dense_config: FrozenMapping | None = None
+    a16_backend: str = "auto"
 
     def __post_init__(self):
         if self.dense_config is not None:
@@ -92,9 +95,10 @@ class BlockscaledConfig:
             "split_k",
             "mma_warps",
             "dense_config",
+            "a16_backend",
         }:
             raise ValueError(
-                "packed precision config requires mode, A16 knobs, and dense_config"
+                "packed precision config requires mode, A16 backend/knobs, and dense_config"
             )
         return cls(**dict(payload))
 
@@ -328,6 +332,7 @@ def mxfp8_a16_dequant(query, config):
     return (
         query.recipe == "mxfp8"
         and config.mode == "a16"
+        and config.a16_backend == "auto"
         and query.workspace_form == "provided"
         and query.num_tokens >= MXFP8_A16_DEQUANT_MIN_ROWS
         and query.in_features == query.padded_in_features
@@ -360,9 +365,18 @@ def _validate_config(query, config, device):
         raise ValueError("invalid packed precision configuration")
     if query.activation_mode != "auto" and config.mode != query.activation_mode:
         raise ValueError("configuration conflicts with caller activation precision")
+    if config.a16_backend not in ("auto", "packed") or (
+        config.a16_backend != "auto"
+        and (config.mode != "a16" or query.recipe != "mxfp8")
+    ):
+        raise ValueError("explicit packed A16 backend requires MXFP8 A16 execution")
     if config.dense_config is not None:
-        if config.mode != "quantized" or query.recipe != "mxfp8":
-            raise ValueError("dense_config requires quantized MXFP8 execution")
+        if config.mode != "quantized" or query.recipe not in (
+            "nvfp4",
+            "mxfp4",
+            "mxfp8",
+        ):
+            raise ValueError("dense_config requires quantized FP4 or FP8 execution")
         from b12x.gemm._tuning import TUNING as DENSE_TUNING
 
         inner = quantized_query(query, expected_m=quantized_expected_m(query))
@@ -442,19 +456,10 @@ def _validate_config(query, config, device):
             raise ValueError(
                 "quantized execution requires K256 for MXFP4 or K128 otherwise"
             )
-        if query.workspace_nbytes is not None and not functional_mxfp8_quantization(
-            query, config
-        ):
-            from ._a16 import _layout
+        if query.workspace_nbytes is not None:
+            from ._preparation import _workspace_bytes
 
-            needed = _layout(
-                query.num_tokens,
-                query.out_features,
-                query.padded_in_features,
-                query.recipe in ("nvfp4", "mxfp4"),
-                (64, 64, 1),
-                group=16 if query.recipe == "nvfp4" else 32,
-            )[-1]
+            needed = _workspace_bytes(query, config)
             if query.workspace_nbytes < needed:
                 raise ValueError(
                     "caller workspace is too small for quantized execution"
@@ -475,7 +480,7 @@ def _validate_config(query, config, device):
 def _tuning_parameters(query, device):
     dense_configs = (None,)
     if (
-        query.recipe == "mxfp8"
+        query.recipe in ("nvfp4", "mxfp4", "mxfp8")
         and query.activation_mode != "a16"
         and query.autotune_effort != "off"
     ):
@@ -492,7 +497,21 @@ def _tuning_parameters(query, device):
                 for _, config in DENSE_TUNING.choices(inner, device)
             )
 
+    expanded = mxfp8_a16_dequant(query, BlockscaledConfig(mode="a16"))
+
     def eligible(parameters):
+        if (
+            expanded
+            and parameters["mode"] == "a16"
+            and parameters["a16_backend"] == "auto"
+        ):
+            return (
+                parameters["tile_m"],
+                parameters["tile_n"],
+                parameters["tile_k"],
+                parameters["split_k"],
+                parameters["mma_warps"],
+            ) == (16, 64, 64, 1, 4)
         if parameters["mode"] != "a16":
             return True
         if parameters["tile_n"] == 4:
@@ -551,6 +570,7 @@ def _tuning_parameters(query, device):
             else (query.activation_mode,),
             "mma_warps": (2, 4) if query.recipe == "mxfp8" else (None,),
             "dense_config": dense_configs,
+            "a16_backend": ("auto", "packed") if expanded else ("auto",),
         },
         predicates=(eligible,),
         autotune_effort=query.autotune_effort,
@@ -572,7 +592,7 @@ def _tuning_parameters(query, device):
 def _equivalence(query, device, config):
     if config.mode == "quantized":
         dense = config.dense_config
-        if dense is None and query.recipe == "mxfp8":
+        if dense is None and query.recipe in ("nvfp4", "mxfp4", "mxfp8"):
             from b12x.gemm._tuning import TUNING as DENSE_TUNING
 
             inner = quantized_query(query, expected_m=quantized_expected_m(query))
@@ -583,6 +603,8 @@ def _equivalence(query, device, config):
             "mode": "quantized",
             "dense_config": None if dense is None else dense.to_dict(),
         }
+    if mxfp8_a16_dequant(query, config):
+        return {"mode": "a16", "backend": "dequant"}
     n, k, split = effective_a16_config(query, config)
     return {
         "mode": "a16",
@@ -597,7 +619,7 @@ def _equivalence(query, device, config):
 TUNING = TuningContract(
     component_id="gemm.blockscaled_precision",
     query_schema_version=23,
-    config_schema_version=24,
+    config_schema_version=25,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {
@@ -608,7 +630,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=23,
+    candidate_contract_version=24,
     knobs=(
         Knob(
             name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE
@@ -626,6 +648,12 @@ TUNING = TuningContract(
             values=None,
             binding=ParameterBinding.COMPILE,
             when=FrozenMapping({"mode": "a16"}),
+        ),
+        Knob(
+            name="a16_backend",
+            values=("auto",),
+            when=FrozenMapping({"mode": "a16"}),
+            otherwise="auto",
         ),
         Knob(
             name="dense_config",

@@ -155,3 +155,65 @@ def test_caller_workspace_limit_and_a16_knobs_are_validated():
         TUNING.validate_config(
             replace(q, activation_mode="a16"), replace(config, mode="a16"), IDENTITY
         )
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", "mxfp4"])
+@pytest.mark.parametrize("rows", [1, 8, 128])
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
+def test_fp4_quantized_search_includes_dense_candidates(recipe, rows, effort):
+    q = replace(
+        query(m=rows, n=512, k=2560),
+        recipe=recipe,
+        activation_scale_available=recipe == "nvfp4",
+        global_scale_kind="multiplier" if recipe == "nvfp4" else "none",
+        autotune_effort=effort,
+    )
+    inner = quantized_query(q, expected_m=quantized_expected_m(q))
+    expected = {
+        DENSE_TUNING.config_payload(c) for _, c in DENSE_TUNING.choices(inner, IDENTITY)
+    }
+    configs = [c for _, c in TUNING.choices(q, IDENTITY)]
+    quantized = [c for c in configs if c.mode == "quantized"]
+    actual = {
+        c.dense_config
+        if c.dense_config is not None
+        else DENSE_TUNING.config_payload(DENSE_TUNING.default_config(inner, IDENTITY))
+        for c in quantized
+    }
+    assert expected <= actual
+    assert len(actual) == len(quantized) > 1
+    for mode in {c.mode for c in configs}:
+        assert {
+            c for _, c in TUNING.choices(replace(q, activation_mode=mode), IDENTITY)
+        } == {c for c in configs if c.mode == mode}
+    for c in quantized:
+        lowered = _dense_lowering(q, c, DEVICE)
+        dense = (
+            DENSE_TUNING.default_config(inner, IDENTITY)
+            if c.dense_config is None
+            else DENSE_TUNING.decode_config(c.dense_config)
+        )
+        assert lowered.mma_tiler_mn == (dense.tile_m, dense.tile_n)
+        assert lowered.policy.split_k_slices == (dense.split_k_slices or 1)
+        required = _workspace_bytes(q, c)
+        TUNING.validate_config(replace(q, workspace_nbytes=required), c, IDENTITY)
+        with pytest.raises(ValueError, match="workspace"):
+            TUNING.validate_config(
+                replace(q, workspace_nbytes=required - 1), c, IDENTITY
+            )
+
+
+@pytest.mark.parametrize("rows", [128, 4096])
+def test_mxfp8_prefill_races_packed_tiles_beside_expanded_baseline(rows):
+    from b12x.gemm.blockscaled._tuning import mxfp8_a16_dequant
+
+    q = query(m=rows)
+    configs = [c for _, c in TUNING.choices(q, IDENTITY)]
+    expanded = [c for c in configs if mxfp8_a16_dequant(q, c)]
+    packed = [c for c in configs if c.mode == "a16" and not mxfp8_a16_dequant(q, c)]
+    assert len(expanded) == 1
+    assert len(packed) == 32
+    assert all(c.a16_backend == "packed" for c in packed)
+    assert {
+        c for _, c in TUNING.choices(replace(q, activation_mode="a16"), IDENTITY)
+    } == set(expanded + packed)

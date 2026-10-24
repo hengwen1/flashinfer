@@ -87,6 +87,13 @@ Resident-grid caps use sparse power-of-two and fractional ladders below `max`;
 query and does not affect compiled program identities. Compact MXFP4 W4A8
 retains reconstructed K128 scale words across both K64 pipeline steps.
 
+Packed FP4 W4A16 execution searches FC1/FC2 tile pairs, route-block sizes,
+and pipeline depths. Explicit launch geometries use packed routing; the
+specialized direct kernels remain separate candidates. Mixed-precision
+queries retain the launch search of each constituent precision, including
+W4A8 resident-grid caps. Benchmark callbacks must time the complete routed
+operation, including activation conversion and output reduction.
+
 Eligible compact N64 MXFP4 shards offer direct-route micro kernels through
 16 tokens and grouped M16 or M64 compute. M64 FC1 uses M32 arithmetic when a
 source tile has at most 32 live rows, while retaining its prepared M64 storage

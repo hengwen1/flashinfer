@@ -267,16 +267,25 @@ def _workspace_bytes(query, config):
             if slices > 1:
                 return slices * query.num_tokens * query.out_features * 4
         return 0
+    return _quantized_layout(query, config)[-1]
+
+
+def _quantized_layout(query, config):
     from ._a16 import _layout
 
+    slices = (
+        1
+        if config.dense_config is None
+        else (config.dense_config["split_k_slices"] or 1)
+    )
     return _layout(
         query.num_tokens,
         query.out_features,
         query.padded_in_features,
         query.recipe in ("nvfp4", "mxfp4"),
-        (64, 64, 1),
+        (64, 64, slices),
         group=16 if query.recipe == "nvfp4" else 32,
-    )[-1]
+    )
 
 
 @dataclass(frozen=True)
@@ -667,8 +676,6 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         return MemoryRequirements(scratch, tuple(persistent))
 
     def materialize(selection, device):
-        from ._a16 import _layout
-
         config = selection.config
         p, short = inner(config, device)
         programs = compile_packed(
@@ -710,14 +717,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         offsets = (
             None
             if config.mode == "a16" or functional_mxfp8_quantization(query, config)
-            else _layout(
-                query.num_tokens,
-                query.out_features,
-                query.padded_in_features,
-                query.recipe in ("nvfp4", "mxfp4"),
-                (64, 64, 1),
-                group=16 if query.recipe == "nvfp4" else 32,
-            )
+            else _quantized_layout(query, config)
         )
         needed = _workspace_bytes(query, config)
         workspace = bases = None

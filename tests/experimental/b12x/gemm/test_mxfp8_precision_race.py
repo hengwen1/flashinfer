@@ -1,4 +1,4 @@
-"""MXFP8 precision selection validates and times complete prepared calls."""
+"""Packed precision selection validates and times complete prepared calls."""
 
 from dataclasses import replace
 
@@ -16,18 +16,43 @@ from b12x.gemm.blockscaled._tuning import TUNING
 from b12x.preparation import PreparationSession, PreparedCall
 from b12x.preparation.device import detect_device
 from b12x.testing.reference.helpers import require_b12x
+from .test_blockscaled import _quantize_mxfp4_rows, _dequantize_mxfp4_rows
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 from .test_blockscaled_a16 import assert_close, make_weight, prepared_execution
 
 
-@pytest.mark.parametrize("m", [1, 8])
-@pytest.mark.parametrize("n,k", [(1792, 5120), (8192, 1280)])
-def test_auto_mxfp8_races_dense_configurations_and_replays(tmp_path, m, n, k):
+@pytest.mark.parametrize(
+    "recipe,m,n,k",
+    [("mxfp8", m, n, k) for m in (1, 8) for n, k in ((1792, 5120), (8192, 1280))]
+    + [("nvfp4", m, 512, 2560) for m in (1, 8, 128)]
+    + [("mxfp8", 128, 512, 2560)]
+    + [("mxfp4", m, 512, 2560) for m in (1, 8, 128)],
+)
+def test_auto_packed_races_dense_configurations_and_replays(tmp_path, recipe, m, n, k):
     require_b12x()
     source = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.125
-    weight, decoded, _ = make_weight("mxfp8", n, k)
+    if recipe == "mxfp4":
+        rhs = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        packed, scale_rows = _quantize_mxfp4_rows(rhs)
+        weight = blockscaled.pack_weight(
+            packed, swizzle_block_scale(scale_rows), recipe=recipe
+        )
+        decoded = _dequantize_mxfp4_rows(packed, scale_rows)
+    else:
+        weight, decoded, _ = make_weight(recipe, n, k)
     output = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    activation_scale = (
+        torch.tensor([128.0], device="cuda") if recipe == "nvfp4" else None
+    )
+    options = (
+        {"activation_global_scale": activation_scale}
+        if activation_scale is not None
+        else {}
+    )
     query = replace(
-        blockscaled.query_from_call(source, weight, out=output, activation_mode="auto"),
+        blockscaled.query_from_call(
+            source, weight, out=output, activation_mode="auto", **options
+        ),
         workspace_form="provided",
     )
     eligible = {
@@ -36,11 +61,28 @@ def test_auto_mxfp8_races_dense_configurations_and_replays(tmp_path, m, n, k):
     }
     assert sum(config.mode == "quantized" for config in eligible) > 1
     values, scales, gain, _ = _a16._weight_parts(weight)
-    quantized = quantize_mxfp8_rows_torch(source)
+    if recipe == "nvfp4":
+        from b12x._lib.intrinsics.reference import _fp4_quantize_values
+
+        groups = source.float().reshape(m, -1, 16)
+        activation_scales = (
+            (groups.abs().amax(-1, keepdim=True) * (1.0 / 6.0) * activation_scale)
+            .to(torch.float8_e4m3fn)
+            .float()
+        )
+        steps = activation_scales * activation_scale.reciprocal()
+        inverse = torch.where(steps == 0, 0, steps.reciprocal())
+        operands = (
+            _fp4_quantize_values((groups * inverse).clamp(-6, 6)) * steps
+        ).reshape(m, k)
+    elif recipe == "mxfp4":
+        operands = _dequantize_mxfp4_rows(*_quantize_mxfp4_rows(source))
+    else:
+        quantized = quantize_mxfp8_rows_torch(source)
+        operands = dequantize_mxfp8_rows_torch(quantized.values, quantized.scale_rows)
     references = {
         "a16": source.float() @ decoded.T,
-        "quantized": dequantize_mxfp8_rows_torch(quantized.values, quantized.scale_rows)
-        @ decoded.T,
+        "quantized": operands @ decoded.T,
     }
     seen = set()
 
@@ -53,7 +95,13 @@ def test_auto_mxfp8_races_dense_configurations_and_replays(tmp_path, m, n, k):
 
         def run():
             return state.run(
-                trial_source, values, scales, gain, out=trial_output, workspace=scratch
+                trial_source,
+                values,
+                scales,
+                gain,
+                out=trial_output,
+                workspace=scratch,
+                activation_scale=activation_scale,
             )
 
         run()
@@ -74,7 +122,7 @@ def test_auto_mxfp8_races_dense_configurations_and_replays(tmp_path, m, n, k):
         session.prepare(
             (
                 plan.request(
-                    name="mxfp8-precision", prepare_call=call, benchmark_call=call
+                    name="packed-precision", prepare_call=call, benchmark_call=call
                 ),
             )
         )
@@ -91,7 +139,9 @@ def test_auto_mxfp8_races_dense_configurations_and_replays(tmp_path, m, n, k):
         session.freeze()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
-            blockscaled.mm(source, weight, out=output, workspace=scratch, plan=plan)
+            blockscaled.mm(
+                source, weight, out=output, workspace=scratch, plan=plan, **options
+            )
         for sign in (-1, 1, -1):
             source.neg_()
             output.fill_(float("nan"))
@@ -111,7 +161,7 @@ def test_auto_mxfp8_races_dense_configurations_and_replays(tmp_path, m, n, k):
         session.prepare(
             (
                 restored.request(
-                    name="mxfp8-precision", prepare_call=call, benchmark_call=call
+                    name="packed-precision", prepare_call=call, benchmark_call=call
                 ),
             )
         )

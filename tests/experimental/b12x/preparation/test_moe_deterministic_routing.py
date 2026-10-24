@@ -222,3 +222,34 @@ def test_qwen_deterministic_defaults_keep_existing_kernel_routes(tokens):
         assert config.backend == "micro" and config.dynamic_route_mode is None
     else:
         assert config.backend == "dynamic" and config.dynamic_route_mode == "grouped"
+
+
+@pytest.mark.parametrize("tokens", [1, 8, 128])
+@pytest.mark.parametrize("effort", ["medium", "max"])
+@pytest.mark.parametrize("precision", ["nvfp4", "w4a8_mx"])
+def test_mixed_precision_search_preserves_each_precision_candidates(
+    tokens, effort, precision
+):
+    query, _ = _qwen_query(tokens, False, "multi")
+    query = replace(query, autotune_effort=effort)
+    if precision == "w4a8_mx":
+        query = replace(
+            query,
+            quant_modes=("w4a16", "w4a8_mx"),
+            source_format="fp4_e8m0_k32",
+            hidden_size=5120,
+            intermediate_size=128,
+            w4a16_weight_layout="packed",
+            w4a16_scale_format="e8m0_k32",
+        )
+    mixed = {c for _, c in TUNING.choices(query, DEVICE)}
+    separate = set()
+    for mode in query.quant_modes:
+        explicit = replace(query, quant_mode=mode, quant_modes=(mode,))
+        separate.update(c for _, c in TUNING.choices(explicit, DEVICE))
+    assert mixed == separate
+    packed = [
+        c for c in mixed if c.backend == "w4a16" and c.w4a16_route_mode == "packed"
+    ]
+    assert len({c.w4a16_tile_config for c in packed}) > 1
+    assert len({c.w4a16_pipeline_stages for c in packed}) > 1

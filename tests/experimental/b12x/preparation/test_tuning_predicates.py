@@ -511,6 +511,7 @@ def test_a16_small_m_mxfp8_wide_tile_remains_eligible():
         split_k=1,
         mma_warps=4,
         dense_config=None,
+        a16_backend="auto",
     )
     space.validate(assignment)
     space.validate({**assignment, "tile_n": 128})
@@ -540,6 +541,7 @@ def test_iq2_transposed_tiles_are_raced_without_split_k():
         split_k=1,
         mma_warps=None,
         dense_config=None,
+        a16_backend="auto",
     )
     TUNING.parameter_space(query, IDENTITY).validate(assignment)
     TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)
@@ -582,6 +584,7 @@ def test_nvfp4_a16_races_k256_tiles():
             split_k=4,
             mma_warps=None,
             dense_config=None,
+            a16_backend="auto",
         )
         TUNING.parameter_space(query, IDENTITY).validate(assignment)
         TUNING.validate_config(query, BlockscaledConfig(**assignment), IDENTITY)

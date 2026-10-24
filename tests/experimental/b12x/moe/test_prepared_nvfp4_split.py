@@ -14,12 +14,12 @@ from b12x.moe._shared.kernels.reference import compare_to_reference, moe_referen
 from ..conftest import require_b12x
 
 
-def _experts(domain, *, swiglu_limit=None, intermediate_scale=None):
+def _experts(domain, *, swiglu_limit=None, intermediate_scale=None, mode="a4"):
     e, h, n = domain["E"], domain["K"], domain["n"]
     declaration = moe.plan_weights(
         source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
         activation=moe.ActivationSpec(
-            mode="a4",
+            mode=mode,
             nonlinearity="silu",
             io_dtype=torch.bfloat16,
             swiglu_limit=swiglu_limit,
@@ -399,3 +399,157 @@ def test_materialized_nvfp4_swiglu_limit_changes_output():
             outputs.append(output.clone())
     effect = compare_to_reference(outputs[0], outputs[1])
     assert effect.rmse > _bf16_output_bound(domain["oracle"]), effect
+
+
+@pytest.mark.parametrize("rows", [8, 128])
+@pytest.mark.parametrize(
+    "tile,block,stages",
+    [
+        (None, None, None),
+        ((128, 64, 128, 64), 8, 3),
+        ((64, 128, 64, 128), 32, 4),
+        ("race", None, None),
+    ],
+)
+def test_prepared_w4a16_launch_configuration_graph(tmp_path, rows, tile, block, stages):
+    from b12x.moe._shared.kernels.reference import moe_reference_w4a16_f32
+
+    device = require_b12x()
+    domain = _build_domain(E=4, K=256, n=128, m=rows, top_k=1, seed=1201)
+    reference_w13 = domain["w13_packed"].clone()
+    reference_w2 = domain["w2_packed"].clone()
+    reference_sf13 = domain["w13_sfb"].view(4, -1).clone()
+    reference_sf2 = domain["w2_sfb"].view(4, -1).clone()
+    experts, weights = _experts(domain, mode="a16")
+    source, ids, probabilities = domain["x"], domain["topk_ids"], domain["topk_weights"]
+    racing = tile == "race"
+    config = (
+        None
+        if racing
+        else moe.MoeDecodeConfig(
+            backend="w4a16",
+            route_planner="internal",
+            max_active_clusters=None,
+            dynamic_tile_m=None,
+            dynamic_route_mode=None,
+            w4a16_route_mode="packed",
+            w4a16_tile_config=tile,
+            w4a16_block_size_m=block,
+            w4a16_pipeline_stages=stages,
+        )
+    )
+    plan = moe.plan_execution(
+        experts=experts,
+        capacity=moe.ExecutionCapacity(max_tokens=rows, top_k=1),
+        invocation={"fast_math": False},
+        override=config,
+    )
+    from b12x.moe.fused_moe._tuning import TUNING
+    from b12x.preparation.device import detect_device
+
+    eligible = (
+        {
+            candidate
+            for _, candidate in TUNING.choices(
+                plan.query, detect_device(device).identity
+            )
+        }
+        if racing
+        else {config}
+    )
+    seen = set()
+    reference = moe_reference_w4a16_f32(
+        source,
+        reference_w13,
+        reference_sf13,
+        weights.w13_global_scales,
+        reference_w2,
+        reference_sf2,
+        weights.w2_global_scales,
+        ids,
+        probabilities,
+        domain["E"],
+        domain["K"],
+        domain["n"],
+    )
+
+    def call(state):
+        trial_source = source.clone()
+        storage = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            for spec in state.scratch.scratch_specs()
+        )
+        output = torch.empty_like(source)
+        binding = state.bind(
+            a=trial_source,
+            topk_ids=ids,
+            topk_weights=probabilities,
+            output=output,
+            scratch=storage,
+            input_scales_static=True,
+        )
+        state.run(binding)
+        _check(output, reference)
+        seen.add(state.config)
+        return PreparedCall(
+            run=lambda: state.run(binding),
+            produce=lambda: trial_source.copy_(source),
+            output=output,
+            owners=(storage, binding, trial_source),
+        )
+
+    with PreparationSession(
+        device=device,
+        autotune=racing,
+        compile_workers=4,
+        cache_dir=tmp_path,
+        race_batch=16,
+    ) as session:
+        session.prepare(
+            (plan.request(name="w4a16-config", prepare_call=call, benchmark_call=call),)
+        )
+        assert seen == eligible
+        storage = tuple(
+            torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            for spec in plan.scratch_specs()
+        )
+        output = torch.empty_like(source)
+        session.freeze()
+        for live in (1, rows):
+            binding = moe.bind(
+                plan,
+                a=source[:live],
+                topk_ids=ids[:live],
+                topk_weights=probabilities[:live],
+                output=output[:live],
+                scratch=storage,
+                input_scales_static=True,
+            )
+            graph = torch.cuda.CUDAGraph()
+            with session.capture(), torch.cuda.graph(graph):
+                moe.run(binding=binding)
+            source.neg_()
+            reference = moe_reference_w4a16_f32(
+                source[:live],
+                reference_w13,
+                reference_sf13,
+                weights.w13_global_scales,
+                reference_w2,
+                reference_sf2,
+                weights.w2_global_scales,
+                ids[:live],
+                probabilities[:live],
+                domain["E"],
+                domain["K"],
+                domain["n"],
+            )
+            output.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert (
+                torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+            )
+            _check(output[:live], reference)
+            assert torch.isnan(output[live:]).all()
+            graph.reset()

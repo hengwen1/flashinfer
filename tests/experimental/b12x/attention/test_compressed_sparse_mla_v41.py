@@ -40,7 +40,31 @@ def _prepare_binding(session, plan, bind_args, run_args, output):
             owners=(scratch, binding),
         )
 
-    session.prepare((plan.request(name="compressed-attention", prepare_call=prepare),))
+    def benchmark(state):
+        query = bind_args["q"]
+        trial_query = torch.empty_like(query)
+        (spec,) = state.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=output.device)
+        trial_output = torch.empty_like(output)
+        binding = state.bind_for_preparation(
+            scratch=scratch, **dict(bind_args, q=trial_query)
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding, **run_args, out=trial_output),
+            produce=lambda: trial_query.copy_(query),
+            output=trial_output,
+            owners=(scratch, binding, trial_query, query),
+        )
+
+    session.prepare(
+        (
+            plan.request(
+                name="compressed-attention",
+                prepare_call=prepare,
+                benchmark_call=benchmark,
+            ),
+        )
+    )
     (spec,) = plan.scratch_specs()
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=output.device)
     return compressed_sparse_mla.bind(plan, scratch=scratch, **bind_args), scratch
@@ -73,6 +97,7 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
     mla_session,
     arithmetic="auto",
     rows=19,
+    interior_holes=False,
 ) -> None:
     from b12x.attention._shared.mla.compressed_reference import (
         pack_deepseek_v41_cache_reference,
@@ -118,6 +143,11 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
     logical = torch.arange(width, device=device, dtype=torch.int32).repeat(rows, 1)
     swa_indices = logical + page_size
     logical[:, 100:].fill_(-1)
+    if interior_holes:
+        # An invalid first-half entry must not mask the producer lane's
+        # valid second-half entry in the same 64-record tile.
+        logical[:, 5] = -1
+        swa_indices[:, 17] = -1
     lengths = torch.full((rows,), width, device=device, dtype=torch.int32)
     lengths[0] = 0
     lengths[1] = 65
@@ -330,7 +360,10 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
 @pytest.mark.parametrize(
     "mode,rows", [("decode", 24), ("decode", 32), ("decode", 40), ("extend", 128)]
 )
-def test_v41_bf16_constraint_preserves_packed_cache_and_replay(mode, rows, monkeypatch):
+@pytest.mark.parametrize("interior_holes", [False, True])
+def test_v41_bf16_constraint_preserves_packed_cache_and_replay(
+    mode, rows, monkeypatch, interior_holes
+):
     device = require_sm120()
     with PreparationSession(device=device, autotune=True, compile_workers=2) as session:
         test_v41_heterogeneous_attention_replay_and_live_rows(
@@ -342,13 +375,22 @@ def test_v41_bf16_constraint_preserves_packed_cache_and_replay(mode, rows, monke
             mla_session=session,
             arithmetic="bf16",
             rows=rows,
+            interior_holes=interior_holes,
         )
 
 
-@pytest.mark.parametrize("cache_format", ["deepseek_v4", "deepseek_v41"])
+@pytest.mark.parametrize(
+    "cache_format,arithmetic,interior_holes",
+    [
+        ("deepseek_v4", "auto", False),
+        ("deepseek_v41", "auto", False),
+        ("deepseek_v41", "bf16", False),
+        ("deepseek_v41", "bf16", True),
+    ],
+)
 @torch.inference_mode()
 def test_prepared_compressed_swa_only_matches_bound_recipe(
-    cache_format: str, mla_session
+    cache_format: str, arithmetic: str, interior_holes: bool, mla_session
 ) -> None:
     from b12x.attention._shared.mla.compressed_reference import (
         pack_deepseek_v41_cache_reference,
@@ -358,6 +400,11 @@ def test_prepared_compressed_swa_only_matches_bound_recipe(
     page_size, heads = 64, 8
     q = torch.full((2, heads, 512), 0.125, device=device, dtype=torch.bfloat16)
     kv = torch.linspace(-0.5, 0.75, 64 * 512, device=device).reshape(64, 512).bfloat16()
+    if interior_holes:
+        q.zero_()
+        kv.zero_()
+        kv[0].fill_(1.5)
+        kv[33].fill_(3.0)
     cache = (
         pack_deepseek_v41_cache_reference(kv, page_size=page_size, cache_kind="swa")
         if cache_format == "deepseek_v41"
@@ -366,6 +413,10 @@ def test_prepared_compressed_swa_only_matches_bound_recipe(
         )
     )
     indices = torch.arange(64, device=device, dtype=torch.int32).repeat(2, 1)
+    if interior_holes:
+        indices.fill_(-1)
+        indices[:, 0] = 0
+        indices[:, 33] = 33
     lengths = torch.tensor([64, 0], device=device, dtype=torch.int32)
     expected = compressed_sparse_mla_reference(
         q,
@@ -386,6 +437,7 @@ def test_prepared_compressed_swa_only_matches_bound_recipe(
             swa_width=64,
             indexed_width=0,
             cache_format=cache_format,
+            compute_mode=arithmetic,
         ),
         invocation=compressed_sparse_mla.invocation_from_tensors(
             q=q, swa_k_cache=cache, out=output
@@ -407,6 +459,9 @@ def test_prepared_compressed_swa_only_matches_bound_recipe(
         out=output,
     )
     torch.testing.assert_close(bound_result, expected, atol=0.035, rtol=0.035)
+    if interior_holes:
+        assert torch.equal(bound_result[0], torch.full_like(bound_result[0], 2.25))
+        assert torch.equal(bound_result[1], torch.zeros_like(bound_result[1]))
     with pytest.raises(ValueError, match="cache_format differs"):
         compressed_sparse_mla.run(
             binding=binding,
@@ -417,6 +472,55 @@ def test_prepared_compressed_swa_only_matches_bound_recipe(
             else "deepseek_v41",
             sm_scale=_SM_SCALE,
         )
+
+
+@pytest.mark.parametrize("stream", ["swa", "indexed"])
+@pytest.mark.parametrize(
+    "indices,length,expected",
+    [
+        ([0, -1, 2], 3, 2.25),
+        ([0, 2, -1], 3, 2.25),
+        ([0, 2, 3], 2, 2.25),
+        ([-1, -1, -1], 3, 0.0),
+    ],
+)
+def test_v41_reference_masks_negative_entries_independently(
+    stream, indices, length, expected
+):
+    from b12x.attention._shared.mla.compressed_reference import (
+        pack_deepseek_v41_cache_reference,
+    )
+
+    values = (
+        torch.tensor([1.5, 99, 3, 100], dtype=torch.bfloat16)[:, None]
+        .expand(4, 512)
+        .contiguous()
+    )
+    packed = pack_deepseek_v41_cache_reference(values, page_size=4, cache_kind=stream)
+    selected = torch.tensor([indices], dtype=torch.int32)
+    count = torch.tensor([length], dtype=torch.int32)
+    extra = {}
+    if stream == "indexed":
+        extra = dict(
+            extra_k_cache=packed,
+            extra_indices=selected,
+            extra_topk_lengths=count,
+            extra_page_size=4,
+        )
+        packed = torch.zeros((1, 4 * 528), dtype=torch.uint8)
+        selected = torch.empty((1, 0), dtype=torch.int32)
+        count = torch.zeros(1, dtype=torch.int32)
+    result = compressed_sparse_mla_reference(
+        torch.zeros((1, 1, 512), dtype=torch.bfloat16),
+        packed,
+        selected,
+        count,
+        swa_page_size=4,
+        cache_format="deepseek_v41",
+        sm_scale=_SM_SCALE,
+        **extra,
+    )
+    assert torch.equal(result, torch.full_like(result, expected))
 
 
 @pytest.mark.parametrize("cache_kind,record_bytes", [("swa", 528), ("indexed", 288)])

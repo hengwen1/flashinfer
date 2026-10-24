@@ -32,9 +32,7 @@ from b12x.attention.dsa_indexer.scratch import (
 from b12x.attention.compressed_sparse_mla._scratch import (
     B12XCompressedSparseMLABinding,
     B12XCompressedSparseMLAScratchCaps,
-)
-from b12x.attention.compressed_sparse_mla import (
-    plan as plan_compressed_sparse_mla_scratch,
+    plan_compressed_sparse_mla_scratch,
 )
 from b12x.attention.sparse_mla._scratch import (
     B12XSparseMLABinding,
@@ -845,6 +843,7 @@ def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(
         raise AssertionError("binding path should not stage compressed MLA inputs")
 
     def fake_forward(**kwargs):
+        calls["prepared"] = kwargs["prepared"]
         calls["q_all"] = kwargs["q_all"]
         calls["swa_indices"] = kwargs["swa_indices"]
         calls["swa_lengths"] = kwargs["swa_topk_lengths"]
@@ -859,14 +858,17 @@ def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(
         compressed_sparse_mla_impl, "_use_sm120_sparse_mla", lambda **_: True
     )
     monkeypatch.setattr(
-        compressed_sparse_mla_kernel, "run_unified_decode", fake_forward
+        compressed_sparse_mla_kernel, "run_prepared_unified_decode", fake_forward
     )
 
+    prepared = object()
     out = compressed_sparse_mla_impl.compressed_sparse_mla_decode_forward(
         binding=binding,
         swa_k_cache=swa_cache,
         sm_scale=1.0,
+        prepared=prepared,
     )
+    assert calls["prepared"] is prepared
 
     assert calls["q_all"].data_ptr() == q.data_ptr()
     assert calls["swa_indices"].data_ptr() == swa_indices.data_ptr()

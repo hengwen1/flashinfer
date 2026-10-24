@@ -330,7 +330,17 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
             actual, lse = run(live_binding, output[:live])
             check(actual, lse, live)
         with torch.cuda.graph(graph):
-            actual, lse = run(binding, output)
+            replay_binding = compressed_sparse_mla.bind(
+                plan,
+                scratch=storage,
+                q=q,
+                swa_indices=swa_indices,
+                swa_lengths=lengths,
+                indexed_indices=logical,
+                indexed_lengths=indexed_lengths,
+                indexed_page_table=table,
+            )
+            actual, lse = run(replay_binding, output)
         pointers = (
             output.data_ptr(),
             binding.scratch.final_lse.data_ptr(),
@@ -340,10 +350,16 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
         table[0].copy_(table[0].flip(0))
         lengths[1:].fill_(3)
         indexed_lengths[1:].fill_(7)
+        # Prepared decode and merge specialize these values. Rebinding a
+        # shared scratch range must neither read nor initialize carrier words.
+        binding.scratch.kv_chunk_size_ptr.fill_(-374)
+        binding.scratch.num_chunks_ptr.fill_(937)
         output.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize(device)
         check(actual, lse, rows)
+        assert binding.scratch.kv_chunk_size_ptr.item() == -374
+        assert binding.scratch.num_chunks_ptr.item() == 937
         assert pointers == (
             output.data_ptr(),
             binding.scratch.final_lse.data_ptr(),

@@ -236,12 +236,11 @@ class B12XCompressedSparseMLAScratch:
             raise RuntimeError(
                 "compressed MLA scratch is missing split-control tensors"
             )
-        if self.kv_chunk_size_value != int(kv_chunk_size):
-            self.kv_chunk_size_ptr.fill_(int(kv_chunk_size))
-            self.kv_chunk_size_value = int(kv_chunk_size)
-        if self.num_chunks_value != int(num_chunks):
-            self.num_chunks_ptr.fill_(int(num_chunks))
-            self.num_chunks_value = int(num_chunks)
+        # Compressed decode and prefill own prepared launches. Decode's merge
+        # specializes its split count, so neither carrier word is read on the
+        # GPU. Rebinding shared scratch must not initialize unused controls.
+        self.kv_chunk_size_value = int(kv_chunk_size)
+        self.num_chunks_value = int(num_chunks)
 
     def bind(
         self,

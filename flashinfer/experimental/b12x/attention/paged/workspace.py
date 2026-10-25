@@ -1622,7 +1622,9 @@ class PagedAttentionWorkspace:
             relative_attention_bias=relative_attention_bias,
         )
 
-    def _validate_q2k_indices_reference(self, q2k_indices: torch.Tensor | None) -> None:
+    def _validate_q2k_indices_reference(
+        self, q2k_indices: torch.Tensor | None, *, query_rows: int
+    ) -> None:
         if q2k_indices is not None:
             raise ValueError(
                 "q2k_indices are only supported by MSA block-sparse scratch bindings"

@@ -1400,6 +1400,8 @@ class B12XPagedAttentionScratch:
     def _validate_q2k_indices_reference(
         self,
         q2k_indices: torch.Tensor | None,
+        *,
+        query_rows: int,
     ) -> None:
         if not self.msa_block_sparse:
             if q2k_indices is not None:
@@ -1419,9 +1421,7 @@ class B12XPagedAttentionScratch:
         if q2k_indices.dtype != torch.int32:
             raise TypeError("q2k_indices must be a torch.int32 tensor")
         if q2k_indices.ndim != 3:
-            raise ValueError(
-                "q2k_indices must have shape [kv_heads, total_q_capacity, 16]"
-            )
+            raise ValueError("q2k_indices must have shape [kv_heads, query_rows, 16]")
         if not q2k_indices.is_contiguous():
             raise ValueError("q2k_indices must be contiguous")
         if (
@@ -1430,11 +1430,11 @@ class B12XPagedAttentionScratch:
         ):
             raise ValueError(
                 "q2k_indices must have shape "
-                f"({self.num_kv_heads}, >=total_q_capacity, 16), got {tuple(q2k_indices.shape)}"
+                f"({self.num_kv_heads}, >=query_rows, 16), got {tuple(q2k_indices.shape)}"
             )
-        if int(q2k_indices.shape[1]) < self.total_q_capacity:
+        if int(q2k_indices.shape[1]) < query_rows:
             raise ValueError(
-                "q2k_indices total_q_capacity is smaller than scratch total_q_capacity"
+                "q2k_indices total_q_capacity is smaller than the query tensor"
             )
         data_ptr = int(q2k_indices.data_ptr())
         if self._q2k_indices_data_ptr is None:
@@ -1600,7 +1600,7 @@ def build_paged_attention_binding(
         )
     elif not scratch.prepared:
         raise RuntimeError("paged attention binding requires prepared scratch metadata")
-    scratch._validate_q2k_indices_reference(q2k_indices)
+    scratch._validate_q2k_indices_reference(q2k_indices, query_rows=int(q.shape[0]))
 
     return B12XPagedAttentionBinding(
         scratch=scratch,
@@ -2537,9 +2537,18 @@ def make_compile_bindings(
     page_table = tensors["page_table"]
     if len(q.shape) != 3 or len(page_table.shape) != 2:
         raise ValueError("paged compile operand ranks do not match the native ABI")
+    planning_q = q
+    # Compile replay metadata for the schedule envelope, retaining physical tensor bindings.
+    if caps.use_cuda_graph and caps.mode == "verify":
+        planning_q = _CompileTensor(
+            shape=(caps.max_total_q, *q.shape[1:]),
+            strides=q.strides,
+            dtype=q.dtype,
+            device=q.device,
+        )
     q_lengths, cache_lengths = _compile_lengths(
         caps=caps,
-        total_q=int(q.shape[0]),
+        total_q=int(planning_q.shape[0]),
         batch=int(page_table.shape[0]),
         invocation=invocation,
     )
@@ -2554,7 +2563,7 @@ def make_compile_bindings(
                 q_lengths
             )
     plan = create_paged_plan(
-        q,
+        planning_q,
         tensors["k_cache"],
         tensors["v_cache"],
         page_table,
@@ -2624,7 +2633,7 @@ def make_compile_bindings(
             fake((layout.nbytes,), torch.uint8),
             layout,
             plan=plan,
-            plan_q=fake_view(q),
+            plan_q=fake_view(planning_q),
             plan_output=fake_view(tensors["output"]),
             plan_k_cache=fake_view(tensors["k_cache"]),
             plan_v_cache=fake_view(tensors["v_cache"]),

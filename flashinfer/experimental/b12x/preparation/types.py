@@ -397,6 +397,11 @@ class PreparedCall:
     A benchmark call must return without waiting for device work or using
     unjoined side streams. Reset and activation production run before its gate.
     ``capture_safe`` describes caller capture support, not the timing method.
+
+    Prepare-call factories construct bindings and resources even when the
+    session disables priming. Only ``reset``, ``produce``, and ``run`` are
+    skipped; ``restore`` releases call-only resources after publication, and
+    ``owners`` and ``close`` remain attached to the plan until release.
     """
 
     run: Callable[[], object]

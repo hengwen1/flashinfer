@@ -844,20 +844,25 @@ def paged_attention_forward(
         and getattr(workspace, "mode", None) == "decode"
         and getattr(workspace, "_decode_graph_chunk_pages_lut", None) is not None
     )
-    capacity_extend_graph = (
+    capacity_prefill_graph = (
         getattr(workspace, "fixed_capacity", False)
         and getattr(workspace, "use_cuda_graph", False)
-        and getattr(workspace, "mode", None) == "extend"
+        and getattr(workspace, "mode", None) in ("extend", "verify")
     )
     if exact_decode_graph_bucket and int(q.shape[0]) != int(plan.total_q):
         raise ValueError(
             "decode graph q total_q must exactly match the prepared bucket: "
             f"got {int(q.shape[0])}, expected {int(plan.total_q)}"
         )
-    if capacity_extend_graph and not (0 < int(q.shape[0]) <= int(plan.total_q)):
+    query_capacity = (
+        workspace.total_q_capacity
+        if capacity_prefill_graph and workspace.mode == "verify"
+        else int(plan.total_q)
+    )
+    if capacity_prefill_graph and not (0 < int(q.shape[0]) <= query_capacity):
         raise ValueError(
-            "extend graph q total_q must be within the prepared capacity: "
-            f"got {int(q.shape[0])}, capacity {int(plan.total_q)}"
+            "prefill graph q total_q must be within the prepared capacity: "
+            f"got {int(q.shape[0])}, capacity {query_capacity}"
         )
     if k_descale is not None and k_descale.ndim == 2 and int(k_descale.shape[1]) == 1:
         source = k_descale[:, 0]
@@ -891,7 +896,9 @@ def paged_attention_forward(
             f"got {int(output.shape[0])}, expected {int(plan.total_q)}"
         )
     required_output_rows = (
-        int(q.shape[0]) if capacity_extend_graph else int(plan.total_q)
+        min(int(q.shape[0]), int(plan.total_q))
+        if capacity_prefill_graph
+        else int(plan.total_q)
     )
     if int(output.shape[0]) < required_output_rows:
         raise ValueError(
@@ -940,9 +947,9 @@ def paged_attention_forward(
                 "q2k_indices must have shape "
                 f"({plan.num_kv_heads}, >=total_q, 16), got {tuple(q2k_indices.shape)}"
             )
-        if int(q2k_indices.shape[1]) < int(plan.total_q):
+        if int(q2k_indices.shape[1]) < int(q.shape[0]):
             raise ValueError(
-                "q2k_indices total_q_capacity is smaller than active total_q"
+                "q2k_indices total_q_capacity is smaller than the query tensor"
             )
     elif q2k_indices is not None:
         raise ValueError("q2k_indices can only be supplied for MSA block-sparse plans")
@@ -1657,7 +1664,11 @@ def paged_attention_forward(
                     ),
                 )
             run_compiled(_launchers.merge, (*merge_args, stream))
-            rows = int(q.shape[0]) if capacity_extend_graph else plan.total_q
+            rows = (
+                min(int(q.shape[0]), int(plan.total_q))
+                if capacity_prefill_graph
+                else plan.total_q
+            )
             return output.narrow(0, 0, rows), workspace.lse.narrow(
                 1, 0, rows
             ).transpose(0, 1)
@@ -1844,8 +1855,8 @@ def paged_attention_forward(
                 runtime_args=(*merge_args, stream),
             )
 
-    if capacity_extend_graph:
-        active_rows = int(q.shape[0])
+    if capacity_prefill_graph:
+        active_rows = min(int(q.shape[0]), int(plan.total_q))
         return (
             output.narrow(0, 0, active_rows),
             workspace.lse.narrow(1, 0, active_rows).transpose(0, 1),

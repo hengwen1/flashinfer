@@ -278,8 +278,20 @@ class B12XCompressedSparseMLABinding:
     plan: Plan | None = None
 
 
+def _mapped_index_width(caps, execution_config):
+    if (
+        caps.cache_format == "deepseek_v41"
+        and execution_config is not None
+        and not execution_config.single_pass
+        and execution_config.v41_compute_mode == "bf16"
+    ):
+        return 0
+    return int(caps.indexed_width)
+
+
 def _compressed_sparse_mla_scratch_layout(
     caps: B12XCompressedSparseMLAScratchCaps,
+    execution_config: object | None = None,
 ) -> _B12XCompressedSparseMLAScratchLayout:
     max_total_q = max(int(caps.max_q_rows), 1)
     max_chunks_per_row = max(int(caps.max_chunks_per_row), 1)
@@ -322,7 +334,11 @@ def _compressed_sparse_mla_scratch_layout(
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     mapped_indices_offset_bytes = cursor
-    cursor += max_total_q * int(caps.indexed_width) * dtype_nbytes(torch.int32)
+    cursor += (
+        max_total_q
+        * _mapped_index_width(caps, execution_config)
+        * dtype_nbytes(torch.int32)
+    )
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
 
     return _B12XCompressedSparseMLAScratchLayout(
@@ -452,7 +468,7 @@ def _materialize_compressed_sparse_mla_scratch(
     mapped_indices, _ = materialize_scratch_view(
         scratch_storage,
         offset_bytes=layout.mapped_indices_offset_bytes,
-        shape=(max_total_q, int(caps.indexed_width)),
+        shape=(max_total_q, _mapped_index_width(caps, execution_config)),
         dtype=torch.int32,
     )
     sm_scale_tensor, _ = materialize_scratch_view(
@@ -759,7 +775,7 @@ def plan_compressed_sparse_mla_scratch(
         execution_config, "max_chunks_per_row", None
     ):
         raise ValueError("caps.max_chunks_per_row must match execution_config")
-    layout = _compressed_sparse_mla_scratch_layout(caps)
+    layout = _compressed_sparse_mla_scratch_layout(caps, execution_config)
     return B12XCompressedSparseMLAScratchPlan(
         caps=caps,
         layout=layout,

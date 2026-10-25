@@ -695,6 +695,56 @@ class UnifiedDecodeKernel:
             stream=stream,
         )
 
+    @cute.jit
+    def call_mapped_extra_pertok(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        latent_scale: Float32,
+        topk_length: cute.Tensor,  # (rows,) int32 per-token MAIN valid length
+        stride_kv_block: Int64,
+        extra_kv_cache_u8: cute.Tensor,
+        extra_indices: cute.Tensor,
+        extra_topk_length: cute.Tensor,  # (rows,) int32 per-token EXTRA valid length
+        num_main_chunks: Int32,  # ceil(MAX main_len/BI); chunks >= this read EXTRA
+        stride_extra_kv_block: Int64,
+        indexed_page_table: cute.Tensor,
+        table_width: Int32,
+        table_stride: Int64,
+        indexed_num_pages: Int64,
+        num_tokens: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel_mapped_extra_pertok(
+            q_all,
+            kv_cache_u8,
+            swa_indices,
+            mid_out,
+            mid_lse,
+            sm_scale_log2,
+            latent_scale,
+            topk_length,
+            stride_kv_block,
+            extra_kv_cache_u8,
+            extra_indices,
+            extra_topk_length,
+            num_main_chunks,
+            stride_extra_kv_block,
+            indexed_page_table,
+            table_width,
+            table_stride,
+            indexed_num_pages,
+        ).launch(
+            grid=(num_tokens, self.h_blocks, self.num_splits),
+            block=[self.block_threads, 1, 1],
+            min_blocks_per_mp=1,
+            stream=stream,
+        )
+
     @cute.kernel
     def kernel(
         self,
@@ -857,6 +907,53 @@ class UnifiedDecodeKernel:
             per_token_len=True,
         )
 
+    @cute.kernel
+    def kernel_mapped_extra_pertok(
+        self,
+        q_all: cute.Tensor,
+        kv_cache_u8: cute.Tensor,
+        swa_indices: cute.Tensor,
+        mid_out: cute.Tensor,
+        mid_lse: cute.Tensor,
+        sm_scale_log2: Float32,
+        latent_scale: Float32,
+        topk_length: cute.Tensor,
+        stride_kv_block: Int64,
+        extra_kv_cache_u8: cute.Tensor,
+        extra_indices: cute.Tensor,
+        extra_topk_length: cute.Tensor,
+        num_main_chunks: Int32,
+        stride_extra_kv_block: Int64,
+        indexed_page_table: cute.Tensor,
+        table_width: Int32,
+        table_stride: Int64,
+        indexed_num_pages: Int64,
+    ):
+        self._kernel_body(
+            q_all,
+            kv_cache_u8,
+            swa_indices,
+            mid_out,
+            mid_lse,
+            sm_scale_log2,
+            latent_scale,
+            Int32(0),
+            stride_kv_block,
+            extra_kv_cache_u8,
+            extra_indices,
+            Int32(0),
+            num_main_chunks,
+            stride_extra_kv_block,
+            topk_length,
+            extra_topk_length,
+            has_extra=True,
+            per_token_len=True,
+            mapping_page_table=indexed_page_table,
+            mapping_table_width=table_width,
+            mapping_table_stride=table_stride,
+            mapping_num_pages=indexed_num_pages,
+        )
+
     @cute.jit
     def _kernel_body(
         self,
@@ -879,6 +976,10 @@ class UnifiedDecodeKernel:
         *,
         has_extra: cutlass.Constexpr,
         per_token_len: cutlass.Constexpr,
+        mapping_page_table=None,
+        mapping_table_width: Int32 = 0,
+        mapping_table_stride: Int64 = 0,
+        mapping_num_pages: Int64 = 0,
     ):
         t = self.traits
         L = self.layout
@@ -1283,6 +1384,12 @@ class UnifiedDecodeKernel:
                                 stride_extra_kv_block,
                                 io_lane,
                                 dsv41_swa=False,
+                                mapping_page_table=mapping_page_table,
+                                mapping_table_width=mapping_table_width,
+                                mapping_table_offset=Int64(token_idx)
+                                * mapping_table_stride,
+                                mapping_num_pages=mapping_num_pages,
+                                mapping_page_size=self.pbs_extra,
                                 **io_kw,
                             )
                     else:
@@ -1850,6 +1957,12 @@ class UnifiedDecodeKernel:
                         sm_p_full_addr=sm_p_full_addr,
                         sm_p_stride=L.sm_p_full_stride,
                         latent_scale_per_token=t.latent_scale_per_token,
+                        known_swa=(
+                            (ci < num_main_chunks if has_extra else Int32(1))
+                            if t.model_type == ModelType.DSV41
+                            and not self.native_dsv41_fp8
+                            else None
+                        ),
                         w_fp8_bufs=L.w_fp8_bufs,
                     )
 
@@ -2101,6 +2214,8 @@ def _sparse_mla_decode_grid_flat_launch(
     native_dsv4_h16_override: bool | None = None,
     native_dsv41_fp8_override: bool | None = None,
     vector_q_override: bool | None = None,
+    indexed_page_table: torch.Tensor | None = None,
+    indexed_num_pages: int = 0,
     _prepared=None,
 ) -> None:
     q_head_dim = int(q_all.shape[-1])
@@ -2211,6 +2326,39 @@ def _sparse_mla_decode_grid_flat_launch(
         else:
             args = base_args + (Int32(rows), stream)
 
+    fused_mapping = (
+        int(model_type) == int(ModelType.DSV41)
+        and bool(has_extra)
+        and bool(per_token_len)
+        and not bool(v41_fp8_internal)
+    )
+    if fused_mapping:
+        if indexed_page_table is None:
+            table_flat = extra_indices_t.view(-1)
+            table_width, table_stride = -1, 0
+        else:
+            table_width, table_stride = (
+                int(indexed_page_table.shape[1]),
+                int(indexed_page_table.stride(0)),
+            )
+            table_flat = (
+                extra_indices_t.view(-1)
+                if table_width == 0
+                else indexed_page_table.as_strided((table_width,), (1,))
+                if table_stride == 0
+                else indexed_page_table.view(-1)
+            )
+        args = (
+            args[:-2]
+            + (
+                _to_cute(table_flat, cutlass.Int32, align=4, dynamic_layout=True),
+                Int32(table_width),
+                Int64(table_stride),
+                Int64(indexed_num_pages),
+            )
+            + args[-2:]
+        )
+
     # A published launch already owns the exact executable.  Its runtime ABI is
     # the pointer/scalar tuple above; do not rebuild traits, layouts, kernels, or
     # compile keys on serving replay.
@@ -2294,6 +2442,7 @@ def _sparse_mla_decode_grid_flat_launch(
         key_field("pbs_extra", int(pbs_extra)),
         key_field("extra_topk_bucket", _topk_bucket(extra_topk) if has_extra else 0),
         key_field("per_token_len", int(per_token_len)),
+        key_field("fused_mapping", int(fused_mapping)),
         key_field("native_glm_h8", int(native_glm_h8)),
         key_field("native_dsv4_h8", int(native_dsv4_h8)),
         key_field("native_dsv4_h16", int(native_dsv4_h16)),
@@ -2388,7 +2537,9 @@ def _sparse_mla_decode_grid_flat_launch(
         ),
         *spec_fields,
     )
-    if per_token_len:
+    if fused_mapping:
+        entry = kernel.call_mapped_extra_pertok
+    elif per_token_len:
         entry = kernel.call_extra_pertok if has_extra else kernel.call_pertok
     else:
         entry = kernel.call_extra if has_extra else kernel
@@ -2819,7 +2970,12 @@ def run_unified_decode(
     # raw-slot-id only; no page-table indirection). RAISE, not fallback. Checked
     # BEFORE the has_extra branch so a mapped page table passed WITHOUT the extra
     # trio is still a hard error (never silently ignored / silently routed).
-    if indexed_page_table is not None:
+    if indexed_page_table is not None and (
+        not has_extra
+        or prepared is None
+        or prepared.traits.model_type != ModelType.DSV41
+        or prepared.native_dsv41_fp8
+    ):
         raise ValueError(
             "SM120 sparse MLA decode: indexed_page_table (mapped extra pages) is "
             "unsupported on SM120 sparse-MLA; upstream addresses the extra cache "
@@ -3313,6 +3469,8 @@ def run_unified_decode(
                 if prepared is None
                 else prepared.native_dsv41_fp8,
                 vector_q_override=None if prepared is None else prepared.vector_q,
+                indexed_page_table=indexed_page_table,
+                indexed_num_pages=int(indexed_k_cache.shape[0]) if has_extra else 0,
                 _prepared=prepared_program,
             )
             if resolved_programs is not None:

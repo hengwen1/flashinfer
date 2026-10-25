@@ -487,6 +487,8 @@ def _lower_indexed_mapper(
 ) -> object | None:
     if query.cache_format != "deepseek_v41" or not query.indexed_cache_present:
         return None
+    if not config.single_pass and config.v41_compute_mode == "bf16":
+        return None
     from b12x.attention.compressed_sparse_mla._metadata import map_indexed_pages
 
     with (

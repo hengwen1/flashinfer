@@ -480,3 +480,192 @@ def test_v41_cache_width_is_source_specific(cache_kind, record_bytes) -> None:
             cache_format="deepseek_v41",
             cache_kind="indexed" if cache_kind == "swa" else "swa",
         )
+
+
+@pytest.mark.parametrize("width", [128, 2048])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("row_shared", [False, True])
+@torch.inference_mode()
+def test_v41_mapped_decode_replay_rejects_invalid_slots(
+    page_size, row_shared, width, mla_session
+):
+    from b12x.attention._shared.mla.compressed_reference import (
+        pack_deepseek_v41_cache_reference,
+    )
+
+    device = require_sm120()
+    rows, heads = 3, 16
+    generator = torch.Generator(device=device).manual_seed(4100)
+    q = (
+        torch.randn((rows, heads, 512), device=device, generator=generator) * 0.2
+    ).bfloat16()
+    values = (
+        torch.randn((3 * page_size, 512), device=device, generator=generator) * 0.2
+    ).bfloat16()
+    indexed = pack_deepseek_v41_cache_reference(
+        values, page_size=page_size, cache_kind="indexed"
+    )
+    swa = pack_deepseek_v41_cache_reference(values[:64], page_size=64, cache_kind="swa")
+    indexed_snapshot, swa_snapshot = indexed.clone(), swa.clone()
+    swa_indices = torch.full((rows, 64), -1, device=device, dtype=torch.int32)
+    swa_lengths = torch.zeros((rows,), device=device, dtype=torch.int32)
+    pattern = torch.tensor(
+        [
+            0,
+            page_size - 1,
+            page_size,
+            2 * page_size - 1,
+            2 * page_size,
+            2147483647,
+            -1,
+            -2147483648,
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    indices = pattern.repeat(rows, width // pattern.numel())
+    lengths = torch.tensor([width, 7, 0], device=device, dtype=torch.int32)
+    table = torch.tensor([[1, 2]], device=device, dtype=torch.int32)
+    table = table.expand(rows, -1) if row_shared else table.repeat(rows, 1)
+    output = torch.empty_like(q)
+    plan = compressed_sparse_mla.plan(
+        compressed_sparse_mla.Caps(
+            device=q.device,
+            num_q_heads=heads,
+            max_q_rows=rows,
+            max_width=64 + width,
+            swa_width=64,
+            indexed_width=width,
+            max_page_table_width=2,
+            swa_page_size=64,
+            indexed_page_size=page_size,
+            cache_format="deepseek_v41",
+            compute_mode="bf16",
+            mode="decode",
+        ),
+        invocation=compressed_sparse_mla.invocation_from_tensors(
+            q=q, swa_k_cache=swa, indexed_k_cache=indexed, out=output
+        ),
+    )
+    bind_args = dict(
+        q=q,
+        swa_indices=swa_indices,
+        swa_lengths=swa_lengths,
+        indexed_indices=indices,
+        indexed_lengths=lengths,
+        indexed_page_table=table,
+    )
+    run_args = dict(
+        swa_k_cache=swa,
+        swa_page_size=64,
+        indexed_k_cache=indexed,
+        indexed_page_size=page_size,
+        sm_scale=_SM_SCALE,
+    )
+    binding, storage = _prepare_binding(mla_session, plan, bind_args, run_args, output)
+    mla_session.freeze()
+
+    def expected_slots(physical):
+        # The reference consumes valid prefixes; compact masked holes in source order.
+        compact = torch.full_like(physical, -1)
+        counts = torch.empty_like(lengths)
+        for row in range(rows):
+            limit = max(0, min(width, int(lengths[row].item())))
+            slots = physical[row, :limit]
+            slots = slots[slots >= 0]
+            count = int(slots.numel())
+            compact[row, :count].copy_(slots)
+            counts[row] = count
+        return compressed_sparse_mla_reference(
+            q,
+            swa,
+            swa_indices,
+            swa_lengths,
+            extra_k_cache=indexed,
+            extra_indices=compact,
+            extra_topk_lengths=counts,
+            swa_page_size=64,
+            extra_page_size=page_size,
+            cache_format="deepseek_v41",
+            sm_scale=_SM_SCALE,
+        )
+
+    def expected():
+        logical = indices.long()
+        page = logical // page_size
+        pid = table.long().gather(1, page.clamp(0, 1))
+        valid = (
+            (logical >= 0)
+            & (page < table.shape[1])
+            & (pid >= 0)
+            & (pid < indexed.shape[0])
+        )
+        physical = torch.where(valid, pid * page_size + logical % page_size, -1).int()
+        return expected_slots(physical)
+
+    def run(bound):
+        return compressed_sparse_mla.run(binding=bound, out=output, **run_args)
+
+    run(binding)
+    torch.testing.assert_close(output, expected(), atol=0.035, rtol=0.035)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run(binding)
+        for (first, second), live_lengths in zip(
+            [(-1, indexed.shape[0]), (2, 2147483647), (1, 0)],
+            [(width, 7, 0), (65, 0, width - 1), (width, width // 2 + 3, 0)],
+            strict=True,
+        ):
+            table[0].copy_(
+                torch.tensor([first, second], device=device, dtype=torch.int32)
+            )
+            if not row_shared:
+                table[1:].copy_(table[0])
+            lengths.copy_(torch.tensor(live_lengths, device=device, dtype=torch.int32))
+            output.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(output, expected(), atol=0.035, rtol=0.035)
+    finally:
+        graph.reset()
+    empty_binding = compressed_sparse_mla.bind(
+        plan, scratch=storage, **(bind_args | {"indexed_page_table": table[:, :0]})
+    )
+    run(empty_binding)
+    assert output.eq(0).all()
+
+    indices.copy_(
+        (
+            torch.arange(width, device=device, dtype=torch.int32)
+            % (indexed.shape[0] * page_size)
+        ).expand(rows, -1)
+    )
+    indices[:, 3::8].fill_(-1)
+    physical_binding = compressed_sparse_mla.bind(
+        plan, scratch=storage, **(bind_args | {"indexed_page_table": None})
+    )
+
+    def physical_expected():
+        return expected_slots(indices)
+
+    run(physical_binding)
+    assert output.ne(0).any(), "physical slots must contribute indexed values"
+    torch.testing.assert_close(output, physical_expected(), atol=0.035, rtol=0.035)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run(physical_binding)
+        indices.copy_(indices.flip(1))
+        output.fill_(float("nan"))
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+        torch.testing.assert_close(output, physical_expected(), atol=0.035, rtol=0.035)
+    finally:
+        graph.reset()
+    assert torch.equal(indexed, indexed_snapshot)
+    assert torch.equal(swa, swa_snapshot)

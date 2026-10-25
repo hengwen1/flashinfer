@@ -49,6 +49,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
 
+from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -884,6 +885,72 @@ def s1_qk_nope_block_scaled(
 
 
 @cute.jit
+def _s1_qk_dsv41_source(
+    qk,
+    q_nope_bf16_base_addr: Int32,
+    kv_fp4_base_addr: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    valid: cutlass.Boolean,
+    *,
+    num_scales: cutlass.Constexpr,
+    quant_tile: cutlass.Constexpr,
+    q_nope_bf16_stride: cutlass.Constexpr,
+    swa: cutlass.Constexpr,
+):
+    """Run the QK K-loop for one invariant packed source format."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    kv_gid_row = warp_first_cand + gid
+    for blk in cutlass.range_constexpr(num_scales):
+        swa_scales = []
+        if cutlass.const_expr(swa and quant_tile % 32 == 0):
+            for sg in cutlass.range_constexpr(quant_tile // 32):
+                scale = Uint32(0)
+                if valid:
+                    scale = _ld_u8_zext(
+                        kv_fp4_base_addr + kv_gid_row * Int32(544),
+                        Int32(512 + blk * (quant_tile // 32) + sg),
+                    )
+                swa_scales.append(scale)
+        for ks in cutlass.range_constexpr(quant_tile // 16):
+            ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
+            b0, b1 = Uint32(0), Uint32(0)
+            if valid:
+                if cutlass.const_expr(swa and quant_tile % 32 == 0):
+                    b0, b1 = _dsv41_qk_bfloat2x2_source(
+                        kv_fp4_base_addr,
+                        kv_gid_row,
+                        ko + tid * Int32(2),
+                        swa=swa,
+                        scale=swa_scales[ks // 2],
+                    )
+                else:
+                    b0, b1 = _dsv41_qk_bfloat2x2_source(
+                        kv_fp4_base_addr, kv_gid_row, ko + tid * Int32(2), swa=swa
+                    )
+            a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                _smem_byte(q_nope_bf16_base_addr, a_byte)
+            )
+            qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+                qk[0],
+                qk[1],
+                qk[2],
+                qk[3],
+                a0,
+                a1,
+                a2,
+                a3,
+                b0,
+                b1,
+            )
+    return qk[0], qk[1], qk[2], qk[3]
+
+
+@cute.jit
 def s1_qk_nope_nvfp4_bf16(
     qk,
     q_nope_bf16_base_addr: Int32,
@@ -917,23 +984,105 @@ def s1_qk_nope_nvfp4_bf16(
     if cutlass.const_expr(latent_scale_per_token):
         latent_scale = ld_shared_f32(kv_sc_base_addr + kv_gid_row * Int32(4))
 
+    if cutlass.const_expr(kv_smem_stride == 544):
+        tag = ld_shared_u32(kv_fp4_base_addr + kv_gid_row * Int32(544) + Int32(528)).to(
+            Int32
+        )
+        q0, q1, q2, q3 = qk[0], qk[1], qk[2], qk[3]
+        swa_warp = cute.arch.vote_all_sync((tag == Int32(1)) | (tag == Int32(2)))
+        indexed_warp = cute.arch.vote_all_sync((tag == Int32(0)) | (tag == Int32(2)))
+        if swa_warp:
+            q0, q1, q2, q3 = _s1_qk_dsv41_source(
+                [q0, q1, q2, q3],
+                q_nope_bf16_base_addr,
+                kv_fp4_base_addr,
+                warp_first_cand,
+                lane,
+                tag != Int32(2),
+                num_scales=num_scales,
+                quant_tile=quant_tile,
+                q_nope_bf16_stride=q_nope_bf16_stride,
+                swa=True,
+            )
+        elif indexed_warp:
+            q0, q1, q2, q3 = _s1_qk_dsv41_source(
+                [q0, q1, q2, q3],
+                q_nope_bf16_base_addr,
+                kv_fp4_base_addr,
+                warp_first_cand,
+                lane,
+                tag != Int32(2),
+                num_scales=num_scales,
+                quant_tile=quant_tile,
+                q_nope_bf16_stride=q_nope_bf16_stride,
+                swa=False,
+            )
+        else:
+            for blk in cutlass.range_constexpr(num_scales):
+                for ks in cutlass.range_constexpr(quant_tile // 16):
+                    ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
+                    if cutlass.const_expr(kv_smem_stride == 544):
+                        b0, b1 = _dsv41_qk_bfloat2x2(
+                            kv_fp4_base_addr, kv_gid_row, ko + tid * Int32(2)
+                        )
+                    else:
+                        b0 = _nvfp4_pair_bfloat2(
+                            kv_fp4_base_addr,
+                            kv_gid_row,
+                            ko + tid * Int32(2),
+                            latent_scale,
+                            kv_smem_stride=kv_smem_stride,
+                        )
+                        b1 = _nvfp4_pair_bfloat2(
+                            kv_fp4_base_addr,
+                            kv_gid_row,
+                            ko + tid * Int32(2) + Int32(8),
+                            latent_scale,
+                            kv_smem_stride=kv_smem_stride,
+                        )
+                    a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (
+                        ko + a_col
+                    ) * Int32(2)
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                        _smem_byte(q_nope_bf16_base_addr, a_byte)
+                    )
+                    q0, q1, q2, q3 = mma_m16n8k16_f32_bf16(
+                        q0,
+                        q1,
+                        q2,
+                        q3,
+                        a0,
+                        a1,
+                        a2,
+                        a3,
+                        b0,
+                        b1,
+                    )
+        qk[0], qk[1], qk[2], qk[3] = q0, q1, q2, q3
+        return qk
+
     for blk in cutlass.range_constexpr(num_scales):
         for ks in cutlass.range_constexpr(quant_tile // 16):
             ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
-            b0 = _nvfp4_pair_bfloat2(
-                kv_fp4_base_addr,
-                kv_gid_row,
-                ko + tid * Int32(2),
-                latent_scale,
-                kv_smem_stride=kv_smem_stride,
-            )
-            b1 = _nvfp4_pair_bfloat2(
-                kv_fp4_base_addr,
-                kv_gid_row,
-                ko + tid * Int32(2) + Int32(8),
-                latent_scale,
-                kv_smem_stride=kv_smem_stride,
-            )
+            if cutlass.const_expr(kv_smem_stride == 544):
+                b0, b1 = _dsv41_qk_bfloat2x2(
+                    kv_fp4_base_addr, kv_gid_row, ko + tid * Int32(2)
+                )
+            else:
+                b0 = _nvfp4_pair_bfloat2(
+                    kv_fp4_base_addr,
+                    kv_gid_row,
+                    ko + tid * Int32(2),
+                    latent_scale,
+                    kv_smem_stride=kv_smem_stride,
+                )
+                b1 = _nvfp4_pair_bfloat2(
+                    kv_fp4_base_addr,
+                    kv_gid_row,
+                    ko + tid * Int32(2) + Int32(8),
+                    latent_scale,
+                    kv_smem_stride=kv_smem_stride,
+                )
             a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
             a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
                 _smem_byte(q_nope_bf16_base_addr, a_byte)
@@ -1449,6 +1598,101 @@ def _bf16x2_extract_lane_u16(packed: Uint32, lane: Int32) -> Uint32:
     return (packed >> sh.to(Uint32)) & Uint32(0xFFFF)
 
 
+@dsl_user_op
+def _mixed_pairs_to_bf16x2_sm120(
+    packed0: Uint32,
+    packed1: Uint32,
+    scale: Uint32,
+    *,
+    swa: bool,
+    loc=None,
+    ip=None,
+):
+    """Decode two pairs sharing one native scale without duplicating conversion."""
+    value_type = "e4m3x2" if swa else "e2m1x2"
+    source_bits = 16 if swa else 8
+    scale_type = "ue8m0x2" if swa else "e4m3x2"
+    result = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32, i32)>"),
+        [
+            Uint32(packed0).ir_value(loc=loc, ip=ip),
+            Uint32(packed1).ir_value(loc=loc, ip=ip),
+            Uint32(scale).ir_value(loc=loc, ip=ip),
+        ],
+        f"""
+        {{
+            .reg .b{source_bits} q0, q1;
+            .reg .b16 sf;
+            .reg .b32 v0, v1, factors, sf_pair;
+            cvt.u{source_bits}.u32 q0, $2;
+            cvt.u{source_bits}.u32 q1, $3;
+            cvt.rn.bf16x2.{value_type} v0, q0;
+            cvt.rn.bf16x2.{value_type} v1, q1;
+            shl.b32 sf_pair, $4, 8;
+            or.b32 sf_pair, $4, sf_pair;
+            cvt.u16.u32 sf, sf_pair;
+            cvt.rn.bf16x2.{scale_type} factors, sf;
+            mul.bf16x2 $0, v0, factors;
+            mul.bf16x2 $1, v1, factors;
+        }}
+        """,
+        "=r,=r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
+    )
+
+
+@cute.jit
+def _dsv41_qk_bfloat2x2_source(
+    base: Int32,
+    entry: Int32,
+    dim_even: Int32,
+    *,
+    swa: cutlass.Constexpr,
+    scale: Uint32 = None,
+):
+    """Decode a pair tile after selecting its packed source format."""
+    row = base + entry * Int32(544)
+    if cutlass.const_expr(swa):
+        p0 = _ld_u16_zext(row, dim_even)
+        p1 = _ld_u16_zext(row, dim_even + Int32(8))
+        if cutlass.const_expr(scale is None):
+            scale = _ld_u8_zext(row, Int32(512) + dim_even // Int32(32))
+        b0, b1 = _mixed_pairs_to_bf16x2_sm120(p0, p1, scale, swa=True)
+    else:
+        p0 = _ld_u8_zext(row, dim_even // Int32(2))
+        p1 = _ld_u8_zext(row, dim_even // Int32(2) + Int32(4))
+        scale = _ld_u8_zext(row, Int32(256) + dim_even // Int32(16))
+        b0, b1 = _mixed_pairs_to_bf16x2_sm120(p0, p1, scale, swa=False)
+    return b0, b1
+
+
+@cute.jit
+def _dsv41_qk_bfloat2x2(base: Int32, entry: Int32, dim_even: Int32):
+    """Decode QK's pairs eight dimensions apart with one shared scale."""
+    row = base + entry * Int32(544)
+    tag = ld_shared_u32(row + Int32(528)).to(Int32)
+    b0, b1 = Uint32(0), Uint32(0)
+    if tag == Int32(1):
+        p0 = _ld_u16_zext(row, dim_even)
+        p1 = _ld_u16_zext(row, dim_even + Int32(8))
+        scale = _ld_u8_zext(row, Int32(512) + dim_even // Int32(32))
+        b0, b1 = _mixed_pairs_to_bf16x2_sm120(p0, p1, scale, swa=True)
+    elif tag == Int32(0):
+        p0 = _ld_u8_zext(row, dim_even // Int32(2))
+        p1 = _ld_u8_zext(row, dim_even // Int32(2) + Int32(4))
+        scale = _ld_u8_zext(row, Int32(256) + dim_even // Int32(16))
+        b0, b1 = _mixed_pairs_to_bf16x2_sm120(p0, p1, scale, swa=False)
+    return b0, b1
+
+
 @cute.jit
 def _nvfp4_pair_bfloat2(
     kv_fp4_base_addr: Int32,
@@ -1459,6 +1703,7 @@ def _nvfp4_pair_bfloat2(
     kv_smem_stride: cutlass.Constexpr,
     latent_scale_per_token: cutlass.Constexpr = False,
     kv_sc_base_addr: Int32 = Int32(0),
+    known_swa: cutlass.Constexpr = None,
 ) -> Uint32:
     """Dequant E2M1 * inline E4M3 * outer scale to bf16x2.
 
@@ -1479,6 +1724,27 @@ def _nvfp4_pair_bfloat2(
             Int32
         )
         result = Uint32(0)
+        if cutlass.const_expr(known_swa is not None):
+            if swa == Int32(1 if known_swa else 0):
+                if cutlass.const_expr(known_swa):
+                    packed = _ld_u16_zext(
+                        kv_fp4_base_addr, entry * Int32(544) + dim_even
+                    )
+                    scale = _ld_u8_zext(
+                        kv_fp4_base_addr,
+                        entry * Int32(544) + Int32(512) + dim_even // Int32(32),
+                    )
+                    result = mxfp8_pair_to_bf16x2_sm120(packed, scale)
+                else:
+                    packed = _ld_u8_zext(
+                        kv_fp4_base_addr, entry * Int32(544) + dim_even // Int32(2)
+                    )
+                    scale = _ld_u8_zext(
+                        kv_fp4_base_addr,
+                        entry * Int32(544) + Int32(256) + dim_even // Int32(16),
+                    )
+                    result = nvfp4_pair_to_bf16x2_sm120(packed, scale)
+            return result
         if swa == Int32(1):
             packed = _ld_u16_zext(kv_fp4_base_addr, entry * Int32(544) + dim_even)
             scale = _ld_u8_zext(
@@ -2070,6 +2336,7 @@ def s6_xv_nope(
     sm_p_full_addr: Int32 = None,  # NVFP4 BF16 PV only
     sm_p_stride: cutlass.Constexpr = 0,  # NVFP4: bf16 elems per sm_p row (0 -> BI)
     latent_scale_per_token: cutlass.Constexpr = False,  # NVFP4_E4M3 only
+    known_swa: Int32 = None,
     w_fp8_bufs: cutlass.Constexpr = 2,  # W staging buffers (GLM two-pass: 2 or 4)
 ):
     """S6: accumulate W . V_nope into acc_nope[vc*NT+nt][0..3] via PLAIN fp8 MMAs
@@ -2110,6 +2377,60 @@ def s6_xv_nope(
     operand and V is dequantized in registers from packed E2M1 + E4M3 group-16
     scales (see ``s6_xv_nope_nvfp4_bf16``)."""
     if cutlass.const_expr(scale_format == 2):
+        if cutlass.const_expr(known_swa is not None):
+            staged_result = cute.make_rmem_tensor(
+                n_v_chunks * nt_per_warp_xv * 4, Float32
+            )
+            if known_swa:
+                source_acc = [[value for value in row] for row in acc_nope]
+                source_acc = s6_xv_nope_nvfp4_bf16(
+                    source_acc,
+                    sm_p_full_addr,
+                    kv_fp8_base_addr,
+                    warp_id,
+                    lane,
+                    latent_scale,
+                    n_v_chunks=n_v_chunks,
+                    v_chunk=v_chunk,
+                    bi=bi,
+                    kv_smem_stride=kv_smem_stride,
+                    n_warps=n_warps,
+                    nt_per_warp_xv=nt_per_warp_xv,
+                    sm_p_stride=(sm_p_stride if sm_p_stride else bi),
+                    latent_scale_per_token=latent_scale_per_token,
+                    kv_sc_base_addr=kv_sc_base_addr,
+                    known_swa=True,
+                )
+                for at in cutlass.range_constexpr(n_v_chunks * nt_per_warp_xv):
+                    for r in cutlass.range_constexpr(4):
+                        staged_result[at * 4 + r] = source_acc[at][r]
+            else:
+                source_acc = [[value for value in row] for row in acc_nope]
+                source_acc = s6_xv_nope_nvfp4_bf16(
+                    source_acc,
+                    sm_p_full_addr,
+                    kv_fp8_base_addr,
+                    warp_id,
+                    lane,
+                    latent_scale,
+                    n_v_chunks=n_v_chunks,
+                    v_chunk=v_chunk,
+                    bi=bi,
+                    kv_smem_stride=kv_smem_stride,
+                    n_warps=n_warps,
+                    nt_per_warp_xv=nt_per_warp_xv,
+                    sm_p_stride=(sm_p_stride if sm_p_stride else bi),
+                    latent_scale_per_token=latent_scale_per_token,
+                    kv_sc_base_addr=kv_sc_base_addr,
+                    known_swa=False,
+                )
+                for at in cutlass.range_constexpr(n_v_chunks * nt_per_warp_xv):
+                    for r in cutlass.range_constexpr(4):
+                        staged_result[at * 4 + r] = source_acc[at][r]
+            return [
+                [staged_result[at * 4 + r] for r in range(4)]
+                for at in range(n_v_chunks * nt_per_warp_xv)
+            ]
         return s6_xv_nope_nvfp4_bf16(
             acc_nope,
             sm_p_full_addr,
@@ -2445,6 +2766,7 @@ def s6_xv_nope_nvfp4_bf16(
     sm_p_stride: cutlass.Constexpr = 0,  # bf16 elems per sm_p row (0 -> BI)
     latent_scale_per_token: cutlass.Constexpr = False,
     kv_sc_base_addr: Int32 = Int32(0),
+    known_swa: cutlass.Constexpr = None,
 ):
     """S6 (NVFP4): BF16 P.V over in-register dequantized E2M1 V.
 
@@ -2482,6 +2804,7 @@ def s6_xv_nope_nvfp4_bf16(
                     kv_smem_stride=kv_smem_stride,
                     latent_scale_per_token=latent_scale_per_token,
                     kv_sc_base_addr=kv_sc_base_addr,
+                    known_swa=known_swa,
                 )
                 pair8 = _nvfp4_pair_bfloat2(
                     kv_fp4_base_addr,
@@ -2491,6 +2814,7 @@ def s6_xv_nope_nvfp4_bf16(
                     kv_smem_stride=kv_smem_stride,
                     latent_scale_per_token=latent_scale_per_token,
                     kv_sc_base_addr=kv_sc_base_addr,
+                    known_swa=known_swa,
                 )
                 peer0 = cute.arch.shuffle_sync_bfly(pair0, offset=4)
                 peer8 = cute.arch.shuffle_sync_bfly(pair8, offset=4)

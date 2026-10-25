@@ -238,6 +238,11 @@ def io_issue_gather(
     dsv41_fp8: cutlass.Constexpr = False,
     ratio_base_addr: Int32 = Int32(0),
     ratio_stride: cutlass.Constexpr = 0,
+    mapping_page_table=None,
+    mapping_table_width: Int32 = -1,
+    mapping_table_offset: Int64 = 0,
+    mapping_num_pages: Int64 = 0,
+    mapping_page_size: cutlass.Constexpr = 1,
 ):
     """Producer body for ONE chunk into buffer ``buf`` (caller selects the dst
     addrs + full_mbar_ptr for ``buf``). Mirrors FlashInfer ``issue_gather``:
@@ -361,8 +366,12 @@ def io_issue_gather(
             if entry < Int32(bi):
                 cand_pos = g_start + entry
                 idx_raw = Int32(-1)
-                if cand_pos < g_end:
-                    idx_raw = Int32(_section_idx[cand_pos])
+                if cutlass.const_expr(mapping_page_table is not None):
+                    # Each IO thread reuses its own mapped entry from the validity pass.
+                    idx_raw = Int32(token_idx_view[entry])
+                else:
+                    if cand_pos < g_end:
+                        idx_raw = Int32(_section_idx[cand_pos])
                 idx = idx_raw
                 if idx < Int32(0):
                     idx = Int32(0)
@@ -452,6 +461,23 @@ def io_issue_gather(
             idx_raw = Int32(-1)
             if cand_pos < g_end:
                 idx_raw = Int32(_section_idx[cand_pos])
+            if cutlass.const_expr(mapping_page_table is not None):
+                # Mapping storage is the fixed BI-sized validity stage.
+                logical = Int64(idx_raw)
+                idx_raw = Int32(-1)
+                if logical >= Int64(0):
+                    if mapping_table_width < Int32(0):
+                        idx_raw = Int32(logical)
+                    else:
+                        page = logical // Int64(mapping_page_size)
+                        if page < Int64(mapping_table_width):
+                            pid = Int64(mapping_page_table[mapping_table_offset + page])
+                            if (pid >= Int64(0)) & (pid < mapping_num_pages):
+                                slot = pid * Int64(mapping_page_size) + logical % Int64(
+                                    mapping_page_size
+                                )
+                                if slot <= Int64(2147483647):
+                                    idx_raw = Int32(slot)
             # gap #9: stage the raw index (incl -1) for the S3 consumer mask.
             token_idx_view[entry] = idx_raw
             if cutlass.const_expr(dsv41):

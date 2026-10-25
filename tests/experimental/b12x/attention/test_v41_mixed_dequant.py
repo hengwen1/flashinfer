@@ -13,6 +13,7 @@ from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 from b12x.attention._shared.mla.decode_math import (
     _nvfp4_pair_bfloat2,
+    _dsv41_qk_bfloat2x2,
     s0_normalize_dsv41_kv_to_fp8,
 )
 from b12x.attention._shared.mla.io import stage_dsv41_fp8_scales
@@ -21,6 +22,10 @@ from b12x.testing.reference.helpers import require_b12x
 
 class StagedMixedPair:
     """Exercise source tags and byte offsets through the production helper."""
+
+    def __init__(self, qk_pairs=False, known_source=None):
+        self.qk_pairs = qk_pairs
+        self.known_source = known_source
 
     @cute.jit
     def __call__(
@@ -49,23 +54,36 @@ class StagedMixedPair:
             16,
         )
         staging[lane * 136] = q[i]
+        staging[lane * 136 + 1] = q[i]
+        staging[lane * 136 + 2] = q[i]
         staging[lane * 136 + 64] = sf[i]
         staging[lane * 136 + 128] = sf[i]
         staging[lane * 136 + 132] = tag[i]
         cute.arch.sync_threads()
-        out[i] = _nvfp4_pair_bfloat2(
-            shared_ptr_to_u32(staging.iterator),
-            lane,
-            Int32(0),
-            Float32(17.0),
-            kv_smem_stride=544,
-        )
+        if cutlass.const_expr(self.qk_pairs):
+            b0, b1 = _dsv41_qk_bfloat2x2(
+                shared_ptr_to_u32(staging.iterator), lane, Int32(0)
+            )
+            out[i * Int64(2)] = b0
+            out[i * Int64(2) + Int64(1)] = b1
+        else:
+            out[i] = _nvfp4_pair_bfloat2(
+                shared_ptr_to_u32(staging.iterator),
+                lane,
+                Int32(0),
+                Float32(17.0),
+                kv_smem_stride=544,
+                known_swa=self.known_source,
+            )
 
 
 @pytest.mark.parametrize("source", ["indexed", "swa", "invalid"])
-def test_staged_pairs_exhaustive_and_graph_mutation(source):
+@pytest.mark.parametrize("decode_path", ["pv", "qk", "known_pv"])
+def test_staged_pairs_exhaustive_and_graph_mutation(source, decode_path):
     """All scale bytes, including UE8M0 zero/subnormals/NaN, match FP64."""
     require_b12x()
+    qk_pairs = decode_path == "qk"
+    known_source = source != "indexed" if decode_path == "known_pv" else None
     codes = torch.arange(256, device="cuda", dtype=torch.int64).repeat(256)
     scales = torch.arange(256, device="cuda", dtype=torch.int64).repeat_interleave(256)
     if source == "indexed":
@@ -91,12 +109,16 @@ def test_staged_pairs_exhaustive_and_graph_mutation(source):
     packed = packed.to(torch.uint32)
     scales = scales.to(torch.uint32)
     tags = torch.full_like(scales, source_tag)
+    if qk_pairs:
+        expected = expected.repeat(1, 2)
     output = torch.empty_like(expected)
     pointers = [
         make_ptr(Uint32, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
         for t in (packed, scales, tags, output)
     ]
-    fn = compile_kernel(StagedMixedPair(), *pointers, current_cuda_stream())
+    fn = compile_kernel(
+        StagedMixedPair(qk_pairs, known_source), *pointers, current_cuda_stream()
+    )
     fn(*pointers, current_cuda_stream())
     torch.testing.assert_close(output, expected, rtol=0, atol=0, equal_nan=True)
     graph = torch.cuda.CUDAGraph()
@@ -104,6 +126,32 @@ def test_staged_pairs_exhaustive_and_graph_mutation(source):
         fn(*pointers, current_cuda_stream())
     # Invalid source rows must become zero even when their payload contains NaNs.
     tags.fill_(2)
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("known_source", [False, True])
+def test_known_source_invalid_words_and_graph_mutation(known_source):
+    require_b12x()
+    packed = torch.full((65536,), 0x7F7F, dtype=torch.uint32, device="cuda")
+    scales = torch.full_like(packed, 255)
+    tags = torch.tensor([2, 3, 0xFFFFFFFF], dtype=torch.uint32, device="cuda")
+    tags = tags.repeat(21846)[:65536].contiguous()
+    output = torch.empty((65536, 2), dtype=torch.bfloat16, device="cuda")
+    pointers = [
+        make_ptr(Uint32, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+        for t in (packed, scales, tags, output)
+    ]
+    fn = compile_kernel(
+        StagedMixedPair(False, known_source), *pointers, current_cuda_stream()
+    )
+    fn(*pointers, current_cuda_stream())
+    torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn(*pointers, current_cuda_stream())
+    tags.fill_(0xFFFFFFFF)
     output.fill_(float("nan"))
     graph.replay()
     torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)

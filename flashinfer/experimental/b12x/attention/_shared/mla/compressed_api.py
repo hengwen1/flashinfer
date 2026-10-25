@@ -209,7 +209,10 @@ def compressed_sparse_mla_decode_forward(
         )
         if indexed_topk_lengths.device != q3.device:
             raise ValueError("indexed_topk_lengths must be on the same device as q_all")
-        if indexed_page_table is not None:
+        if indexed_page_table is not None and (
+            isinstance(prepared, tuple)
+            or scratch.execution_config.v41_compute_mode != "bf16"
+        ):
             if cache_format != "deepseek_v41":
                 raise ValueError(
                     "mapped indexed_page_table is only supported for deepseek_v41"
@@ -319,6 +322,9 @@ def compressed_sparse_mla_decode_forward(
         indexed_indices=indexed_indices_2d,
         indexed_topk_lengths=indexed_topk_lengths if has_indexed else None,
         indexed_page_size=indexed_page_size if has_indexed else None,
+        indexed_page_table=indexed_page_table
+        if has_indexed and scratch.execution_config.v41_compute_mode == "bf16"
+        else None,
         attn_sink=attn_sink,
         return_lse=return_lse,
         lse_scale=lse_scale,

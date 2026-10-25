@@ -1151,6 +1151,28 @@ def cp_async_u32_shared_global(
 
 
 @dsl_user_op
+def cp_async_u32_shared_global_zfill(
+    smem_addr: Int32, gmem_addr: Int64, valid: Int32, *, loc=None, ip=None
+):
+    """Copy four bytes asynchronously, filling zeros when valid is zero."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Int32(valid).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p; setp.eq.b32 p, $2, 0; cp.async.ca.shared.global [$0], [$1], 4, p; }",
+        "r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def cp_async_u64_shared_global(
     smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=None
 ):
@@ -1182,6 +1204,28 @@ def cp_async4_shared_global(smem_addr: Int32, gmem_addr: Int64, *, loc=None, ip=
         ],
         "cp.async.cg.shared.global [$0], [$1], 16;",
         "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cp_async4_shared_global_zfill(
+    smem_addr: Int32, gmem_addr: Int64, valid: Int32, *, loc=None, ip=None
+):
+    """Copy 16 bytes asynchronously, filling zeros when valid is zero."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Int32(valid).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p; setp.eq.b32 p, $2, 0; cp.async.cg.shared.global [$0], [$1], 16, p; }",
+        "r,l,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

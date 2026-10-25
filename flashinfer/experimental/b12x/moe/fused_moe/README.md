@@ -61,11 +61,15 @@ payload and preserve native scale bytes, normalization, and arithmetic.
 
 The autotuner measures the complete invocation, including expansion, route
 planning, synchronization resets, and reduction. Token capacity is part of the
-tuning query. Explicit config overrides select either choice. On SM120,
+tuning query. Preparation compiles the candidates and fixes the selected
+configuration and programs before CUDA graph capture. Explicit
+`MoeDecodeConfig` overrides pin supported choices; incompatible geometry is
+rejected during planning. On SM120,
 untuned preparation prefers inline scales for moderate routing density and
 expansion for tiny calls, compact N64 W4A8, and dense prefill. Inline readers
-cover M16/M32 NVFP4 W4A4 and MXFP4 W4A8 tiles, and packed W4A16 kernels. Scalar and compact micro
-kernels, M64/M128 activation-quantized tiles, materialized NVFP4 W4A4,
+cover M16/M32 NVFP4 W4A4 and MXFP4 W4A8 tiles, native compact N64 MXFP4 W4A8
+micro kernels, and packed W4A16 kernels. Scalar kernels,
+M64/M128 activation-quantized tiles, materialized NVFP4 W4A4,
 source-native W4A16, dense GEMM, and the optional
 W4A16 activation-prefill path consume expanded scales. Unsupported inline
 overrides are rejected during planning.
@@ -99,6 +103,24 @@ Eligible compact N64 MXFP4 shards offer direct-route micro kernels through
 source tile has at most 32 live rows, while retaining its prepared M64 storage
 and launch capacity. Four-lane groups quantize each activated K32 block with
 the same BF16 boundary and MXFP8 scale calculation.
+
+Native compact N64 MXFP4 W4A8 uses `fp4_e8m0_k32` weights with intermediate
+width congruent to 64 modulo 128. Its micro FC1 tuning controls are
+`micro_fc1_tile_n` (64 or 128), `micro_fc1_max_copy_groups` (1 or 2 pending
+copy groups), and `micro_fc1_pipeline_stages` (1 or 2). One stage requires
+one pending copy group. N128 tiles pair gate/up projections when the prepared
+token capacity is 4 through 8. For these paired projections,
+`compact_fuse_input_quantization=True` quantizes the input inside FC1; it
+requires BF16 I/O, SiLU gating, and hidden size divisible by 256. `False`
+uses a separate input-quantization launch. Both support inline or expanded
+scales when the corresponding scale layout is available.
+
+`materialized_fc1_cta_budget` sets the compiler's resident-CTA target per SM
+and the FC1 launch-grid multiplier to 2 (default) or 3. Three requires dynamic
+M16 native compact N64 MXFP4 W4A8 with SiLU gating, hidden size divisible by
+256, and inline CSF scales. These controls participate in complete-invocation
+tuning and remain fixed during captured replay;
+live route counts do not retune or replace the prepared geometry.
 
 Expansion reconstructs each selected expert's scales once per invocation.
 Inline reconstruction repeats for every compute tile that consumes those

@@ -124,6 +124,7 @@ from b12x.moe._shared.kernels.dynamic.sync import (
     _threadfence,
 )
 from b12x.moe._shared.kernels.dynamic.types import DynamicLaunchParams
+from b12x.moe._shared.kernels.routing_ids import local_expert_id
 
 
 class MoEDynamicKernelBackend:
@@ -148,6 +149,7 @@ class MoEDynamicKernelBackend:
         w4a8_repacked: bool = False,
         w4a8_n64_repacked: bool = False,
         w4a8_n64_tail: bool = False,
+        materialized_fc1_cta_budget: int = 2,
         direct_routing: bool = False,
         external_route_plan: bool = False,
         materialize_intermediate: bool = False,
@@ -399,19 +401,26 @@ class MoEDynamicKernelBackend:
             and mma_tiler_mn == (128, 128)
             and not self.w4a8_repacked
         )
-        # Dense M128 retains this kernel as a routing/input-quantization
-        # front-end.  Compact stream-ordered M128xN128 kernels compute FC1/FC2
-        # through the existing caller-owned materialized workspace.  The split
-        # removes both GEMM bodies from the routing kernel's register/shared
-        # union and is graph-safe: every grid is fixed from preplanned launch
-        # capacity and no host value is read between launches.  The M64 source
-        # tile is deliberately NOT admitted: the phase kernels' 64-row
-        # multi-tile specialization is not yet validated and is known-wrong on
-        # multi-tile experts, so those shapes keep the monolithic path.
+        # Standalone W4A8 FC1/FC2 support native N64 M16 and repacked M64/M128
+        # sources; NVFP4 uses M128. They consume caller-owned workspace on the
+        # routing/input-quantization launch's CUDA stream.
         self.external_materialized_fc1 = bool(
             self.w4a8_split_materialized or self.nvfp4_split_materialized
         )
         self.external_materialized_fc2 = self.external_materialized_fc1
+        if type(
+            materialized_fc1_cta_budget
+        ) is not int or materialized_fc1_cta_budget not in (2, 3):
+            raise ValueError("materialized FC1 CTA budget must be two or three")
+        if materialized_fc1_cta_budget == 3 and not (
+            self.w4a8_m16_materialized
+            and quant_recipe == "w4a8_mx"
+            and activation == "silu"
+            and csf_inline_scales
+        ):
+            raise ValueError(
+                "three-CTA materialized FC1 requires native N64 M16 SiLU with inline CSF scales"
+            )
         if int(num_topk) <= 0:
             raise ValueError(f"num_topk must be positive, got {num_topk}")
         self.num_topk = int(num_topk)
@@ -444,6 +453,7 @@ class MoEDynamicKernelBackend:
         else:
             self.materialized_phase1_kernel = W4A8MaterializedPhase1Kernel(
                 fast_math=self.fast_math,
+                cta_budget=materialized_fc1_cta_budget,
                 swiglu_limit=swiglu_limit,
                 source_tile_m=materialized_source_tile_m,
                 deterministic_output=bool(deterministic_output),
@@ -594,13 +604,6 @@ class MoEDynamicKernelBackend:
             )
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
-        # Small NVFP4 tiles and W4A8 split each shared token across two warps.
-        # Only complete pairs participate in the per-token rendezvous.
-        self.input_warps_per_token = (
-            2
-            if share_input_across_experts and (self.is_w4a8 or mma_tiler_mn[0] == 16)
-            else 1
-        )
         self.deterministic_output = bool(deterministic_output)
         # swap_ab runs the gated FC1 with the intermediate (logical N) on the
         # MMA M-role (mirrors dense.py), so a sub-64 tile_n that divides a
@@ -698,6 +701,18 @@ class MoEDynamicKernelBackend:
         self.num_dma_warps = 2 if self.is_w4a8 else 1
         self.num_route_warps = self.num_mma_warps + self.num_dma_warps
         self.threads_per_cta = self.num_route_warps * self.num_threads_per_warp
+        self.input_warps_per_token = (
+            2
+            if share_input_across_experts and (self.is_w4a8 or mma_tiler_mn[0] == 16)
+            else 1
+        )
+        if (
+            share_input_across_experts
+            and self.is_w4a8
+            and self.external_materialized_fc1
+            and not self.work_is_streaming
+        ):
+            self.input_warps_per_token = self.num_route_warps
         # Repacked small-W4A8 has exactly two buffers and one producer warp
         # assigned to each parity.  A hardware named-barrier handoff avoids
         # burning scheduler slots in the old shared-flag polling loops.  M128
@@ -2904,7 +2919,9 @@ class MoEDynamicKernelBackend:
             if m1_lane_id == Int32(0):
                 m1_route_idx = Int32(0)
                 while m1_route_idx < total_pairs:
-                    m1_route_expert_id = topk_ids[m1_route_idx].to(Int32)
+                    m1_route_expert_id = local_expert_id(
+                        topk_ids[m1_route_idx], num_experts
+                    )
                     if (
                         m1_route_expert_id >= Int32(0)
                         and m1_route_expert_id < num_experts
@@ -2948,7 +2965,7 @@ class MoEDynamicKernelBackend:
                     m1_blk_idx += flat_stride
 
             if flat_tid < total_pairs:
-                m1_slot_expert_id = topk_ids[flat_tid].to(Int32)
+                m1_slot_expert_id = local_expert_id(topk_ids[flat_tid], num_experts)
                 if m1_slot_expert_id >= Int32(0) and m1_slot_expert_id < num_experts:
                     m1_physical_row = flat_tid * Int32(self.tile_shape_mnk[0])
                     token_map[m1_physical_row] = Int32(0)
@@ -2973,7 +2990,7 @@ class MoEDynamicKernelBackend:
         if cutlass.const_expr(not self.direct_routing and not self.external_route_plan):
             hist_idx = flat_tid
             while hist_idx < total_pairs:
-                expert_id = topk_ids[hist_idx].to(Int32)
+                expert_id = local_expert_id(topk_ids[hist_idx], num_experts)
                 # A route outside the local expert domain is inactive. vLLM
                 # uses -1 for scheduler padding, and expert-parallel callers
                 # may use the same contract for non-local routes.
@@ -3100,7 +3117,9 @@ class MoEDynamicKernelBackend:
                                 topk_step = Int32(self.input_warps_per_token)
                             while topk_slot < num_topk:
                                 pair_idx = token_idx * num_topk + topk_slot
-                                expert_id = topk_ids[pair_idx].to(Int32)
+                                expert_id = local_expert_id(
+                                    topk_ids[pair_idx], num_experts
+                                )
                                 weight = topk_weights[pair_idx].to(cutlass.Float32)
                                 phys_row = Int32(-1)
                                 if expert_id >= Int32(0) and expert_id < num_experts:
@@ -3563,7 +3582,7 @@ class MoEDynamicKernelBackend:
                         phys_tile = Int32(0)
                         route_is_valid = Int32(0)
                         if pair_idx < total_pairs:
-                            expert_id = topk_ids[pair_idx].to(Int32)
+                            expert_id = local_expert_id(topk_ids[pair_idx], num_experts)
                             token_idx = pair_idx // num_topk
                             weight = topk_weights[pair_idx].to(cutlass.Float32)
                             if expert_id >= Int32(0) and expert_id < num_experts:
@@ -3828,11 +3847,11 @@ class MoEDynamicKernelBackend:
             cute.arch.sync_threads()
 
         if cutlass.const_expr(not self.work_is_streaming):
-            # NVFP4 external routing fixes counts and offsets before input packing.
-            # Task publication can overlap packing; the barrier after publication
-            # makes both packed inputs and task metadata visible to consumers.
+            # Split FC1/FC2 consume packed inputs and deferred metadata after
+            # this kernel completes on their shared CUDA stream.
             if cutlass.const_expr(
                 not self.w4a8_m1_materialized
+                and not self.external_materialized_fc1
                 and not (self.external_route_plan and self.quant_recipe == "nvfp4")
             ):
                 self._resident_grid_barrier(
@@ -3848,7 +3867,9 @@ class MoEDynamicKernelBackend:
                 if cutlass.const_expr(self.direct_routing):
                     pair_flush = Int32(bidz)
                     while pair_flush < total_pairs:
-                        expert_flush = topk_ids[pair_flush].to(Int32)
+                        expert_flush = local_expert_id(
+                            topk_ids[pair_flush], num_experts
+                        )
                         valid_rows = Int32(0)
                         if expert_flush >= Int32(0) and expert_flush < num_experts:
                             valid_rows = Int32(1)
@@ -3901,12 +3922,13 @@ class MoEDynamicKernelBackend:
                 )
 
             if cutlass.const_expr(not self.w4a8_m1_materialized):
-                self._resident_grid_barrier(
-                    barrier_count,
-                    barrier_epoch,
-                    Int32(gdim_z),
-                    is_cta_leader,
-                )
+                if cutlass.const_expr(not self.external_materialized_fc1):
+                    self._resident_grid_barrier(
+                        barrier_count,
+                        barrier_epoch,
+                        Int32(gdim_z),
+                        is_cta_leader,
+                    )
                 if flat_tid == Int32(0):
                     _st_global_release_i32(
                         get_ptr_as_int64(all_work_published, Int32(0)),
@@ -4591,7 +4613,7 @@ class MoEDynamicKernelBackend:
                 if materialized_slot < materialized_tail:
                     route_idx = materialized_slot // route_gate_tile_cnt
                     route_slice = materialized_slot - route_idx * route_gate_tile_cnt
-                    route_expert = topk_ids[route_idx].to(Int32)
+                    route_expert = local_expert_id(topk_ids[route_idx], num_experts)
                     if route_expert >= Int32(0) and route_expert < num_experts:
                         work_item[_WORK_EXPERT] = route_expert
                         work_item[_WORK_M_TILE] = route_idx
@@ -9465,7 +9487,9 @@ class MoEDynamicKernelBackend:
                     phase2_output_tile = (
                         phase2_slot - phase2_m_tile * phase2_task_output_tiles
                     )
-                    phase2_expert = topk_ids[phase2_m_tile].to(Int32)
+                    phase2_expert = local_expert_id(
+                        topk_ids[phase2_m_tile], num_experts
+                    )
                     if phase2_expert >= Int32(0) and phase2_expert < num_experts:
                         self._run_w4a8_materialized_fc2(
                             intermediate_u32,

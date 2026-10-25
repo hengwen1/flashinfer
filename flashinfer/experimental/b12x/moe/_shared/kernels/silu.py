@@ -98,6 +98,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
         csf_inline_scales: bool = False,
+        materialized_fc1_cta_budget: int = 2,
     ):
         super().__init__(
             sf_vec_size,
@@ -128,6 +129,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             mxfp6_fmt_a=mxfp6_fmt_a,
             mxfp6_fmt_b=mxfp6_fmt_b,
             csf_inline_scales=csf_inline_scales,
+            materialized_fc1_cta_budget=materialized_fc1_cta_budget,
         )
 
 

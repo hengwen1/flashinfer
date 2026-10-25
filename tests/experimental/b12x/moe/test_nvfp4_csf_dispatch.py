@@ -110,7 +110,6 @@ def test_inline_tuning_prunes_repeated_expert_tiles(tokens, inline_tiles, mode):
     [
         ("nvfp4", 512, "micro", False),
         ("w4a8_mx", 512, "micro", False),
-        ("w4a8_mx", 576, "micro", False),
         ("nvfp4", 512, "dynamic", True),
         ("w4a16", 512, "w4a16", False),
     ],
@@ -139,6 +138,28 @@ def test_expansion_only_families_reject_inline_override(mode, n, backend, materi
         TUNING.configure(
             query, device=DEVICE, override=replace(expanded, csf_inline_scales=True)
         )
+
+
+@pytest.mark.parametrize("tile_n", (64, 128))
+def test_compact_n64_accepts_inline_override(tile_n):
+    query = replace(
+        _nvfp4_query(),
+        quant_mode="w4a8_mx",
+        quant_modes=("w4a8_mx",),
+        source_format="fp4_e8m0_k32",
+        intermediate_size=576,
+        num_tokens=4,
+        routed_rows=16,
+        csf_inline_scales=True,
+    )
+    config = MoeDecodeConfig(
+        backend="micro",
+        route_planner="internal",
+        max_active_clusters=None,
+        micro_fc1_tile_n=tile_n,
+        csf_inline_scales=True,
+    )
+    assert TUNING.configure(query, device=DEVICE, override=config).pinned == config
 
 
 @pytest.mark.parametrize("clusters", [-1, 0, 188])
@@ -208,7 +229,17 @@ def test_fp4_families_expose_inline_and_expansion_choices(source, mode, n, capac
     assert TUNING.configure(query, device=DEVICE, search=False).default in configs
     for c in configs:
         if c.csf_inline_scales:
-            assert replace(c, csf_inline_scales=False) in configs
+            assert (
+                replace(c, csf_inline_scales=False, materialized_fc1_cta_budget=2)
+                in configs
+            )
+            if c.materialized_fc1_cta_budget == 3:
+                with pytest.raises(ValueError, match="materialized_fc1_cta_budget"):
+                    TUNING.lower(
+                        query,
+                        DEVICE,
+                        TUNING.config_payload(replace(c, csf_inline_scales=False)),
+                    )
 
 
 @pytest.mark.parametrize(
@@ -264,3 +295,43 @@ def test_csf_defaults_follow_measured_routing_bands(
         config.csf_inline_scales,
         config.nvfp4_materialize_intermediate,
     ) == (backend, tile, inline, materialized)
+
+
+@pytest.mark.parametrize("capacity", [1, 2, 3, 4, 5, 7, 8, 9, 16, 24])
+@pytest.mark.parametrize("compressed", [False, True])
+def test_paired_projection_input_quantization_is_a_prepared_choice(
+    capacity, compressed
+):
+    query = replace(
+        _nvfp4_query(),
+        source_format="fp4_e8m0_k32",
+        quant_mode="w4a8_mx",
+        quant_modes=("w4a8_mx",),
+        num_tokens=capacity,
+        routed_rows=capacity * 4,
+        hidden_size=5120,
+        intermediate_size=576,
+        csf_inline_scales=compressed,
+        weight_layouts=("qmma_repacked",),
+    )
+    configs = [c for _, c in TUNING.eligible_plan(query, DEVICE).candidates]
+    fused = [c for c in configs if c.compact_fuse_input_quantization]
+    assert bool(fused) == (4 <= capacity <= 8)
+    for config in configs:
+        assert MoeDecodeConfig.from_config(FrozenMapping(config.to_dict())) == config
+        if config.compact_fuse_input_quantization:
+            assert config.backend == "micro"
+            assert replace(config, compact_fuse_input_quantization=False) in configs
+    if compressed and fused:
+        assert {c.csf_inline_scales for c in fused} == {False, True}
+    standalone = MoeDecodeConfig("micro", "internal", None)
+    if capacity <= 16:
+        fused_override = replace(standalone, compact_fuse_input_quantization=True)
+        if 4 <= capacity <= 8:
+            assert (
+                TUNING.configure(query, device=DEVICE, override=fused_override).default
+                == fused_override
+            )
+        else:
+            with pytest.raises(ValueError, match="fused compact input"):
+                TUNING.configure(query, device=DEVICE, override=fused_override)

@@ -7,9 +7,11 @@ computes gate and up in one K sweep, applies the selected gated activation,
 and writes the caller-owned MXFP8 intermediate workspace.
 
 Keeping the compute body separate from routing and FC2 removes the monolithic
-kernel's register/shared-memory union.  The launch has a fixed two-CTA-per-SM
-capacity and uses only caller-owned storage, so it is safe to capture and
-replay without host reads or allocations.
+kernel's register/shared-memory union. The CTA budget sets the compiler
+residency target and launch-grid multiplier. Preparation retains budget two and
+can select three for native N64 M16 SiLU with inline CSF scales. Launches use
+caller-owned storage and support capture and replay without host reads or
+allocations.
 """
 
 from __future__ import annotations
@@ -29,7 +31,9 @@ from b12x._lib.intrinsics.conversion import (
 from b12x._lib.intrinsics.math import fmax_f32, fabs_f32
 from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
+    cp_async4_shared_global_zfill,
     cp_async_u32_shared_global,
+    cp_async_u32_shared_global_zfill,
     get_ptr_as_int64,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
@@ -38,6 +42,7 @@ from b12x._lib.intrinsics.memory import (
 from b12x._lib.intrinsics.mma import (
     e2m1x8_to_qmma_e2m1x8,
     mxfp8_mma_m16n8k32_f32_e2m1,
+    mxfp8_mma_m16n8k32_f32_e2m1_e4m3,
     mxfp8_mma_m16n8k32_f32_e4m3,
 )
 from b12x._lib.intrinsics.atomics import (
@@ -75,6 +80,7 @@ class W4A8MaterializedPhase1Kernel:
         self,
         *,
         fast_math: bool = False,
+        cta_budget: int = 2,
         source_tile_m: int = 128,
         deterministic_output: bool = False,
         num_topk: int = 1,
@@ -86,6 +92,9 @@ class W4A8MaterializedPhase1Kernel:
         n64_repacked: bool = False,
         n64_tail: bool = False,
     ):
+        if type(cta_budget) is not int or cta_budget not in (2, 3):
+            raise ValueError("materialized FC1 CTA budget must be two or three")
+        self.cta_budget = cta_budget
         self.fast_math = bool(fast_math)
         self.csf_inline = False
         self.has_swiglu_limit = swiglu_limit is not None
@@ -169,6 +178,14 @@ class W4A8MaterializedPhase1Kernel:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        if cutlass.const_expr(self.cta_budget == 3):
+            assert (
+                self.tile_m == 16
+                and self.n64_repacked
+                and self.csf_inline
+                and not self.w4a8_trellis
+                and not self.is_situ
+            )
         self.kernel(
             cute.recast_tensor(packed_a_storage, cutlass.Uint32),
             scale_storage,
@@ -188,9 +205,9 @@ class W4A8MaterializedPhase1Kernel:
             intermediate_tiles,
             packed_w13_tiles,
         ).launch(
-            grid=(1, 1, max_active_clusters * Int32(2)),
+            grid=(1, 1, max_active_clusters * Int32(self.cta_budget)),
             block=[self.threads_per_cta, 1, 1],
-            min_blocks_per_mp=2,
+            min_blocks_per_mp=self.cta_budget,
             stream=stream,
         )
 
@@ -455,10 +472,17 @@ class W4A8MaterializedPhase1Kernel:
                 src_word = Int64(tok) * Int64(words_per_token) + Int64(
                     k64_slice * 16 + vec * 4
                 )
-                cp_async4_shared_global(
-                    a_base + row * Int32(128) + (physical_vec << Int32(4)),
-                    get_ptr_as_int64(packed_a_u32, src_word),
-                )
+                if cutlass.const_expr(self.tile_m == 16 and not self.w4a8_trellis):
+                    cp_async4_shared_global_zfill(
+                        a_base + row * Int32(128) + (physical_vec << Int32(4)),
+                        get_ptr_as_int64(packed_a_u32, src_word),
+                        Int32(row < valid_rows),
+                    )
+                else:
+                    cp_async4_shared_global(
+                        a_base + row * Int32(128) + (physical_vec << Int32(4)),
+                        get_ptr_as_int64(packed_a_u32, src_word),
+                    )
 
         if tid < Int32(self.tile_m):
             tok = Int32(0)
@@ -469,10 +493,17 @@ class W4A8MaterializedPhase1Kernel:
             sf_src = Int64(tok) * Int64(input_k128_tiles) * Int64(4) + Int64(
                 k64_slice >> 1
             ) * Int64(4)
-            cp_async_u32_shared_global(
-                sfa_base + (tid << Int32(2)),
-                get_ptr_as_int64(scale_storage, sf_src),
-            )
+            if cutlass.const_expr(self.tile_m == 16 and not self.w4a8_trellis):
+                cp_async_u32_shared_global_zfill(
+                    sfa_base + (tid << Int32(2)),
+                    get_ptr_as_int64(scale_storage, sf_src),
+                    Int32(tid < valid_rows),
+                )
+            else:
+                cp_async_u32_shared_global(
+                    sfa_base + (tid << Int32(2)),
+                    get_ptr_as_int64(scale_storage, sf_src),
+                )
 
         k128_slice = k64_slice >> Int32(1)
         k_half = k64_slice & Int32(1)
@@ -669,7 +700,15 @@ class W4A8MaterializedPhase1Kernel:
         intermediate_tiles: Int32,
         packed_w13_tiles: Int32,
         compute_m: cutlass.Constexpr[int],
+        transpose_grouped: cutlass.Constexpr = False,
     ):
+        if cutlass.const_expr(transpose_grouped):
+            assert (
+                compute_m == 16
+                and self.n64_repacked
+                and not self.w4a8_trellis
+                and not self.is_situ
+            )
         lane = tid & Int32(31)
         q = lane >> Int32(2)
         c = lane & Int32(3)
@@ -739,6 +778,8 @@ class W4A8MaterializedPhase1Kernel:
         # the complete live accumulator set around loop-carried values even
         # though every MMA consumes exactly four adjacent values.
         n_fragments = self.tile_n // 32
+        if cutlass.const_expr(transpose_grouped):
+            n_fragments = self.tile_n // 64
         gate_acc = tuple(
             tuple(
                 cute.make_rmem_tensor((4,), cutlass.Float32)
@@ -811,6 +852,8 @@ class W4A8MaterializedPhase1Kernel:
                     # One native K128 word serves both K64 pipeline epochs.
                     for nt in cutlass.range_constexpr(n_fragments):
                         n8 = warp_idx * Int32(n_fragments) + Int32(nt)
+                        if cutlass.const_expr(transpose_grouped):
+                            n8 = warp_idx * Int32(4) + Int32(nt * 2) + (lane & Int32(1))
                         scale_offset = (n8 * Int32(8) + q) << Int32(2)
                         gate_scale_words[nt] = ld_shared_u32(
                             gate_sfb_base + scale_offset
@@ -820,6 +863,8 @@ class W4A8MaterializedPhase1Kernel:
             asc = cute.make_rmem_tensor((compute_m // 16,), Uint32)
             for blk in cutlass.range_constexpr(compute_m // 16):
                 sf_row = Int32(blk * 16) + q + ((lane & Int32(1)) << Int32(3))
+                if cutlass.const_expr(transpose_grouped):
+                    sf_row = q
                 asc[blk] = ld_shared_u32(sfa_base + (sf_row << Int32(2))) >> scale_shift
 
             for kb in cutlass.range_constexpr(2):
@@ -834,16 +879,19 @@ class W4A8MaterializedPhase1Kernel:
                         + ((c & Int32(1)) << Int32(3))
                     )
                     a0, a2 = ld_shared_v2_u32(a_lo)
-                    a1, a3 = ld_shared_v2_u32(a_lo + Int32(8 * 128))
+                    if cutlass.const_expr(transpose_grouped):
+                        a1, a3 = a0, a2
+                    else:
+                        a1, a3 = ld_shared_v2_u32(a_lo + Int32(8 * 128))
                     a_frag[blk, 0] = a0
                     a_frag[blk, 1] = a1
                     a_frag[blk, 2] = a2
                     a_frag[blk, 3] = a3
 
-                gate_b0 = cute.make_rmem_tensor((n_fragments,), Uint32)
-                gate_b1 = cute.make_rmem_tensor((n_fragments,), Uint32)
-                up_b0 = cute.make_rmem_tensor((n_fragments,), Uint32)
-                up_b1 = cute.make_rmem_tensor((n_fragments,), Uint32)
+                gate_b0 = cute.make_rmem_tensor((self.tile_n // 32,), Uint32)
+                gate_b1 = cute.make_rmem_tensor((self.tile_n // 32,), Uint32)
+                up_b0 = cute.make_rmem_tensor((self.tile_n // 32,), Uint32)
+                up_b1 = cute.make_rmem_tensor((self.tile_n // 32,), Uint32)
                 if cutlass.const_expr(self.w4a8_trellis):
                     for th in cutlass.range_constexpr(2):
                         tr_n16 = warp_idx * Int32(2) + Int32(th)
@@ -901,7 +949,7 @@ class W4A8MaterializedPhase1Kernel:
                     up_words[1] = uw1
                     up_words[2] = uw2
                     up_words[3] = uw3
-                    for nt in cutlass.range_constexpr(n_fragments):
+                    for nt in cutlass.range_constexpr(self.tile_n // 32):
                         gate_b0[nt], gate_b1[nt] = e2m1x8_to_qmma_e2m1x8(gate_words[nt])
                         up_b0[nt], up_b1[nt] = e2m1x8_to_qmma_e2m1x8(up_words[nt])
                 for nt in cutlass.range_constexpr(n_fragments):
@@ -910,6 +958,16 @@ class W4A8MaterializedPhase1Kernel:
                     gb1 = gate_b1[nt]
                     ub0 = up_b0[nt]
                     ub1 = up_b1[nt]
+                    if cutlass.const_expr(transpose_grouped):
+                        n8 = warp_idx * Int32(4) + Int32(nt * 2) + (lane & Int32(1))
+                        gb0 = gate_b0[nt * 2]
+                        gb1 = gate_b0[nt * 2 + 1]
+                        gb2 = gate_b1[nt * 2]
+                        gb3 = gate_b1[nt * 2 + 1]
+                        ub0 = up_b0[nt * 2]
+                        ub1 = up_b0[nt * 2 + 1]
+                        ub2 = up_b1[nt * 2]
+                        ub3 = up_b1[nt * 2 + 1]
                     gate_sfb = Uint32(0x7F7F7F7F)
                     up_sfb = Uint32(0x7F7F7F7F)
                     if cutlass.const_expr(self.csf_inline):
@@ -930,7 +988,24 @@ class W4A8MaterializedPhase1Kernel:
                         )
                     for blk in cutlass.range_constexpr(compute_m // 16):
                         gate_fragment = gate_acc[blk][nt]
-                        if cutlass.const_expr(self.w4a8_trellis):
+                        if cutlass.const_expr(transpose_grouped):
+                            g0, g1, g2, g3 = mxfp8_mma_m16n8k32_f32_e2m1_e4m3(
+                                gate_fragment[0],
+                                gate_fragment[1],
+                                gate_fragment[2],
+                                gate_fragment[3],
+                                gb0,
+                                gb1,
+                                gb2,
+                                gb3,
+                                a_frag[blk, 0],
+                                a_frag[blk, 2],
+                                gate_sfb,
+                                asc[blk],
+                                bid_a=kb,
+                                bid_b=kb,
+                            )
+                        elif cutlass.const_expr(self.w4a8_trellis):
                             g0, g1, g2, g3 = mxfp8_mma_m16n8k32_f32_e4m3(
                                 gate_fragment[0],
                                 gate_fragment[1],
@@ -969,7 +1044,24 @@ class W4A8MaterializedPhase1Kernel:
                         gate_fragment[2] = g2
                         gate_fragment[3] = g3
                         up_fragment = up_acc[blk][nt]
-                        if cutlass.const_expr(self.w4a8_trellis):
+                        if cutlass.const_expr(transpose_grouped):
+                            u0, u1, u2, u3 = mxfp8_mma_m16n8k32_f32_e2m1_e4m3(
+                                up_fragment[0],
+                                up_fragment[1],
+                                up_fragment[2],
+                                up_fragment[3],
+                                ub0,
+                                ub1,
+                                ub2,
+                                ub3,
+                                a_frag[blk, 0],
+                                a_frag[blk, 2],
+                                up_sfb,
+                                asc[blk],
+                                bid_a=kb,
+                                bid_b=kb,
+                            )
+                        elif cutlass.const_expr(self.w4a8_trellis):
                             u0, u1, u2, u3 = mxfp8_mma_m16n8k32_f32_e4m3(
                                 up_fragment[0],
                                 up_fragment[1],
@@ -1025,7 +1117,57 @@ class W4A8MaterializedPhase1Kernel:
         ].to(cutlass.Float32)
         epilogue_base = smem_base
         col_base = warp_idx * Int32((self.tile_n // 32) * 8) + (c << Int32(1))
-        if cutlass.const_expr(self.w4a8_trellis):
+        if cutlass.const_expr(transpose_grouped):
+            for transpose_nt in cutlass.range_constexpr(n_fragments):
+                transpose_gate = gate_acc[0][transpose_nt]
+                transpose_up = up_acc[0][transpose_nt]
+                transpose_gate_peer = (
+                    cute.arch.shuffle_sync_bfly(transpose_gate[0], offset=4),
+                    cute.arch.shuffle_sync_bfly(transpose_gate[1], offset=4),
+                    cute.arch.shuffle_sync_bfly(transpose_gate[2], offset=4),
+                    cute.arch.shuffle_sync_bfly(transpose_gate[3], offset=4),
+                )
+                transpose_up_peer = (
+                    cute.arch.shuffle_sync_bfly(transpose_up[0], offset=4),
+                    cute.arch.shuffle_sync_bfly(transpose_up[1], offset=4),
+                    cute.arch.shuffle_sync_bfly(transpose_up[2], offset=4),
+                    cute.arch.shuffle_sync_bfly(transpose_up[3], offset=4),
+                )
+                if (q & Int32(1)) == Int32(0):
+                    for transpose_row_part in cutlass.range_constexpr(2):
+                        transpose_row = c * Int32(2) + Int32(transpose_row_part)
+                        if transpose_row < valid_rows:
+                            for transpose_half in cutlass.range_constexpr(2):
+                                transpose_col = (
+                                    warp_idx * Int32(32)
+                                    + Int32(transpose_nt * 16 + transpose_half * 8)
+                                    + q
+                                )
+                                transpose_index = (
+                                    transpose_half * 2 + transpose_row_part
+                                )
+                                transpose_first = self._activated_value(
+                                    transpose_gate[transpose_index],
+                                    transpose_up[transpose_index],
+                                    alpha_value,
+                                )
+                                transpose_second = self._activated_value(
+                                    transpose_gate_peer[transpose_index],
+                                    transpose_up_peer[transpose_index],
+                                    alpha_value,
+                                )
+                                st_shared_u32(
+                                    epilogue_base
+                                    + (
+                                        transpose_row * Int32(self.tile_n)
+                                        + transpose_col
+                                    )
+                                    * Int32(2),
+                                    pack_f32x2_to_bfloat2(
+                                        transpose_first, transpose_second
+                                    ),
+                                )
+        elif cutlass.const_expr(self.w4a8_trellis):
             # Trellis activation boundary: raw alpha-scaled projections into
             # two shared tiles, per-row H128 + per-expert rotations + gated
             # activation + down scale + H128, then the shared requantization
@@ -1431,88 +1573,48 @@ class W4A8MaterializedPhase1Kernel:
             )
             valid_rows = cutlass.min(valid_rows, Int32(self.tile_m))
             if valid_rows > Int32(0):
-                if cutlass.const_expr(self.n64_repacked and self.tile_m == 64):
-                    if valid_rows <= Int32(32):
-                        self._run_task(
-                            packed_a_u32,
-                            scale_storage,
-                            w13_rp,
-                            w13_sfb_rp,
-                            intermediate_u32,
-                            token_map,
-                            token_weights,
-                            alpha,
-                            input_global_scale,
-                            trellis_lut,
-                            trellis_rotations,
-                            smem_base,
-                            tid,
-                            warp_idx,
-                            source_m_tile,
-                            m_half,
-                            expert_idx,
-                            output_tile,
-                            valid_rows,
-                            rows_capacity,
-                            input_k128_tiles,
-                            intermediate_tiles,
-                            packed_w13_tiles,
-                            32,
-                        )
+                task_args = (
+                    packed_a_u32,
+                    scale_storage,
+                    w13_rp,
+                    w13_sfb_rp,
+                    intermediate_u32,
+                    token_map,
+                    token_weights,
+                    alpha,
+                    input_global_scale,
+                    trellis_lut,
+                    trellis_rotations,
+                    smem_base,
+                    tid,
+                    warp_idx,
+                    source_m_tile,
+                    m_half,
+                    expert_idx,
+                    output_tile,
+                    valid_rows,
+                    rows_capacity,
+                    input_k128_tiles,
+                    intermediate_tiles,
+                    packed_w13_tiles,
+                )
+                if cutlass.const_expr(
+                    self.n64_repacked
+                    and self.tile_m == 16
+                    and not self.w4a8_trellis
+                    and not self.is_situ
+                ):
+                    if valid_rows <= Int32(8):
+                        self._run_task(*task_args, 16, transpose_grouped=True)
                     else:
-                        self._run_task(
-                            packed_a_u32,
-                            scale_storage,
-                            w13_rp,
-                            w13_sfb_rp,
-                            intermediate_u32,
-                            token_map,
-                            token_weights,
-                            alpha,
-                            input_global_scale,
-                            trellis_lut,
-                            trellis_rotations,
-                            smem_base,
-                            tid,
-                            warp_idx,
-                            source_m_tile,
-                            m_half,
-                            expert_idx,
-                            output_tile,
-                            valid_rows,
-                            rows_capacity,
-                            input_k128_tiles,
-                            intermediate_tiles,
-                            packed_w13_tiles,
-                            self.tile_m,
-                        )
+                        self._run_task(*task_args, 16)
+                elif cutlass.const_expr(self.n64_repacked and self.tile_m == 64):
+                    if valid_rows <= Int32(32):
+                        self._run_task(*task_args, 32)
+                    else:
+                        self._run_task(*task_args, self.tile_m)
                 else:
-                    self._run_task(
-                        packed_a_u32,
-                        scale_storage,
-                        w13_rp,
-                        w13_sfb_rp,
-                        intermediate_u32,
-                        token_map,
-                        token_weights,
-                        alpha,
-                        input_global_scale,
-                        trellis_lut,
-                        trellis_rotations,
-                        smem_base,
-                        tid,
-                        warp_idx,
-                        source_m_tile,
-                        m_half,
-                        expert_idx,
-                        output_tile,
-                        valid_rows,
-                        rows_capacity,
-                        input_k128_tiles,
-                        intermediate_tiles,
-                        packed_w13_tiles,
-                        self.tile_m,
-                    )
+                    self._run_task(*task_args, self.tile_m)
             task_slot += Int32(gdimz)
 
 

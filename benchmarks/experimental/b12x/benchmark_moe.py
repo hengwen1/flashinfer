@@ -28,12 +28,6 @@ weighted routing scenarios. Tuning and evaluation use separate random seeds.
 
 from __future__ import annotations
 
-import b12x.moe._shared.kernels.w4a16.kernel.config as w4a16_config
-import b12x.moe._shared.kernels.w4a16.kernel.fused_launch as w4a16_fused_launch
-
-
-from b12x._lib.quant.block_codec import IQ2_CODECS, block_codec
-
 import argparse
 import hashlib
 import json
@@ -52,6 +46,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
 import torch
 import torch.nn.functional as F
+
+import b12x.moe._shared.kernels.w4a16.kernel.config as w4a16_config
+import b12x.moe._shared.kernels.w4a16.kernel.fused_launch as w4a16_fused_launch
+from b12x._lib.quant.block_codec import IQ2_CODECS, block_codec
 
 from b12x.moe._shared.kernels.reference import (
     OracleMetrics,
@@ -588,6 +586,7 @@ MODEL_PROFILES = {
         default_validate="oracle",
         default_swiglu_limit=10.0,
         default_routing="model",
+        default_scale_compression="csf",
     ),
     "glm51": ModelProfile(
         label="GLM-5.1",
@@ -777,6 +776,7 @@ class ExpertWeights:
     oracle_w2_weight: torch.Tensor | None = None
     oracle_w2_scale: torch.Tensor | None = None
     w13_layout: str = "w31"
+    mxfp4_csf_sources: tuple[object, object] | None = None
 
 
 def _load_config(model_path: pathlib.Path) -> dict:
@@ -810,6 +810,51 @@ def _slice_v41_tp_shard(
     shard_width = intermediate_size_per_partition // packing
     offset = tp_rank * shard_width
     return source.narrow(dimension, offset, shard_width).contiguous()
+
+
+def _load_v41_csf_sources(loader, spec, *, layer_idx, device):
+    from b12x.loader._csf_source import stage_csf_sources
+
+    fields = ("bases", "codes", "page_bases", "offsets", "exceptions")
+    first = spec.tp_rank * spec.logical_I_tp
+    last = first + spec.logical_I_tp
+    sources = []
+    for projections, rows, columns, selection in (
+        (
+            ("w1", "w3"),
+            spec.global_intermediate_size,
+            spec.hidden_size // 32,
+            dict(join=2, row_range=(first, last)),
+        ),
+        (
+            ("w2",),
+            spec.hidden_size,
+            spec.global_intermediate_size // 32,
+            dict(column_range=(first // 32, last // 32)),
+        ),
+    ):
+        components = [
+            tuple(
+                loader.get_tensor(
+                    f"layers.{layer_idx}.ffn.experts.{expert}.{projection}.scale.csf32_{field}"
+                )
+                for field in fields
+            )
+            for expert in range(spec.num_experts)
+            for projection in projections
+        ]
+        sources.append(
+            stage_csf_sources(
+                components,
+                rows=rows,
+                columns=columns,
+                quantization="mxfp4",
+                device=device,
+                encoding="csf_32x2_v1",
+                **selection,
+            )
+        )
+    return tuple(sources)
 
 
 def build_model_spec(
@@ -1177,6 +1222,7 @@ def load_expert_weights(
     oracle_w2_weight = None
     oracle_w2_scale = None
     w13_layout = "w31"
+    mxfp4_csf_sources = None
     if checkpoint_family in {
         "nano35_w4a16_shape",
         "dsv4f_shape",
@@ -1679,6 +1725,13 @@ def load_expert_weights(
         gate_proj = "w1"
         up_proj = "w3"
         down_proj = "w2"
+        if (
+            uses_v41_checkpoint_layout
+            and f"{prefix}.0.w1.scale.csf32_bases" in loader.weight_map
+        ):
+            mxfp4_csf_sources = _load_v41_csf_sources(
+                loader, spec, layer_idx=layer_idx, device=device
+            )
         e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
         if e8m0_dtype is None:
             raise RuntimeError(
@@ -1717,18 +1770,20 @@ def load_expert_weights(
                     ),
                     0,
                 ).to(device)
-                gate_sf[eid] = shard(
-                    loader.get_tensor(f"{ep}.{gate_proj}.scale"),
-                    0,
-                ).to(device)
+                if mxfp4_csf_sources is None:
+                    gate_sf[eid] = shard(
+                        loader.get_tensor(f"{ep}.{gate_proj}.scale"),
+                        0,
+                    ).to(device)
                 up_w[eid] = shard(
                     _fp4_checkpoint_bytes(loader.get_tensor(f"{ep}.{up_proj}.weight")),
                     0,
                 ).to(device)
-                up_sf[eid] = shard(
-                    loader.get_tensor(f"{ep}.{up_proj}.scale"),
-                    0,
-                ).to(device)
+                if mxfp4_csf_sources is None:
+                    up_sf[eid] = shard(
+                        loader.get_tensor(f"{ep}.{up_proj}.scale"),
+                        0,
+                    ).to(device)
                 down_w[eid] = shard(
                     _fp4_checkpoint_bytes(
                         loader.get_tensor(f"{ep}.{down_proj}.weight")
@@ -1736,11 +1791,12 @@ def load_expert_weights(
                     1,
                     packing=2,
                 ).to(device)
-                down_sf[eid] = shard(
-                    loader.get_tensor(f"{ep}.{down_proj}.scale"),
-                    1,
-                    packing=32,
-                ).to(device)
+                if mxfp4_csf_sources is None:
+                    down_sf[eid] = shard(
+                        loader.get_tensor(f"{ep}.{down_proj}.scale"),
+                        1,
+                        packing=32,
+                    ).to(device)
             else:
                 tp_off = spec.tp_rank * I_tp
                 tp_off_packed = tp_off // 2
@@ -1782,7 +1838,20 @@ def load_expert_weights(
         # FP4 W13 source is contiguous [w1/gate, w3/up], and B12X receives it
         # without an additional row swap.
         w13_weight = torch.cat([gate_w, up_w], dim=1).contiguous()
-        w13_sf = torch.cat([gate_sf, up_sf], dim=1).contiguous()
+        if mxfp4_csf_sources is None:
+            w13_sf = torch.cat([gate_sf, up_sf], dim=1).contiguous()
+        else:
+            from b12x._lib.quant._csf_prepare import (
+                expand_source_scales,
+                validate_source,
+            )
+
+            w13_sf = torch.empty(E, 2 * I_tp, K // 32, dtype=e8m0_dtype, device=device)
+            for source, output in zip(
+                mxfp4_csf_sources, (w13_sf, down_sf), strict=True
+            ):
+                validate_source(source)
+                expand_source_scales(source, output, swizzled=False)
         w13_sf.view(torch.uint8).clamp_(max=247)
         down_sf.view(torch.uint8).clamp_(max=247)
         w13_blockscale_swizzled = w13_sf
@@ -1865,6 +1934,7 @@ def load_expert_weights(
         oracle_w2_weight=oracle_w2_weight,
         oracle_w2_scale=oracle_w2_scale,
         w13_layout=w13_layout,
+        mxfp4_csf_sources=mxfp4_csf_sources,
     )
 
 
@@ -2347,31 +2417,51 @@ def prepare_b12x_benchmark_weights(
         if scale_compression == "csf_32x2_v1"
         else fused_moe.prepare_weights
     )
-    experts = prepare(
-        plan=plan,
-        weights=fused_moe.PackedWeights(
-            w13=weights.w13_weight,
-            w2=weights.w2_weight,
-            w13_block_scales=weights.w13_blockscale_swizzled,
-            w2_block_scales=weights.w2_blockscale_swizzled,
-            w13_global_scales=w1_global_scale,
-            w2_global_scales=w2_global_scale,
-            input_scale=params.a1_gscale,
-            intermediate_scale=params.a2_gscale,
-            immutable_input_scales=True,
-        ),
-        scale_scratch=(
-            tuple(
-                torch.empty_like(t)
-                for t in (
-                    weights.w13_blockscale_swizzled,
-                    weights.w2_blockscale_swizzled,
-                )
+    if weights.mxfp4_csf_sources is not None:
+        if quant_mode != "w4a8_mx" or plan.scale_compression != "csf":
+            raise ValueError(
+                "Native MXFP4-CSF checkpoint scales require W4A8 MX with CSF preparation"
             )
-            if plan.scale_compression == "csf"
-            else None
-        ),
-    )
+        scratch = tuple(
+            torch.empty_like(t)
+            for t in (weights.w13_blockscale_swizzled, weights.w2_blockscale_swizzled)
+        )
+        experts = fused_moe.prepare_weights(
+            plan=replace(plan, scale_compression=None),
+            weights=fused_moe.Mxfp4CsfWeights(
+                weights.w13_weight,
+                weights.w2_weight,
+                *weights.mxfp4_csf_sources,
+                *scratch,
+            ),
+        )
+        weights.mxfp4_csf_sources = None
+    else:
+        experts = prepare(
+            plan=plan,
+            weights=fused_moe.PackedWeights(
+                w13=weights.w13_weight,
+                w2=weights.w2_weight,
+                w13_block_scales=weights.w13_blockscale_swizzled,
+                w2_block_scales=weights.w2_blockscale_swizzled,
+                w13_global_scales=w1_global_scale,
+                w2_global_scales=w2_global_scale,
+                input_scale=params.a1_gscale,
+                intermediate_scale=params.a2_gscale,
+                immutable_input_scales=True,
+            ),
+            scale_scratch=(
+                tuple(
+                    torch.empty_like(t)
+                    for t in (
+                        weights.w13_blockscale_swizzled,
+                        weights.w2_blockscale_swizzled,
+                    )
+                )
+                if plan.scale_compression == "csf"
+                else None
+            ),
+        )
     if plan.scale_compression == "csf":
         weights.w13_scale = weights.down_scale = None
         weights.w13_blockscale_swizzled = weights.w2_blockscale_swizzled = None
@@ -2976,6 +3066,102 @@ def compare_graph_replay_outputs(
     return metrics
 
 
+def live_moe_inputs(x, ids, probabilities, num_experts):
+    changed_ids = (ids.roll(1, 0) + 17).remainder(num_experts)
+    changed_ids[0].fill_(-1)
+    changed_ids[-1, ::2].fill_(-7)
+    return x * -0.75, changed_ids, probabilities * 0.75
+
+
+def validate_live_moe_graph(
+    graph, eager, x, ids, probabilities, output, experts, oracle
+):
+    """Replay bound storage after changing live operands and resident weights."""
+    operands = (x, ids, probabilities)
+    saved = tuple(tensor.clone() for tensor in operands)
+    native_down = experts._impl.w2_fp4
+    saved_down = native_down.clone()
+    original_output = output.clone()
+    pointers = tuple(tensor.data_ptr() for tensor in (*operands, output, native_down))
+
+    def replay():
+        if experts.has_csf_blocks:
+            for scales in (experts._impl.w1_blockscale, experts._impl.w2_blockscale):
+                scales.view(torch.uint8).fill_(0x7F)
+        output.fill_(float("nan"))
+        allocated = torch.cuda.memory_stats(x.device)["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize(x.device)
+        if torch.cuda.memory_stats(x.device)["allocation.all.allocated"] != allocated:
+            raise RuntimeError("MoE graph replay allocated CUDA storage")
+        if pointers != tuple(
+            tensor.data_ptr() for tensor in (*operands, output, native_down)
+        ):
+            raise RuntimeError("MoE graph replay changed bound storage")
+        if not bool(torch.isfinite(output).all()):
+            raise RuntimeError("MoE graph replay produced nonfinite live output")
+
+    def consistency(label, reference):
+        metrics = compare_graph_replay_outputs(output, reference)
+        failures = check_oracle_metrics(
+            label, metrics, x.shape[0], oracle_mode="w4a8_mx"
+        )
+        if metrics.cos <= 0.9999:
+            failures.append(f"{label}: cosine={metrics.cos:.9f} <= 0.9999")
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        return dict(
+            asdict(metrics),
+            output_norm=output.float().norm().item(),
+            reference_norm=reference.float().norm().item(),
+        )
+
+    metrics = {}
+    try:
+        for tensor, changed in zip(
+            operands, live_moe_inputs(*operands, experts.num_experts), strict=True
+        ):
+            tensor.copy_(changed)
+        eager()
+        torch.cuda.synchronize(x.device)
+        expected = output.clone()
+        replay()
+        metrics["live_graph_vs_eager"] = consistency("MoE live graph", expected)
+        if oracle is not None:
+            oracle_metrics = compare_to_reference(output, oracle)
+            failures = check_oracle_metrics(
+                "MoE mutated oracle", oracle_metrics, x.shape[0], oracle_mode="w4a8_mx"
+            )
+            if failures:
+                raise RuntimeError("; ".join(failures))
+            metrics["mutated_oracle"] = dict(
+                asdict(oracle_metrics),
+                output_norm=output.float().norm().item(),
+                reference_norm=oracle.float().norm().item(),
+            )
+        if not bool(output[0].eq(0).all()):
+            raise RuntimeError("MoE inactive query row did not produce zero output")
+        probabilities.zero_()
+        replay()
+        if not bool(output.eq(0).all()):
+            raise RuntimeError("MoE graph replay ignored zero route weights")
+        probabilities.copy_(saved[2])
+        native_down.zero_()
+        replay()
+        if not bool(output.eq(0).all()):
+            raise RuntimeError("MoE graph replay ignored changed packed weights")
+    finally:
+        native_down.copy_(saved_down)
+        for tensor, original in zip(operands, saved, strict=True):
+            tensor.copy_(original)
+        replay()
+    metrics["restored_graph_vs_eager"] = consistency(
+        "MoE restored graph", original_output
+    )
+    metrics["guards"] = "passed"
+    return metrics
+
+
 def prepare_moe_execution(
     *,
     session: PreparationSession,
@@ -3131,6 +3317,10 @@ def prepare_moe_execution(
             ),
         )
     )
+    for tokens, scale_plan in scale_plans.items():
+        print(
+            f"  scale preparation {name} tokens={tokens}: {scale_plan.selection.config}"
+        )
     execution = declaration
     selection = execution.selection
     if selection is None:
@@ -3820,14 +4010,6 @@ def bench_e2e() -> None:
         args.scale_compression = model_profile.default_scale_compression
     elif args.scale_compression == "none":
         args.scale_compression = None
-    if config_override is not None and config_override.csf_inline_scales:
-        if (
-            args.quant_mode not in {"nvfp4", "w4a16", "w4a8_mx"}
-            or args.scale_compression != "csf_32x2_v1"
-        ):
-            parser.error(
-                "csf_inline_scales requires csf_32x2_v1 scales and a native FP4 recipe"
-            )
     if args.swiglu_clamp_after_silu is None:
         args.swiglu_clamp_after_silu = model_profile.default_swiglu_clamp_after_silu
     use_w4a16 = args.quant_mode == "w4a16"
@@ -4174,6 +4356,7 @@ def bench_e2e() -> None:
         scale_compression=args.scale_compression,
     )
     precomputed_oracles: dict[tuple[int, int], torch.Tensor] = {}
+    mutated_oracles: dict[tuple[int, int], torch.Tensor] = {}
     if args.validate == "oracle":
         print(
             "  Precomputing oracle outputs before destructive weight preparation...",
@@ -4199,6 +4382,27 @@ def bench_e2e() -> None:
             # Outputs are the only state retained across the ownership
             # transfer.  Keep them off-device; never retain a second model.
             precomputed_oracles[batch_size, sample_index] = oracle_output.detach().cpu()
+            if (
+                model_profile.checkpoint_family == "deepseek_v41_flash"
+                and args.quant_mode == "w4a8_mx"
+            ):
+                live_x, live_ids, live_probabilities = live_moe_inputs(
+                    oracle_x, oracle_ids, oracle_topk, spec.num_experts
+                )
+                mutated = make_oracle_reference(
+                    args.oracle_mode,
+                    args.quant_mode,
+                    live_x,
+                    weights,
+                    params,
+                    live_ids,
+                    live_probabilities,
+                    activation=args.activation,
+                    activation_params=activation_params,
+                    quant_scale_math=args.oracle_quant_scale_math,
+                )
+                mutated_oracles[batch_size, sample_index] = mutated.detach().cpu()
+                del live_x, live_ids, live_probabilities, mutated
             del oracle_x, oracle_ids, oracle_topk, oracle_output
         torch.cuda.synchronize()
         # representation.  It must not survive into B12X preparation/runtime.
@@ -4567,6 +4771,24 @@ def bench_e2e() -> None:
                                 "Graph oracle failed: " + "; ".join(failures)
                             )
                         record["graph_oracle"] = asdict(graph_metrics)
+
+                    if (
+                        model_profile.checkpoint_family == "deepseek_v41_flash"
+                        and args.quant_mode == "w4a8_mx"
+                    ):
+                        mutated_oracle = mutated_oracles.get((batch_size, sample_index))
+                        record["live_graph_guards"] = validate_live_moe_graph(
+                            graph,
+                            fn,
+                            x,
+                            topk_ids,
+                            topk_weights,
+                            backend_output,
+                            experts,
+                            None
+                            if mutated_oracle is None
+                            else mutated_oracle.to(device),
+                        )
 
                     timed_fn = replay if args.time_graph_replay else fn
                     device_before = (

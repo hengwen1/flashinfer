@@ -80,76 +80,85 @@ class W4A8CompactMicroActivationKernel:
         if pair < num_pairs:
             expert = Int64(topk_ids[pair])
             if expert >= Int64(0) and expert < Int64(self.num_experts):
-                col = output_tile * Int32(128) + lane * Int32(4)
-                value = cute.make_rmem_tensor((4,), cutlass.Float32)
-                value.fill(0.0)
-                scale_byte = Uint32(0)
-                if col < Int32(self.n):
-                    gate = cute.make_rmem_tensor((4,), cutlass.Float32)
-                    up = cute.make_rmem_tensor((4,), cutlass.Float32)
-                    for i in cutlass.range_constexpr(4):
-                        gate[i] = projections[pair, col + Int32(i)].to(cutlass.Float32)
-                        up[i] = projections[pair, Int32(self.n) + col + Int32(i)].to(
-                            cutlass.Float32
-                        )
-                        if cutlass.const_expr(self.has_swiglu_limit):
-                            limit = cutlass.Float32(self.swiglu_limit)
-                            gate[i] = cutlass.min(gate[i], limit)
-                            up[i] = cutlass.max(
-                                cutlass.min(up[i], limit),
-                                -limit,
-                            )
+                self.activate_tile(projections, intermediate, pair, output_tile, lane)
 
-                    for i in cutlass.range_constexpr(4):
-                        sigmoid = cute.arch.rcp_approx(
-                            cutlass.Float32(1.0)
-                            + cute.math.exp(-gate[i], fastmath=self.fast_math)
-                        )
-                        # Preserve the common W4A8 contract: BF16 activation
-                        # boundary first; route weights are applied after FC2.
-                        value[i] = cutlass.BFloat16(gate[i] * sigmoid * up[i]).to(
-                            cutlass.Float32
-                        )
-
-                # Padded columns still participate in full-warp scale reductions.
-                amax = fabs_f32(value[0])
-                for i in cutlass.range_constexpr(1, 4):
-                    amax = fmax_f32(amax, fabs_f32(value[i]))
-                for shift in cutlass.range_constexpr(3):
-                    amax = fmax_f32(
-                        amax,
-                        cute.arch.shuffle_sync_bfly(amax, offset=1 << shift),
+    @cute.jit
+    def activate_tile(
+        self,
+        projections: cute.Tensor,
+        intermediate: cute.Tensor,
+        pair: Int32,
+        output_tile: Int32,
+        lane: Int32,
+    ) -> None:
+        col = output_tile * Int32(128) + lane * Int32(4)
+        value = cute.make_rmem_tensor((4,), cutlass.Float32)
+        value.fill(0.0)
+        scale_byte = Uint32(0)
+        if col < Int32(self.n):
+            gate = cute.make_rmem_tensor((4,), cutlass.Float32)
+            up = cute.make_rmem_tensor((4,), cutlass.Float32)
+            for i in cutlass.range_constexpr(4):
+                gate[i] = projections[pair, col + Int32(i)].to(cutlass.Float32)
+                up[i] = projections[pair, Int32(self.n) + col + Int32(i)].to(
+                    cutlass.Float32
+                )
+                if cutlass.const_expr(self.has_swiglu_limit):
+                    limit = cutlass.Float32(self.swiglu_limit)
+                    gate[i] = cutlass.min(gate[i], limit)
+                    up[i] = cutlass.max(
+                        cutlass.min(up[i], limit),
+                        -limit,
                     )
-                if col < Int32(self.n):
-                    _, scale_byte = pow2_ceil_ue8m0(
-                        amax * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
-                    )
-                    inv_scale = ue8m0_to_output_scale(scale_byte)
-                    for i in cutlass.range_constexpr(4):
-                        value[i] = value[i] * inv_scale
 
-                rows = Int64(projections.shape[0])
-                words_per_row = Int64(self.n_padded // 4)
-                physical_row = Int64(pair)
-                intermediate[
-                    physical_row * words_per_row + output_tile * Int32(32) + lane
-                ] = cvt_f32x4_to_e4m3x4(
-                    value[0],
-                    value[1],
-                    value[2],
-                    value[3],
+            for i in cutlass.range_constexpr(4):
+                sigmoid = cute.arch.rcp_approx(
+                    cutlass.Float32(1.0)
+                    + cute.math.exp(-gate[i], fastmath=self.fast_math)
+                )
+                # Preserve the common W4A8 contract: BF16 activation
+                # boundary first; route weights are applied after FC2.
+                value[i] = cutlass.BFloat16(gate[i] * sigmoid * up[i]).to(
+                    cutlass.Float32
                 )
 
-                # Each N128 scale plane has one packed word per physical row.
-                # Tail padding receives zero scale bytes alongside zero values.
-                if lane % Int32(8) == Int32(0):
-                    intermediate_u8 = cute.recast_tensor(intermediate, Uint8)
-                    scale_byte_index = (
-                        rows * words_per_row + output_tile * rows + physical_row
-                    ) * Int32(4) + lane // Int32(8)
-                    intermediate_u8[scale_byte_index] = (scale_byte & Uint32(0xFF)).to(
-                        Uint8
-                    )
+        # Padded columns still participate in full-warp scale reductions.
+        amax = fabs_f32(value[0])
+        for i in cutlass.range_constexpr(1, 4):
+            amax = fmax_f32(amax, fabs_f32(value[i]))
+        for shift in cutlass.range_constexpr(3):
+            amax = fmax_f32(
+                amax,
+                cute.arch.shuffle_sync_bfly(amax, offset=1 << shift),
+            )
+        if col < Int32(self.n):
+            _, scale_byte = pow2_ceil_ue8m0(
+                amax * cutlass.Float32(1.0 / FLOAT8_E4M3_MAX)
+            )
+            inv_scale = ue8m0_to_output_scale(scale_byte)
+            for i in cutlass.range_constexpr(4):
+                value[i] = value[i] * inv_scale
+
+        rows = Int64(projections.shape[0])
+        words_per_row = Int64(self.n_padded // 4)
+        physical_row = Int64(pair)
+        intermediate[physical_row * words_per_row + output_tile * Int32(32) + lane] = (
+            cvt_f32x4_to_e4m3x4(
+                value[0],
+                value[1],
+                value[2],
+                value[3],
+            )
+        )
+
+        # Each N128 scale plane has one packed word per physical row.
+        # Tail padding receives zero scale bytes alongside zero values.
+        if lane % Int32(8) == Int32(0):
+            intermediate_u8 = cute.recast_tensor(intermediate, Uint8)
+            scale_byte_index = (
+                rows * words_per_row + output_tile * rows + physical_row
+            ) * Int32(4) + lane // Int32(8)
+            intermediate_u8[scale_byte_index] = (scale_byte & Uint32(0xFF)).to(Uint8)
 
 
 __all__ = ["W4A8CompactMicroActivationKernel"]

@@ -32,6 +32,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32
 from cutlass.cutlass_dsl import Int32, Int64
+from b12x.moe._shared.kernels.routing_ids import local_expert_id
 
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
@@ -207,7 +208,7 @@ class MoETinyDecodeKernelBackend:
         inter: cute.Tensor,  # f32 [rt * 2n] (pre-zeroed for phase 1)
         w2: cute.Tensor,  # u8 rp bytes
         sfb2: cute.Tensor,  # u8 sfb bytes
-        topk_ids: cute.Tensor,  # i32 [rt]
+        topk_ids: cute.Tensor,  # i32 or i64 [rt]
         topk_weights: cute.Tensor,  # f32 [rt]
         out: cute.Tensor,  # bf16 [m*k] (pre-zeroed for phase 2)
     ):
@@ -233,7 +234,7 @@ class MoETinyDecodeKernelBackend:
             rem = bidx % fc1_per_rt
             nt = rem // Int32(c["fc1_ktg"])
             ktg = rem % Int32(c["fc1_ktg"])
-            route_eid = Int32(topk_ids[rt_idx])
+            route_eid = local_expert_id(topk_ids[rt_idx], Int32(c["weight_E"]))
             route_active = route_eid >= Int32(0) and route_eid < Int32(c["weight_E"])
             # vLLM represents CUDA-graph padding and non-local EP routes with
             # an expert id outside [0, weight_E). Keep every address in range;
@@ -335,7 +336,7 @@ class MoETinyDecodeKernelBackend:
             rem = bidx % fc2_per_rt
             nt = rem // Int32(c["fc2_ktg"])
             ktg = rem % Int32(c["fc2_ktg"])
-            route_eid = Int32(topk_ids[rt_idx])
+            route_eid = local_expert_id(topk_ids[rt_idx], Int32(c["weight_E"]))
             route_active = route_eid >= Int32(0) and route_eid < Int32(c["weight_E"])
             eid = Int64(0)
             if route_active:
@@ -538,7 +539,11 @@ class MoETinyDecodeKernelBackend:
             ptr(cutlass.Float32, inter_fp32),
             ptr(cutlass.Uint8, w2_rp.view(torch.uint8)),
             ptr(cutlass.Uint8, sfb2.view(torch.uint8)),
-            ptr(cutlass.Int32, topk_ids, 4),
+            ptr(
+                cutlass.Int32 if topk_ids.dtype == torch.int32 else cutlass.Int64,
+                topk_ids,
+                4 if topk_ids.dtype == torch.int32 else 8,
+            ),
             ptr(cutlass.Float32, topk_weights, 4),
             ptr(cutlass.BFloat16, out),
             stream,

@@ -184,19 +184,28 @@ class CsfInlineReader:
         bounds=None,
         value_offset=None,
         base_word=None,
+        coordinates=None,
     ):
         """Stage codes, bases and the first 32 exceptions in a 512-byte slot.
 
         Callers publish the asynchronous copies before reconstructing the slot.
-        Dense exception tails remain in the resident payload.
+        Dense exception tails remain in the resident payload. Optional coordinates
+        contain the section, row group and column group matching ``group``.
         """
         storage = cute.recast_ptr(storage, dtype=cutlass.Uint8)
-        source_expert = expert * Int32(self.plane.sections) + group // Int32(
-            self.plane.storage.groups
-        )
-        source_group = group % Int32(self.plane.storage.groups)
-        row_group = source_group // Int32(self.plane.storage.column_groups)
-        column_group = source_group % Int32(self.plane.storage.column_groups)
+        if cutlass.const_expr(coordinates is not None):
+            section, row_group, column_group = coordinates
+            source_expert = expert * Int32(self.plane.sections) + section
+            source_group = (
+                row_group * Int32(self.plane.storage.column_groups) + column_group
+            )
+        else:
+            source_expert = expert * Int32(self.plane.sections) + group // Int32(
+                self.plane.storage.groups
+            )
+            source_group = group % Int32(self.plane.storage.groups)
+            row_group = source_group // Int32(self.plane.storage.column_groups)
+            column_group = source_group % Int32(self.plane.storage.column_groups)
         nr = cutlass.min(
             Int32(128), Int32(self.plane.storage.rows) - row_group * Int32(128)
         )
@@ -342,9 +351,9 @@ class CsfInlineReader:
                         packed, packed >> Uint32(4), Int32(0x5140)
                     ) & Uint32(0x0F0F0F0F)
                 else:
-                    offsets = packed & Uint32(15)
-                    offsets = (offsets | (offsets << Uint32(14))) & Uint32(0x00030003)
-                    offsets = (offsets | (offsets << Uint32(7))) & Uint32(0x01010101)
+                    offsets = ((packed & Uint32(15)) * Uint32(0x00204081)) & Uint32(
+                        0x01010101
+                    )
                 base = Uint32(0)
                 if cutlass.const_expr(self.plane.destination == 1):
                     base = ld_shared_u32(address + Int32(256) + index % nr)

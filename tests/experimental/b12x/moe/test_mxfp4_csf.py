@@ -327,6 +327,7 @@ def test_expanded_scales_match_native_under_poisoned_replay(
     activation_mode="a8",
     deterministic=True,
     packing=None,
+    inactive=False,
 ):
     """Poisoned scale scratch is restored before native kernels execute."""
     device = require_b12x()
@@ -416,6 +417,10 @@ def test_expanded_scales_match_native_under_poisoned_replay(
         for _ in range(3):
             source.neg_()
             ids.add_(1).remainder_(e)
+            if inactive:
+                ids[0, 0] = -1
+                if tokens > 1:
+                    ids[-1, -1] = e
             for buffer in scratch[0]:
                 buffer.view(torch.uint8).fill_(0xFF)
             for output in outputs:
@@ -652,6 +657,68 @@ def test_inline_poisoned_graph(h, n, tokens, backend, tile_m, layout, monkeypatc
         execution_override=config,
         activation_mode="a16" if backend == "w4a16" else "a8",
         packing="mma_packed" if backend == "w4a16" else None,
+    )
+
+
+@pytest.mark.parametrize(
+    "h,n,tokens,fc1_tile_n,fuse_input_quantization",
+    [
+        (h, n, tokens, tile, False)
+        for h, n, tokens in (
+            (256, 192, 8),
+            (512, 192, 1),
+            (512, 192, 8),
+            (512, 192, 16),
+            (5120, 576, 8),
+            (5120, 576, 16),
+        )
+        for tile in (64, 128)
+    ]
+    + [(h, n, 8, 128, True) for h, n in ((256, 192), (512, 192), (5120, 576))],
+)
+@pytest.mark.parametrize("layout", ["w13", "w31"])
+@pytest.mark.parametrize("max_active_clusters", (None, 1))
+@pytest.mark.parametrize(
+    "copy_groups,pipeline_stages",
+    (
+        pytest.param(1, 1, id="single-slot"),
+        pytest.param(1, 2, id="double-slot-one-group"),
+        pytest.param(2, 2, id="double-slot-two-groups"),
+    ),
+)
+@pytest.mark.parametrize("inline_scales", (False, True))
+def test_compact_micro_inline_poisoned_graph(
+    h,
+    n,
+    tokens,
+    layout,
+    fc1_tile_n,
+    max_active_clusters,
+    copy_groups,
+    pipeline_stages,
+    fuse_input_quantization,
+    inline_scales,
+    monkeypatch,
+):
+    config = moe.MoeDecodeConfig(
+        backend="micro",
+        route_planner="internal",
+        max_active_clusters=max_active_clusters,
+        micro_fc1_tile_n=fc1_tile_n,
+        micro_fc1_max_copy_groups=copy_groups,
+        micro_fc1_pipeline_stages=pipeline_stages,
+        compact_fuse_input_quantization=fuse_input_quantization,
+    )
+    test_expanded_scales_match_native_under_poisoned_replay(
+        h,
+        n,
+        tokens,
+        layout,
+        torch.int32,
+        monkeypatch,
+        inline=inline_scales,
+        execution_override=config,
+        inactive=True,
     )
 
 

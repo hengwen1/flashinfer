@@ -108,15 +108,25 @@ class MoeDecodeConfig:
     w4a16_tile_config: tuple[int, int, int, int] | None = None
     w4a16_block_size_m: int | None = None
     w4a16_pipeline_stages: int | None = None
+    micro_fc1_tile_n: int = 128
+    materialized_fc1_cta_budget: int = 2
+    micro_fc1_max_copy_groups: int = 2
+    compact_fuse_input_quantization: bool = False
+    micro_fc1_pipeline_stages: int = 2
 
     @classmethod
     def from_config(cls, payload: FrozenMapping) -> "MoeDecodeConfig":
         expected = {
+            "materialized_fc1_cta_budget",
+            "compact_fuse_input_quantization",
             "backend",
             "dynamic_route_mode",
             "dynamic_tile_m",
             "dynamic_mma_warps",
             "max_active_clusters",
+            "micro_fc1_tile_n",
+            "micro_fc1_max_copy_groups",
+            "micro_fc1_pipeline_stages",
             "route_planner",
             "w4a16_route_mode",
             "nvfp4_share_input",
@@ -134,8 +144,20 @@ class MoeDecodeConfig:
         backend = payload["backend"]
         route_planner = payload["route_planner"]
         max_active_clusters = payload["max_active_clusters"]
+        micro_fc1_tile_n = payload["micro_fc1_tile_n"]
+        if type(micro_fc1_tile_n) is not int:
+            raise TypeError("micro_fc1_tile_n must be an integer")
+        micro_fc1_max_copy_groups = payload["micro_fc1_max_copy_groups"]
+        if type(micro_fc1_max_copy_groups) is not int:
+            raise TypeError("micro_fc1_max_copy_groups must be an integer")
+        micro_fc1_pipeline_stages = payload["micro_fc1_pipeline_stages"]
+        if type(micro_fc1_pipeline_stages) is not int:
+            raise TypeError("micro_fc1_pipeline_stages must be an integer")
         dynamic_tile_m = payload["dynamic_tile_m"]
         dynamic_mma_warps = payload["dynamic_mma_warps"]
+        materialized_fc1_cta_budget = payload["materialized_fc1_cta_budget"]
+        if type(materialized_fc1_cta_budget) is not int:
+            raise TypeError("materialized_fc1_cta_budget must be an integer")
         if dynamic_mma_warps is not None and type(dynamic_mma_warps) is not int:
             raise TypeError("dynamic_mma_warps must be an integer or null")
         dynamic_route_mode = payload["dynamic_route_mode"]
@@ -161,6 +183,7 @@ class MoeDecodeConfig:
                 "nvfp4_share_input",
                 "nvfp4_materialize_intermediate",
                 "csf_inline_scales",
+                "compact_fuse_input_quantization",
             )
         ):
             raise TypeError("Scale and NVFP4 lowering controls must be boolean")
@@ -180,13 +203,18 @@ class MoeDecodeConfig:
             backend=backend,
             route_planner=route_planner,
             max_active_clusters=max_active_clusters,
+            micro_fc1_tile_n=micro_fc1_tile_n,
+            micro_fc1_max_copy_groups=micro_fc1_max_copy_groups,
+            micro_fc1_pipeline_stages=micro_fc1_pipeline_stages,
             dynamic_tile_m=dynamic_tile_m,
             dynamic_mma_warps=dynamic_mma_warps,
+            materialized_fc1_cta_budget=materialized_fc1_cta_budget,
             dynamic_route_mode=dynamic_route_mode,
             w4a16_route_mode=w4a16_route_mode,
             nvfp4_share_input=payload["nvfp4_share_input"],
             nvfp4_materialize_intermediate=payload["nvfp4_materialize_intermediate"],
             csf_inline_scales=payload["csf_inline_scales"],
+            compact_fuse_input_quantization=payload["compact_fuse_input_quantization"],
             w4a16_tile_config=tiles,
             w4a16_block_size_m=payload["w4a16_block_size_m"],
             w4a16_pipeline_stages=payload["w4a16_pipeline_stages"],
@@ -197,8 +225,13 @@ class MoeDecodeConfig:
             "backend": self.backend,
             "route_planner": self.route_planner,
             "max_active_clusters": self.max_active_clusters,
+            "micro_fc1_tile_n": self.micro_fc1_tile_n,
+            "micro_fc1_max_copy_groups": self.micro_fc1_max_copy_groups,
+            "micro_fc1_pipeline_stages": self.micro_fc1_pipeline_stages,
             "dynamic_tile_m": self.dynamic_tile_m,
             "dynamic_mma_warps": self.dynamic_mma_warps,
+            "materialized_fc1_cta_budget": self.materialized_fc1_cta_budget,
+            "compact_fuse_input_quantization": self.compact_fuse_input_quantization,
             "dynamic_route_mode": self.dynamic_route_mode,
             "w4a16_route_mode": self.w4a16_route_mode,
             "nvfp4_share_input": self.nvfp4_share_input,
@@ -326,11 +359,12 @@ def _csf_inline_eligible(query, config):
         return False
     if (
         query.csf_inline_scales
-        and config.backend == "dynamic"
+        and config.backend in {"micro", "dynamic"}
         and query.quant_mode == "w4a8_mx"
     ):
         return (
-            query.source_format == "fp4_e8m0_k32"
+            (config.backend != "micro" or _compact_w4a8_query(query))
+            and query.source_format == "fp4_e8m0_k32"
             and query.activation == "silu"
             and query.hidden_size % 256 == 0
             and query.intermediate_size % 64 == 0
@@ -369,6 +403,18 @@ def _compact_w4a8_query(query):
         query.quant_mode == "w4a8_mx"
         and query.source_format == "fp4_e8m0_k32"
         and query.intermediate_size % 128 == 64
+    )
+
+
+def _compact_input_quantization_eligible(query, config):
+    return (
+        config.backend == "micro"
+        and config.micro_fc1_tile_n == 128
+        and _compact_w4a8_query(query)
+        and query.io_dtype == "bfloat16"
+        and query.activation == "silu"
+        and query.hidden_size % 256 == 0
+        and 4 <= query.num_tokens <= 8
     )
 
 
@@ -413,6 +459,18 @@ def validate_moe_decode_config(
 ) -> None:
     """Reject a decode config the query's recipe cannot execute."""
     _validate_w4a16_launch(query, config)
+    if type(config.micro_fc1_tile_n) is not int:
+        raise TypeError("micro_fc1_tile_n must be an integer")
+    if config.micro_fc1_tile_n not in (64, 128):
+        raise ValueError("compact FC1 tile N must be 64 or 128")
+    if type(config.micro_fc1_max_copy_groups) is not int:
+        raise TypeError("micro_fc1_max_copy_groups must be an integer")
+    if config.micro_fc1_max_copy_groups not in (1, 2):
+        raise ValueError("compact FC1 permits one or two pending copy groups")
+    if type(config.micro_fc1_pipeline_stages) is not int:
+        raise TypeError("micro_fc1_pipeline_stages must be an integer")
+    if config.micro_fc1_pipeline_stages not in (1, 2):
+        raise ValueError("micro_fc1_pipeline_stages must be one or two")
     if query.source_format in BLOCK_CODECS:
         if query.quant_mode != "w4a16" or query.io_dtype != "bfloat16":
             raise ValueError("IQ2_XS requires BF16 W4A16 execution")
@@ -446,6 +504,38 @@ def validate_moe_decode_config(
                     "non-W4A16 multi-recipe MoE requires an explicit recipe route"
                 )
             query = replace(query, quant_mode=non_a16[0])
+    if config.micro_fc1_tile_n == 64 and not (
+        config.backend == "micro" and _compact_w4a8_query(query)
+    ):
+        raise ValueError("N64 FC1 tiles require native compact W4A8 micro geometry")
+    if config.micro_fc1_max_copy_groups == 1 and not (
+        config.backend == "micro" and _compact_w4a8_query(query)
+    ):
+        raise ValueError(
+            "one pending FC1 copy group requires native compact micro execution"
+        )
+    if config.micro_fc1_pipeline_stages == 1 and not (
+        config.backend == "micro"
+        and _compact_w4a8_query(query)
+        and config.micro_fc1_max_copy_groups == 1
+    ):
+        raise ValueError(
+            "one FC1 pipeline stage requires native compact micro and one copy group"
+        )
+    if type(config.materialized_fc1_cta_budget) is not int:
+        raise TypeError("materialized_fc1_cta_budget must be an integer")
+    if config.materialized_fc1_cta_budget not in (2, 3):
+        raise ValueError("materialized_fc1_cta_budget must be two or three")
+    if config.materialized_fc1_cta_budget == 3 and not (
+        config.backend == "dynamic"
+        and config.dynamic_tile_m == 16
+        and config.csf_inline_scales
+        and _compact_w4a8_query(query)
+        and _csf_inline_eligible(query, config)
+    ):
+        raise ValueError(
+            "three-CTA materialized FC1 requires native N64 M16 SiLU with inline CSF scales"
+        )
     if config.dynamic_mma_warps is not None and not (
         type(config.dynamic_mma_warps) is int
         and config.dynamic_mma_warps == 4
@@ -463,9 +553,17 @@ def validate_moe_decode_config(
             config.nvfp4_share_input,
             config.nvfp4_materialize_intermediate,
             config.csf_inline_scales,
+            config.compact_fuse_input_quantization,
         )
     ):
         raise TypeError("Scale and NVFP4 lowering controls must be boolean")
+    if (
+        config.compact_fuse_input_quantization
+        and not _compact_input_quantization_eligible(query, config)
+    ):
+        raise ValueError(
+            "fused compact input quantization requires paired N128 BF16 native N64 SiLU execution"
+        )
     if config.nvfp4_share_input and not (
         query.quant_mode == "nvfp4"
         and config.backend == "dynamic"
@@ -805,7 +903,17 @@ def _launch_parameter_space(query, device):
                 else knob
                 for knob in TUNING.knobs
             ),
-            values={"max_active_clusters": (None, *ladder)},
+            values={
+                "max_active_clusters": (None, *ladder),
+                "micro_fc1_tile_n": (128, 64),
+                "micro_fc1_max_copy_groups": (2, 1),
+                "compact_fuse_input_quantization": (False, True)
+                if _compact_input_quantization_eligible(
+                    query, MoeDecodeConfig("micro", "internal", None)
+                )
+                else (False,),
+                "micro_fc1_pipeline_stages": (2, 1),
+            },
         )
     if _repacked_w4a8_decode_query(query):
         # M16/M32 repacked kernels permit two resident CTAs per SM. The knob
@@ -854,6 +962,27 @@ def _launch_parameter_space(query, device):
     return {"max_active_clusters": (None, *ladder)}
 
 
+@dataclass(frozen=True, kw_only=True)
+class _MoeParameterSpace(ParameterSpace):
+    sparse_grids: tuple[object, ...]
+
+    def _product(self, index, assignment):
+        if index < len(self.knobs):
+            knob = self.knobs[index]
+            if (
+                knob.name == "max_active_clusters"
+                and knob.active(assignment)
+                and not self.exhaustive
+                and self.autotune_effort is not AutotuneEffort.MAX
+            ):
+                for value in self.sparse_grids:
+                    assignment[knob.name] = value
+                    yield from self._product(index + 1, assignment)
+                del assignment[knob.name]
+                return
+        yield from super()._product(index, assignment)
+
+
 def _tuning_parameters(query, device):
     launch_query = query
     if query.quant_mode == "multi":
@@ -889,7 +1018,7 @@ def _tuning_parameters(query, device):
     sparse_grids = frozenset(grid_knob.values)
     limit = max((v for v in sparse_grids if v is not None), default=0)
     grids = (None, *range(1, limit + 1))
-    return ParameterSpace.create(
+    dense_space = ParameterSpace.create(
         space.knobs,
         values={"max_active_clusters": grids, **w4a16_values},
         predicates=space.predicates,
@@ -910,6 +1039,13 @@ def _tuning_parameters(query, device):
             ),
         ),
         autotune_effort=query.autotune_effort,
+    )
+    return _MoeParameterSpace(
+        knobs=dense_space.knobs,
+        predicates=dense_space.predicates,
+        efficiency_predicates=dense_space.efficiency_predicates,
+        autotune_effort=dense_space.autotune_effort,
+        sparse_grids=tuple(value for value in grids if value in sparse_grids),
     )
 
 
@@ -1001,7 +1137,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 TUNING = TuningContract(
     component_id="moe.decode",
     query_schema_version=33,
-    config_schema_version=26,
+    config_schema_version=31,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
     encode_query=MoeDecodeQuery.to_dict,
@@ -1010,12 +1146,33 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=36,
+    candidate_contract_version=62,
     knobs=(
         Knob(
             name="backend",
             values=("w4a16", "micro", "dynamic"),
             binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="micro_fc1_tile_n",
+            values=(128,),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "micro"}),
+            otherwise=128,
+        ),
+        Knob(
+            name="micro_fc1_max_copy_groups",
+            values=(2,),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "micro"}),
+            otherwise=2,
+        ),
+        Knob(
+            name="micro_fc1_pipeline_stages",
+            values=(2,),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "micro", "micro_fc1_max_copy_groups": 1}),
+            otherwise=2,
         ),
         Knob(
             name="route_planner",
@@ -1064,6 +1221,22 @@ TUNING = TuningContract(
             name="csf_inline_scales",
             values=(False, True),
             binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="compact_fuse_input_quantization",
+            values=(False,),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "micro", "micro_fc1_tile_n": 128}),
+            otherwise=False,
+        ),
+        Knob(
+            name="materialized_fc1_cta_budget",
+            values=(2, 3),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping(
+                {"backend": "dynamic", "dynamic_tile_m": 16, "csf_inline_scales": True}
+            ),
+            otherwise=2,
         ),
         Knob(
             name="w4a16_route_mode",

@@ -2097,8 +2097,9 @@ def _dynamic_route_plan_kernel(
         topk_ids + routes,
         mask=routes < live_routes,
         other=-1,
-    ).to(tl.int32)
+    )
     valid = (routes < live_routes) & (expert_ids >= 0) & (expert_ids < NUM_EXPERTS)
+    expert_ids = tl.where(valid, expert_ids, -1).to(tl.int32)
     tl.atomic_add(row_counts + expert_ids, 1, mask=valid, sem="relaxed")
     tl.debug_barrier()
 
@@ -11223,6 +11224,7 @@ def _get_dynamic_kernel(
     nvfp4_materialize_intermediate: bool = False,
     csf_inline_scales: bool = False,
     mma_warps: int | None = None,
+    materialized_fc1_cta_budget: int = 2,
     direct_routing: bool = False,
     external_route_plan: bool = False,
     share_input_across_experts: bool = False,
@@ -11239,6 +11241,10 @@ def _get_dynamic_kernel(
     """Resolve, compile, and cache the dynamic MoE kernel specialization for this
     launch geometry.
     """
+    if type(
+        materialized_fc1_cta_budget
+    ) is not int or materialized_fc1_cta_budget not in (2, 3):
+        raise ValueError("materialized FC1 CTA budget must be two or three")
     quant_mode = _normalize_quant_mode(quant_mode)
     # Both MX byte-container recipes ride the nvfp4-shaped launch ABI (no
     # repack/residual operands) and the MXFP8 activation scratch with UE8M0
@@ -11360,6 +11366,7 @@ def _get_dynamic_kernel(
         bool(external_route_plan),
         bool(materialize_intermediate),
         mma_warps,
+        int(materialized_fc1_cta_budget),
         int(trellis_bits),
         bool(trellis_intermediate_hadamard),
         *(("csf_inline_scales",) if csf_inline_scales else ()),
@@ -11400,6 +11407,8 @@ def _get_dynamic_kernel(
     )
     if mma_warps is not None:
         kernel_kwargs["mma_warps"] = mma_warps
+    if materialized_fc1_cta_budget != 2:
+        kernel_kwargs["materialized_fc1_cta_budget"] = materialized_fc1_cta_budget
     kernel_kwargs["share_input_across_experts"] = share_input_across_experts
     kernel_kwargs["deterministic_output"] = bool(deterministic_output)
     kernel_kwargs["num_topk"] = int(num_topk)
@@ -11695,7 +11704,7 @@ def _get_dynamic_kernel(
         ),
         compile_spec=KernelCompileSpec.from_key(
             "integration.tp_moe.dynamic",
-            11,
+            21,
             cache_key,
         ),
         dsl_compile_options=dsl_compile_options,
@@ -11769,6 +11778,7 @@ def _launch_dynamic_flat(
     nvfp4_materialize_intermediate: bool,
     csf_inline_scales: bool,
     mma_warps: int | None = None,
+    materialized_fc1_cta_budget: int = 2,
     share_input_across_experts: bool,
     deterministic_output: bool,
     swiglu_limit: float | None,
@@ -11981,6 +11991,7 @@ def _launch_dynamic_flat(
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
         csf_inline_scales=csf_inline_scales,
         mma_warps=mma_warps,
+        materialized_fc1_cta_budget=materialized_fc1_cta_budget,
         direct_routing=direct_routing,
         external_route_plan=external_route_plan,
         share_input_across_experts=share_input_across_experts,
@@ -12121,6 +12132,8 @@ def _launch_dynamic_flat(
 
 _DYNAMIC_TILE_M_POLICY_CODES = {16: 0, 32: 1, 64: 2, 128: 3}
 _DYNAMIC_POLICY_TILE_MS = tuple(_DYNAMIC_TILE_M_POLICY_CODES)
+# Bits 10..61 encode the cluster limit; bit 62 selects FC1 budget three.
+_DYNAMIC_FC1_BUDGET3_BIT = 1 << 62
 
 
 def _encode_dynamic_launch_policy(
@@ -12134,6 +12147,7 @@ def _encode_dynamic_launch_policy(
     nvfp4_materialize_intermediate: bool = False,
     csf_inline_scales: bool = False,
     mma_warps: int | None = None,
+    materialized_fc1_cta_budget: int = 2,
     swiglu_clamp_after_silu: bool = False,
 ) -> int:
     try:
@@ -12144,6 +12158,12 @@ def _encode_dynamic_launch_policy(
         ) from exc
     if policy_max_active_clusters < -1:
         raise ValueError("policy_max_active_clusters must be -1 or nonnegative")
+    if policy_max_active_clusters > (1 << 52) - 2:
+        raise ValueError("policy_max_active_clusters exceeds the launch policy field")
+    if type(
+        materialized_fc1_cta_budget
+    ) is not int or materialized_fc1_cta_budget not in (2, 3):
+        raise ValueError("materialized FC1 CTA budget must be two or three")
     if mma_warps not in (None, 4):
         raise ValueError("compute warps must be four or the tile default")
     return (
@@ -12157,6 +12177,7 @@ def _encode_dynamic_launch_policy(
         | (int(bool(swiglu_clamp_after_silu)) << 8)
         | (int(bool(csf_inline_scales)) << 9)
         | ((int(policy_max_active_clusters) + 1) << 10)
+        | (_DYNAMIC_FC1_BUDGET3_BIT if materialized_fc1_cta_budget == 3 else 0)
     )
 
 
@@ -12172,7 +12193,7 @@ def _decode_dynamic_launch_policy(
         bool(value & 32),
         bool(value & 64),
         4 if value & 128 else None,
-        (value >> 10) - 1,
+        ((value & (_DYNAMIC_FC1_BUDGET3_BIT - 1)) >> 10) - 1,
     )
 
 
@@ -12346,6 +12367,9 @@ def _tp_moe_dynamic_launch_op(
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
         csf_inline_scales=bool(launch_policy & 512),
+        materialized_fc1_cta_budget=3
+        if launch_policy & _DYNAMIC_FC1_BUDGET3_BIT
+        else 2,
         mma_warps=mma_warps,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
@@ -12458,6 +12482,7 @@ def _launch_dynamic(
     nvfp4_materialize_intermediate: bool = False,
     csf_inline_scales: tuple | None = None,
     mma_warps: int | None = None,
+    materialized_fc1_cta_budget: int = 2,
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
@@ -12483,6 +12508,7 @@ def _launch_dynamic(
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
         csf_inline_scales=csf_inline_scales is not None,
         mma_warps=mma_warps,
+        materialized_fc1_cta_budget=materialized_fc1_cta_budget,
         swiglu_clamp_after_silu=swiglu_clamp_after_silu,
     )
     if deterministic_output and workspace.route_output.numel() < routed_rows * k:
@@ -12869,12 +12895,16 @@ def _get_tiny_decode_kernel(
     num_topk: int,
     *,
     device: torch.device | None = None,
+    topk_ids_dtype: torch.dtype = torch.int32,
 ):
     from b12x.moe._shared.kernels.tiny_decode import (
         MoETinyDecodeKernelBackendPhase1,
         MoETinyDecodeKernelBackendPhase2,
     )
 
+    if topk_ids_dtype not in (torch.int32, torch.int64):
+        raise TypeError("tiny decode expert IDs must be int32 or int64")
+    ids_type = cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
     compiled_phases = []
     for kernel_cls in (
         MoETinyDecodeKernelBackendPhase1,
@@ -12882,14 +12912,14 @@ def _get_tiny_decode_kernel(
     ):
         kernel = kernel_cls()
         kernel.configure(m, k, n, num_topk, weight_E, device=device)
-        cache_key = ("tiny_decode",) + kernel.__cache_key__
+        cache_key = ("tiny_decode", str(topk_ids_dtype)) + kernel.__cache_key__
         cached = None if planning() else _TINY_DECODE_KERNEL_CACHE.get(cache_key)
         if cached is not None:
             compiled_phases.append(cached)
             continue
 
-        def dummy(dt):
-            return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
+        def dummy(dt, align=16):
+            return make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=align)
 
         raise_if_kernel_resolution_frozen(
             "cute.compile", target=kernel, cache_key=cache_key
@@ -12902,13 +12932,13 @@ def _get_tiny_decode_kernel(
             dummy(cutlass.Float32),
             dummy(cutlass.Uint8),
             dummy(cutlass.Uint8),
-            dummy(cutlass.Int32),
+            dummy(ids_type, 16 if topk_ids_dtype == torch.int32 else 8),
             dummy(cutlass.Float32),
             dummy(cutlass.BFloat16),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
                 "integration.tp_moe.tiny_decode",
-                1,
+                2,
                 cache_key,
             ),
         )
@@ -12943,7 +12973,7 @@ def _launch_tiny_decode_flat(
 
     del barrier_count, barrier_epoch
     compiled_fc1, compiled_fc2 = _get_tiny_decode_kernel(
-        weight_E, m, k, n, num_topk, device=a.device
+        weight_E, m, k, n, num_topk, device=a.device, topk_ids_dtype=launch_ids.dtype
     )
     rt = m * num_topk
     inter = micro_intermediate.view(torch.float32).reshape(-1)[: rt * 2 * n]
@@ -13177,11 +13207,7 @@ def _launch_micro(
         # The w4a8_mx tiny band reaches the compact family only via the
         # tiny_decode resolve gate; its weights are N256/K128-repacked,
         # which direct-micro cannot read.
-        if flat_ids.dtype == torch.int32 and flat_ids.is_contiguous():
-            launch_ids = flat_ids
-        else:
-            launch_ids = workspace.compact_topk_ids[: flat_ids.numel()]
-            launch_ids.copy_(flat_ids.to(torch.int32))
+        launch_ids = flat_ids
         torch.ops.b12x.tp_moe_tiny_decode_launch(
             workspace.barrier_count,
             workspace.barrier_epoch,
@@ -13852,13 +13878,20 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             _prepared_kernel=compact.kernels[topk_ids.dtype],
             _prepared_quantize=compact.quantize,
             max_active_clusters=plan.decode_config.max_active_clusters,
+            fc1_tile_n=plan.decode_config.micro_fc1_tile_n,
+            fc1_max_copy_groups=plan.decode_config.micro_fc1_max_copy_groups,
+            fc1_pipeline_stages=plan.decode_config.micro_fc1_pipeline_stages,
             a=a,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             w13=wv.w1_storage,
-            w13_scales=wv.w1_scale_storage,
+            w13_scales=wv.w1_scale_storage
+            if inline_scales is None
+            else inline_scales[0].storage,
             w2=wv.w2_storage,
-            w2_scales=wv.w2_scale_storage,
+            w2_scales=wv.w2_scale_storage
+            if inline_scales is None
+            else inline_scales[1].storage,
             alpha1=wv.w1_alpha,
             alpha2=wv.w2_alpha,
             input_scale=input_gs,
@@ -13867,6 +13900,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             num_topk=num_topk,
             swiglu_limit=swiglu_limit,
             fast_math=fast_math,
+            csf_inline_scales=inline_scales is not None,
+            fuse_input_quantization=plan.decode_config.compact_fuse_input_quantization,
         )
         return scatter_output
 
@@ -13937,6 +13972,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             w4a8_n64_repacked=bool(getattr(prepared_payload, "n64_repack", False)),
             nvfp4_materialize_intermediate=decode_config.nvfp4_materialize_intermediate,
             mma_warps=decode_config.dynamic_mma_warps,
+            materialized_fc1_cta_budget=decode_config.materialized_fc1_cta_budget,
             deterministic_output=deterministic_output,
             swiglu_limit=swiglu_limit,
             swiglu_clamp_after_silu=swiglu_clamp_after_silu,

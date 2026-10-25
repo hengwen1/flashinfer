@@ -18,8 +18,9 @@ from ..conftest import require_b12x
 
 
 class ReadInline:
-    def __init__(self, geometry):
+    def __init__(self, geometry, predecoded_coordinates):
         self.reader = CsfInlineReader(geometry)
+        self.predecoded_coordinates = predecoded_coordinates
 
     @cute.jit
     def __call__(self, source: cute.Pointer, output: cute.Pointer, stream):
@@ -43,7 +44,17 @@ class ReadInline:
             cutlass.Uint32, cute.make_layout(128), byte_alignment=16
         )
         target = cute.recast_ptr(shared.iterator, dtype=cutlass.Uint8)
-        self.reader.stage_compressed(source, expert, group, target, Int32(lane))
+        coordinates = None
+        if cutlass.const_expr(self.predecoded_coordinates):
+            source_group = group % Int32(self.reader.plane.storage.groups)
+            coordinates = (
+                group // Int32(self.reader.plane.storage.groups),
+                source_group // Int32(self.reader.plane.storage.column_groups),
+                source_group % Int32(self.reader.plane.storage.column_groups),
+            )
+        self.reader.stage_compressed(
+            source, expert, group, target, Int32(lane), coordinates=coordinates
+        )
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_warp()
@@ -85,6 +96,7 @@ class ReadInline:
                 )[0] = value
 
 
+@pytest.mark.parametrize("predecoded_coordinates", [False, True])
 @pytest.mark.parametrize("preparation", ["upload", "gpu"])
 @pytest.mark.parametrize("quantization", ["nvfp4", "mxfp4"])
 @pytest.mark.parametrize(
@@ -93,7 +105,14 @@ class ReadInline:
 )
 @pytest.mark.parametrize("dense", [False, True])
 def test_inline_native_bytes(
-    quantization, destination, rows, columns, sections, dense, preparation
+    quantization,
+    destination,
+    rows,
+    columns,
+    sections,
+    dense,
+    preparation,
+    predecoded_coordinates,
 ):
     device = require_b12x()
     planes, _ = planes_and_native(
@@ -126,12 +145,12 @@ def test_inline_native_bytes(
     output = torch.full_like(expected, 0xD3)
     pointer = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
     program = b12x_compile(
-        ReadInline(plane.geometry),
+        ReadInline(plane.geometry, predecoded_coordinates),
         pointer,
         pointer,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "test.csf_inline", 2, (plane.geometry,)
+            "test.csf_inline", 3, (plane.geometry, predecoded_coordinates)
         ),
     )
     source_ptr = make_ptr(

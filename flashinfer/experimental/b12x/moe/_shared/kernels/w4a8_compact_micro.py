@@ -16,6 +16,7 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 from b12x.moe._shared.kernels.w4a8_compact_projection import (
+    W4A8CompactMicroProjectionActivationKernel,
     W4A8CompactMicroProjectionKernel,
 )
 from b12x.moe._shared.kernels.w4a8_compact_activation import (
@@ -92,6 +93,11 @@ class _DirectW4A8CompactLaunch:
         down_scale_count: int,
         swiglu_limit: float | None,
         fast_math: bool,
+        fc1_tile_n: int = 128,
+        csf_inline_scales: bool = False,
+        fc1_max_copy_groups: int = 2,
+        fuse_input_quantization: bool = False,
+        fc1_pipeline_stages: int = 2,
     ):
         self.capacity = max_tokens
         self.topk = num_topk
@@ -100,17 +106,39 @@ class _DirectW4A8CompactLaunch:
         self.experts = experts
         self.input_scale_count = input_scale_count
         self.down_scale_count = down_scale_count
-        self.projection = W4A8CompactMicroProjectionKernel(
-            k,
-            n,
-            num_topk,
-        )
         self.activation = W4A8CompactMicroActivationKernel(
             n,
             experts,
             swiglu_limit=swiglu_limit,
             fast_math=fast_math,
         )
+        self.fuse_activation = fc1_tile_n == 128 and 4 <= self.capacity <= 8
+        if fuse_input_quantization and not self.fuse_activation:
+            raise ValueError(
+                "fused input quantization requires paired compact projections"
+            )
+        self.fuse_input_quantization = bool(fuse_input_quantization)
+        if self.fuse_activation:
+            self.projection = W4A8CompactMicroProjectionActivationKernel(
+                k,
+                n,
+                num_topk,
+                self.activation,
+                csf_inline=csf_inline_scales,
+                max_copy_groups=fc1_max_copy_groups,
+                fuse_input_quantization=self.fuse_input_quantization,
+                pipeline_stages=fc1_pipeline_stages,
+            )
+        else:
+            self.projection = W4A8CompactMicroProjectionKernel(
+                k,
+                n,
+                num_topk,
+                tile_n=fc1_tile_n,
+                csf_inline=csf_inline_scales,
+                max_copy_groups=fc1_max_copy_groups,
+                pipeline_stages=fc1_pipeline_stages,
+            )
         self.phase2 = W4A8MaterializedPhase2Kernel(
             source_tile_m=1,
             deterministic_output=True,
@@ -120,11 +148,30 @@ class _DirectW4A8CompactLaunch:
             n64_tail=self.n % 128 == 64,
         )
 
+        if self.capacity == 16:
+            self.phase2._route_buffer_slots = (
+                (self.topk + self.phase2.fused_groups - 1)
+                // self.phase2.fused_groups
+                * self.phase2.fused_groups
+            )
+
+        if csf_inline_scales:
+            from b12x._lib.quant.csf_inline import CsfInlineReader
+
+            self.projection.csf_reader = CsfInlineReader(
+                (2 * n, k // 32, 1, 9, n, k // 32, experts, 8, 1, 3, 2)
+            )
+            self.phase2.csf_inline = True
+            self.phase2.csf_reader = CsfInlineReader(
+                (k, n // 32, 1, 9, k, n // 32, experts, 8, 1, 3, 1)
+            )
+
     @cute.jit
     def __call__(
         self,
         packed_a_ptr: cute.Pointer,
         a_scales_ptr: cute.Pointer,
+        source_a_ptr: cute.Pointer,
         w13_ptr: cute.Pointer,
         w13_scales_ptr: cute.Pointer,
         intermediate_ptr: cute.Pointer,
@@ -193,26 +240,48 @@ class _DirectW4A8CompactLaunch:
             output_ptr,
             cute.make_ordered_layout((self.capacity, self.k), order=(1, 0)),
         )
-        self.projection(
-            packed_a,
-            a_scales,
-            w13,
-            w13_scales,
-            projections,
-            topk_ids,
-            alpha1,
-            input_scale,
-            num_pairs,
-            max_active_clusters,
-            stream,
-        )
-        self.activation(
-            projections,
-            intermediate,
-            topk_ids,
-            num_pairs,
-            stream,
-        )
+        if cutlass.const_expr(self.fuse_activation):
+            source_a = cute.make_tensor(
+                source_a_ptr, cute.make_layout((self.capacity * self.k,))
+            )
+            input_source = source_a
+            if cutlass.const_expr(not self.fuse_input_quantization):
+                input_source = packed_a
+            self.projection(
+                input_source,
+                a_scales,
+                w13,
+                w13_scales,
+                projections,
+                intermediate,
+                topk_ids,
+                alpha1,
+                input_scale,
+                num_pairs,
+                max_active_clusters,
+                stream,
+            )
+        else:
+            self.projection(
+                packed_a,
+                a_scales,
+                w13,
+                w13_scales,
+                projections,
+                topk_ids,
+                alpha1,
+                input_scale,
+                num_pairs,
+                max_active_clusters,
+                stream,
+            )
+            self.activation(
+                projections,
+                intermediate,
+                topk_ids,
+                num_pairs,
+                stream,
+            )
         self.phase2(
             intermediate,
             w2,
@@ -247,6 +316,11 @@ def _compiled_direct_w4a8_compact(
     down_scale_count: int,
     swiglu_limit: float | None,
     fast_math: bool,
+    fc1_tile_n: int = 128,
+    csf_inline_scales: bool = False,
+    fc1_max_copy_groups: int = 2,
+    fuse_input_quantization: bool = False,
+    fc1_pipeline_stages: int = 2,
 ):
     launch = _DirectW4A8CompactLaunch(
         max_tokens=max_tokens,
@@ -258,6 +332,11 @@ def _compiled_direct_w4a8_compact(
         down_scale_count=down_scale_count,
         swiglu_limit=swiglu_limit,
         fast_math=fast_math,
+        fc1_tile_n=fc1_tile_n,
+        csf_inline_scales=csf_inline_scales,
+        fc1_max_copy_groups=fc1_max_copy_groups,
+        fuse_input_quantization=fuse_input_quantization,
+        fc1_pipeline_stages=fc1_pipeline_stages,
     )
     ids_type = cutlass.Int32 if ids_dtype == torch.int32 else cutlass.Int64
 
@@ -279,12 +358,18 @@ def _compiled_direct_w4a8_compact(
             down_scale_count,
             swiglu_limit,
             fast_math,
+            fc1_tile_n,
+            bool(csf_inline_scales),
+            fc1_max_copy_groups,
+            bool(fuse_input_quantization),
+            fc1_pipeline_stages,
         ),
     )
     return b12x_compile(
         launch,
         dummy(cutlass.Uint8),
         dummy(cutlass.Uint8),
+        dummy(cutlass.BFloat16, 2),
         dummy(cutlass.Uint32),
         dummy(cutlass.Uint32),
         dummy(cutlass.Uint32),
@@ -303,7 +388,7 @@ def _compiled_direct_w4a8_compact(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a8.compact_micro",
-            4,
+            31,
             (
                 max_tokens,
                 num_topk,
@@ -315,6 +400,11 @@ def _compiled_direct_w4a8_compact(
                 down_scale_count,
                 swiglu_limit,
                 fast_math,
+                fc1_tile_n,
+                bool(csf_inline_scales),
+                fc1_max_copy_groups,
+                bool(fuse_input_quantization),
+                fc1_pipeline_stages,
             ),
         ),
     )
@@ -347,9 +437,14 @@ def launch_w4a8_compact_micro(
     num_topk: int,
     swiglu_limit: float | None,
     fast_math: bool,
+    csf_inline_scales: bool = False,
+    fc1_max_copy_groups: int = 2,
+    fuse_input_quantization: bool = False,
+    fc1_pipeline_stages: int = 2,
     _prepared_kernel=None,
     _prepared_quantize=None,
     max_active_clusters: int | None = None,
+    fc1_tile_n: int = 128,
 ) -> torch.Tensor:
     """Run compact W4A8 projections and ordered route reduction into output."""
     if max_active_clusters is not None and max_active_clusters <= 0:
@@ -390,10 +485,11 @@ def launch_w4a8_compact_micro(
     scale_mma = region("a_mma_scales")
     intermediate = region("intermediate")
     projections = region("projections")
-    if _prepared_quantize is None:
-        quantize_mxfp8_rows_cute(a, values, scale_rows, scale_mma, expected_m=cap)
-    else:
-        _prepared_quantize(a, values, scale_rows, scale_mma)
+    if not fuse_input_quantization:
+        if _prepared_quantize is None:
+            quantize_mxfp8_rows_cute(a, values, scale_rows, scale_mma, expected_m=cap)
+        else:
+            _prepared_quantize(a, values, scale_rows, scale_mma)
 
     compiled = _prepared_kernel or _compiled_direct_w4a8_compact(
         int(a.device.index or 0),
@@ -407,12 +503,18 @@ def launch_w4a8_compact_micro(
         down_scale.numel(),
         swiglu_limit,
         fast_math,
+        fc1_tile_n,
+        csf_inline_scales,
+        fc1_max_copy_groups,
+        fuse_input_quantization,
+        fc1_pipeline_stages,
     )
     ids = topk_ids.reshape(-1)
     weights = topk_weights.reshape(-1)
     compiled(
         _ptr(cutlass.Uint8, values),
         _ptr(cutlass.Uint8, scale_rows),
+        _ptr(cutlass.BFloat16, a, align=2),
         _ptr(cutlass.Uint32, w13),
         _ptr(cutlass.Uint32, w13_scales),
         _ptr(cutlass.Uint32, intermediate),

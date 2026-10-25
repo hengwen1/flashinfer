@@ -138,3 +138,128 @@ def test_filters_naturally_preserve_defaults_across_shapes(device, recipe):
                     payload = TUNING.config_payload(config)
                     TUNING.parameter_space(q, device).validate(payload)
                     assert TUNING.lower(q, device, payload) == config
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_materialized_fc1_cta_budget_preserves_baseline_choices(device):
+    q = replace(query(24, csf_inline_scales=True), intermediate_size=576)
+    configuration = TUNING.configure(q, device=device)
+    candidates = [config for _, config in TUNING.iterate(configuration)]
+    groups = {2: set(), 3: set()}
+    for config in candidates:
+        if (
+            config.backend != "dynamic"
+            or config.dynamic_tile_m != 16
+            or not config.csf_inline_scales
+        ):
+            assert config.materialized_fc1_cta_budget == 2
+            continue
+        payload = config.to_dict()
+        budget = payload.pop("materialized_fc1_cta_budget")
+        groups[budget].add(tuple(sorted(payload.items())))
+    assert groups[2] and groups[3]
+    assert groups[2] == groups[3]
+
+
+def test_moe_config_roundtrip_requires_explicit_controls():
+    from b12x.preparation import FrozenMapping
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+    config = TUNING.default_config(
+        replace(query(24, csf_inline_scales=True), intermediate_size=576), DEVICES[1]
+    )
+    defaults = MoeDecodeConfig("micro", "internal", None)
+    assert defaults.materialized_fc1_cta_budget == 2
+    assert defaults.compact_fuse_input_quantization is False
+    for budget in (2, 3):
+        value = replace(config, materialized_fc1_cta_budget=budget)
+        assert MoeDecodeConfig.from_config(FrozenMapping(value.to_dict())) == value
+    for fuse in (False, True):
+        value = replace(defaults, compact_fuse_input_quantization=fuse)
+        assert MoeDecodeConfig.from_config(FrozenMapping(value.to_dict())) == value
+    for field in ("materialized_fc1_cta_budget", "compact_fuse_input_quantization"):
+        payload = config.to_dict()
+        payload.pop(field)
+        with pytest.raises(ValueError, match="config fields must be exactly"):
+            MoeDecodeConfig.from_config(FrozenMapping(payload))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"activation": "situ"},
+        {"intermediate_size": 512},
+        {"source_format": "modelopt_nvfp4"},
+        {"csf_inline_scales": False},
+    ),
+)
+def test_materialized_fc1_cta_budget_requires_operand_geometry(changes):
+    q = replace(query(24, csf_inline_scales=True), intermediate_size=576)
+    config = replace(
+        TUNING.default_config(q, DEVICES[1]), materialized_fc1_cta_budget=3
+    )
+    q = replace(q, **changes)
+    with pytest.raises(ValueError):
+        TUNING.lower(q, DEVICES[1], TUNING.config_payload(config))
+
+
+@pytest.mark.parametrize("mac", (-1, 0, 128, 188))
+def test_materialized_fc1_cta_budget_preserves_cluster_policy(mac):
+    from b12x.moe.fused_moe._impl import (
+        _decode_dynamic_launch_policy,
+        _encode_dynamic_launch_policy,
+    )
+
+    kwargs = dict(
+        volatile_launch_state=False,
+        external_route_plan_requested=True,
+        policy_max_active_clusters=mac,
+        planned_tile_m=16,
+        planned_direct_routing=False,
+        w4a8_n64_repacked=True,
+        csf_inline_scales=True,
+    )
+    baseline = _encode_dynamic_launch_policy(**kwargs)
+    assert baseline == _encode_dynamic_launch_policy(
+        **kwargs, materialized_fc1_cta_budget=2
+    )
+    alternate = _encode_dynamic_launch_policy(**kwargs, materialized_fc1_cta_budget=3)
+    assert baseline != alternate
+    assert _decode_dynamic_launch_policy(baseline) == _decode_dynamic_launch_policy(
+        alternate
+    )
+    assert _decode_dynamic_launch_policy(alternate)[-1] == mac
+
+
+def test_materialized_fc1_cta_budget_reaches_only_fc1():
+    from b12x.moe._shared.kernels.silu import MoEDynamicKernelSilu
+
+    kernels = [
+        MoEDynamicKernelSilu(
+            sf_vec_size=32,
+            mma_tiler_mn=(16, 128),
+            quant_recipe="w4a8_mx",
+            w4a8_repacked=True,
+            w4a8_n64_repacked=True,
+            w4a8_n64_tail=True,
+            materialize_intermediate=True,
+            share_input_across_experts=True,
+            csf_inline_scales=True,
+            materialized_fc1_cta_budget=budget,
+        )
+        for budget in (2, 3)
+    ]
+    assert [k.materialized_phase1_kernel.cta_budget for k in kernels] == [2, 3]
+    assert kernels[0].threads_per_cta == kernels[1].threads_per_cta
+    assert (
+        kernels[0].materialized_phase1_kernel.shared_bytes
+        == kernels[1].materialized_phase1_kernel.shared_bytes
+    )
+    assert (
+        kernels[0].materialized_phase2_kernel.shared_bytes
+        == kernels[1].materialized_phase2_kernel.shared_bytes
+    )
+    assert (
+        kernels[0].materialized_phase2_kernel.num_warps
+        == kernels[1].materialized_phase2_kernel.num_warps
+    )

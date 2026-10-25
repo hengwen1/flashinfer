@@ -878,6 +878,7 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
         "share_input_across_experts": share_input,
         "planned_tile_m": tile_m,
         "mma_warps": plan.decode_config.dynamic_mma_warps,
+        "materialized_fc1_cta_budget": plan.decode_config.materialized_fc1_cta_budget,
         "csf_inline_scales": bool(
             caps.weight_plan.csf_inline_scales and plan.decode_config.csf_inline_scales
         ),
@@ -933,6 +934,14 @@ def _compact_launches(plan, caps):
             plan.weight_E,
             plan.swiglu_limit,
             caps.w4a16_fast_math,
+            plan.decode_config.micro_fc1_tile_n,
+            bool(
+                caps.weight_plan.csf_inline_scales
+                and plan.decode_config.csf_inline_scales
+            ),
+            plan.decode_config.micro_fc1_max_copy_groups,
+            plan.decode_config.compact_fuse_input_quantization,
+            plan.decode_config.micro_fc1_pipeline_stages,
         )
         for dtype in (torch.int32, torch.int64)
     }
@@ -974,23 +983,25 @@ def _program_carriers(
             launches.append(compact)
             return tuple(launches)
         # Tiny W4A8-MX dispatch does not enter _get_micro_kernel: it always
-        # normalizes IDs to int32 and resolves the paired tiny-decode phases.
+        # resolves both integer ID ABIs for the paired tiny-decode phases.
         # Its layout is fixed by the same canonical weight plan that owns the
         # materialized payload, not by a guessed kernel-layout spelling.
         if (
             plan.quant_mode == "w4a8_mx"
             and caps.weight_plan.w4a8_weight_layout != "trellis_t256"
         ):
-            launches.extend(
-                _impl._get_tiny_decode_kernel(
-                    plan.weight_E,
-                    plan.max_tokens_per_launch,
-                    plan.k,
-                    plan.n,
-                    plan.num_topk,
-                    device=plan.device,
+            for dtype in (torch.int32, torch.int64):
+                launches.extend(
+                    _impl._get_tiny_decode_kernel(
+                        plan.weight_E,
+                        plan.max_tokens_per_launch,
+                        plan.k,
+                        plan.n,
+                        plan.num_topk,
+                        device=plan.device,
+                        topk_ids_dtype=dtype,
+                    )
                 )
-            )
         else:
             weight_layout = (
                 caps.weight_plan.w4a8_weight_layout
@@ -1068,6 +1079,7 @@ def _program_carriers(
                 trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                 planned_tile_m=dynamic["planned_tile_m"],
                 mma_warps=dynamic["mma_warps"],
+                materialized_fc1_cta_budget=dynamic["materialized_fc1_cta_budget"],
             )
             launches.append(launch)
         if plan.deterministic_output:

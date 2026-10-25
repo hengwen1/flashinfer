@@ -646,6 +646,56 @@ def mxfp8_mma_m16n8k32_f32_e2m1(
 
 
 @dsl_user_op
+def mxfp8_mma_m16n8k32_f32_e2m1_e4m3(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    sfa: Uint32,
+    sfb: Uint32,
+    bid_a: int = 0,
+    bid_b: int = 0,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """SM120 block-scaled QMMA with E2M1 A and E4M3 B containers."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(value).ir_value(loc=loc, ip=ip)
+            for value in (a0, a1, a2, a3, b0, b1, sfa, sfb)
+        ]
+        + [Float32(value).ir_value(loc=loc, ip=ip) for value in (d0, d1, d2, d3)],
+        f"""
+        mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e4m3.f32.ue8m0
+        {{$0, $1, $2, $3}},
+        {{$4, $5, $6, $7}},
+        {{$8, $9}},
+        {{$0, $1, $2, $3}},
+        {{$10}}, {{{int(bid_a)}, 0}},
+        {{$11}}, {{{int(bid_b)}, 0}};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,r,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip))
+        for i in range(4)
+    )
+
+
+@dsl_user_op
 def mma_m16n8k32_f32_e4m3(
     d0: Float32,
     d1: Float32,

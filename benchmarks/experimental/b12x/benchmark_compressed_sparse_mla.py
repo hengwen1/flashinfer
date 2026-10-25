@@ -15,6 +15,13 @@ from dataclasses import dataclass
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
+from benchmarks.experimental.b12x.benchmark_deepseek_v41_mla import dispatch_preset
+
+if __name__ == "__main__":
+    _profile_result = dispatch_preset()
+    if _profile_result is not None:
+        raise SystemExit(_profile_result)
+
 import torch
 
 from b12x.attention._shared.mla.compressed_reference import (
@@ -1028,12 +1035,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--preset",
-        choices=("none", VLLM_DSV4_TRACE_PRESET),
+        choices=("none", VLLM_DSV4_TRACE_PRESET, "flare-dsv41-tp4"),
         default="none",
         help=(
             "vllm-dsv4-trace reproduces the captured TP2 C1, C4, and C128 "
             "decode contracts, packed cache stride, sink, split caps, and "
-            "b12x reference checks"
+            "b12x reference checks; use --preset flare-dsv41-tp4 --help for "
+            "the prepared Flare V4.1 profile and its options"
         ),
     )
     parser.add_argument(
@@ -1176,6 +1184,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    profile_result = dispatch_preset(argv)
+    if profile_result is not None:
+        return profile_result
     args = _parse_args(argv)
     if args.warmup <= 0 or args.replays <= 0:
         raise SystemExit("--warmup and --replays must be positive")

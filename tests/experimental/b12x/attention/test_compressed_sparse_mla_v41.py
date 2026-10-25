@@ -40,7 +40,49 @@ def _prepare_binding(session, plan, bind_args, run_args, output):
             owners=(scratch, binding),
         )
 
-    session.prepare((plan.request(name="compressed-attention", prepare_call=prepare),))
+    def benchmark(state):
+        def copy(value):
+            if not isinstance(value, torch.Tensor):
+                return value
+            if value.ndim > 1 and value.stride(0) == 0:
+                return value[0].clone().unsqueeze(0).expand_as(value)
+            return value.clone(memory_format=torch.preserve_format)
+
+        seeds = {name: copy(value) for name, value in (bind_args | run_args).items()}
+        operands = {name: copy(value) for name, value in seeds.items()}
+        (spec,) = state.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=output.device)
+        trial_output = torch.empty_like(output)
+        binding = state.bind_for_preparation(
+            scratch=scratch, **{name: operands[name] for name in bind_args}
+        )
+
+        def produce():
+            for name, value in operands.items():
+                if isinstance(value, torch.Tensor):
+                    if value.ndim > 1 and value.stride(0) == 0:
+                        value[0].copy_(seeds[name][0])
+                    else:
+                        value.copy_(seeds[name])
+
+        return PreparedCall(
+            run=lambda: state.run(
+                binding, **{name: operands[name] for name in run_args}, out=trial_output
+            ),
+            produce=produce,
+            output=trial_output,
+            owners=(scratch, binding, operands, seeds),
+        )
+
+    session.prepare(
+        (
+            plan.request(
+                name="compressed-attention",
+                prepare_call=prepare,
+                benchmark_call=benchmark,
+            ),
+        )
+    )
     (spec,) = plan.scratch_specs()
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=output.device)
     return compressed_sparse_mla.bind(plan, scratch=scratch, **bind_args), scratch

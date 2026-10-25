@@ -13,6 +13,13 @@ from dataclasses import dataclass, field
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
+from benchmarks.experimental.b12x.benchmark_deepseek_v41_mla import dispatch_preset
+
+if __name__ == "__main__":
+    _profile_result = dispatch_preset()
+    if _profile_result is not None:
+        raise SystemExit(_profile_result)
+
 import torch
 import triton
 import triton.language as tl
@@ -2276,12 +2283,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             TARGET_PREFILL64K_BS1_PRESET,
             TARGET_GLM52_PREFILL4K_CTX16K_PRESET,
             TARGET_DSV4_TRACE_PRESET,
+            "flare-dsv41-tp4",
         ),
         default="none",
         help=(
             "shape preset; target-glm52-prefill4k-ctx16k maps to a vLLM-oriented "
             "TP8 4096-token chunk at 16k context with top-k 2048 and tiled top-k; "
-            "target-dsv4-trace runs the TP2 C1/C4/C128 compressed-MLA trace race"
+            "target-dsv4-trace runs the TP2 C1/C4/C128 compressed-MLA trace race; "
+            "use --preset flare-dsv41-tp4 --help for the prepared Flare V4.1 profile"
         ),
     )
     parser.add_argument(
@@ -2407,6 +2416,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    profile_result = dispatch_preset(argv)
+    if profile_result is not None:
+        return profile_result
     args = _parse_args(argv)
     if args.preset == TARGET_DSV4_TRACE_PRESET:
         from benchmarks.experimental.b12x.benchmark_compressed_sparse_mla import (

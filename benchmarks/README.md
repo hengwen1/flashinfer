@@ -18,6 +18,35 @@ the sample count to stay within the rotating-state capacity and set
 iterations fit. `--dry-run-iters` and `--repeat-iters` request fixed iteration
 counts; they are not duration targets.
 
+## Prepared DeepSeek V4.1 MLA on SM120/SM121
+
+The experimental [V4.1 MLA benchmark](experimental/b12x/benchmark_deepseek_v41_mla.py)
+runs rank-local Flare TP4 attention shapes on one selected GPU:
+
+```sh
+python benchmarks/experimental/b12x/benchmark_compressed_sparse_mla.py \
+  --preset flare-dsv41-tp4 \
+  --model-config /path/to/DeepSeek-V4.1-Flash-1017/config.json \
+  --device 4 --output-csv /tmp/v41-mla.csv
+```
+
+The profile uses BF16 arithmetic, 16 query heads, a 1M-token context capacity,
+8192-column indexed page tables, and a 512-token live context. It covers SWA,
+C2, C1, and draft SWA through prepared plans and captured CUDA graph replay.
+`--verify-shapes BxWxP` keeps the per-request query ceiling `W` separate from
+the physical packed query rows `P`. A 4096-row prefill uses 128 suffix rows
+for C1 attention. `--describe` prints the resolved contracts without importing
+GPU libraries; use `--preset flare-dsv41-tp4 --help` for all profile options.
+
+Queries, cache values, sinks, and selections are synthetic. The indexed cache
+view has 895489 rows, requiring about 33 GB for C1; ordinary PyTorch backing
+differs from Flare's virtual-memory residency. `--cache-pages` explicitly
+overrides that descriptor for smaller fixtures. Timing includes attention and
+logical-to-physical page mapping, excluding projections, index selection,
+cache writes, and communication. L2 eviction runs outside timed replay by
+default; `--no-flush-l2` disables it. CSV results retain actual layouts,
+selected configurations, numerical errors, cache policy, and raw timings.
+
 ## Overview
 
 This framework provides tools to:
